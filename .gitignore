@@ -1,0 +1,6 @@
+__pycache__/
+.specify/memory/.constitution-template.json
+.grok/*.json
+/target
+*.swp
+.cargo-home/

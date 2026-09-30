@@ -1,0 +1,26 @@
+[package]
+name = "seat"
+version = "0.1.2"
+edition = "2021"
+description = "Offline agent-to-agent mail plus a tmux supervisor for each agent's stored command"
+repository = "https://github.com/diegonetto/seat"
+readme = "README.md"
+license = "MIT"
+exclude = ["/.grok/", "/.specify/", "/specs/"]
+
+[[bin]]
+name = "seat"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+thiserror = "2"
+libc = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
