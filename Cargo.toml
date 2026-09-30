@@ -1,11 +1,13 @@
 [package]
 name = "seat"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Offline agent-to-agent mail plus a tmux supervisor for each agent's stored command"
 repository = "https://github.com/diegonetto/seat"
 readme = "README.md"
 license = "MIT"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["agent", "mail", "tmux", "inbox", "supervisor"]
 exclude = ["/.grok/", "/.specify/", "/specs/"]
 
 [[bin]]

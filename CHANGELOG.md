@@ -2,6 +2,11 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## 0.1.3 — 2026-09-30
+
+crates.io categories are command-line-utilities and development-tools.
+Keywords are agent, mail, tmux, inbox, and supervisor.
+
 ## 0.1.2 — 2026-09-30
 
 The published repository is https://github.com/diegonetto/seat.
