@@ -82,6 +82,10 @@ root directory only when that leaves the directory empty.
 A command other than `init` refuses a directory it does not recognize
 and names the path.
 
+## Tests
+
+`cargo test` covers the commands. `tests/smoke.sh` is a shell script and is not part of `cargo test`.
+
 ## License
 
 MIT. See `LICENSE`.
