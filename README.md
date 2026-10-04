@@ -64,9 +64,23 @@ seat
 
 `arm` is the only waiter. The default lifecycle is `exit-wake`: one wake
 and the process exits. `poller` stays up until SIGTERM. A second `arm`
-sees the live waiter and exits 0. `gallery` prints the running names and
-then attaches to `swarm`. On a tty, `seat` with no verb is a read-only
-roster. `q` quits. The roster does not send, drain, or arm.
+sees the live waiter and exits 0. `gallery` prints the names that have a
+live pane in `swarm`, then attaches. It does not list a seat that is only
+awake. On a tty, `seat` with no verb is a read-only roster. `q` quits.
+The roster does not send, drain, or arm. Its state column is the waiter
+(`idle`, `live`, `orphan`, or `corrupt`), which is not presence.
+
+`status` prints one row per registered seat, sorted by name:
+
+```
+<name> <presence> mail=<N>
+```
+
+Presence is `pane`, `awake`, or `unattended`. `pane` is a live pane in
+`swarm` tagged `@seat`. `awake` is no pane and a live waiter in `wait.pid`,
+including a waiter whose parent is pid 1. `unattended` is no pane and no
+live waiter. `mail=<N>` is the number of files in that seat's inbox. It is
+printed on every row. Mail does not change presence.
 
 `seat reset` removes the marker, `seats/`, and `rooms/`. It removes the
 root directory only when that leaves the directory empty.

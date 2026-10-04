@@ -98,9 +98,8 @@ pub fn panes(prog: &str) -> Result<Vec<Pane>> {
     Ok(found)
 }
 
-/// The running seats: the names `gallery` prints and `status` labels
-/// running. Only live panes in the `swarm` session count — a dead pane
-/// is a stopped seat (data model: Running).
+/// Live panes in the `swarm` session. `gallery` prints these names.
+/// `status` calls this set `pane`. A dead pane is not in the set.
 pub fn running_seats(prog: &str) -> Result<BTreeSet<String>> {
     Ok(panes(prog)?
         .into_iter()
@@ -110,7 +109,9 @@ pub fn running_seats(prog: &str) -> Result<BTreeSet<String>> {
 }
 
 fn has_session(prog: &str) -> Result<bool> {
-    Ok(tmux(prog, &["has-session", "-t", SESSION])?.status.success())
+    Ok(tmux(prog, &["has-session", "-t", SESSION])?
+        .status
+        .success())
 }
 
 /// The launch `up` starts a seat with: the stored absolute directory
@@ -154,12 +155,7 @@ fn preflight(root: &Path, name: &str) -> Result<Launch> {
 /// pane is stamped `@seat`, `@cwd` (JSON string), and `@cmd` (JSON
 /// array of the stored words only): the launch as started, not as
 /// stored now. No pin file is read; no shell is used.
-fn start_seat(
-    prog: &str,
-    seat_name: &str,
-    launch: &Launch,
-    have_session: &mut bool,
-) -> Result<()> {
+fn start_seat(prog: &str, seat_name: &str, launch: &Launch, have_session: &mut bool) -> Result<()> {
     let mut args: Vec<&str> = if *have_session {
         vec!["new-window", "-d", "-t", SESSION, "-n", seat_name]
     } else {
@@ -170,7 +166,10 @@ fn start_seat(
     args.extend(["-P", "-F", "#{pane_id}", "--", "/usr/bin/env", "--"]);
     args.extend(launch.cmd.iter().map(|s| s.as_str()));
     let out = tmux(prog, &args).map_err(|e| {
-        SeatError::StartFailed(seat_name.to_string(), format!("cannot run multiplexer: {e}"))
+        SeatError::StartFailed(
+            seat_name.to_string(),
+            format!("cannot run multiplexer: {e}"),
+        )
     })?;
     if !out.status.success() {
         return Err(SeatError::StartFailed(
@@ -193,7 +192,11 @@ fn start_seat(
     }
     let cwd_json = serde_json::to_string(&launch.cwd)?;
     let cmd_json = serde_json::to_string(&launch.cmd)?;
-    for (option, value) in [("@seat", seat_name), ("@cwd", &cwd_json), ("@cmd", &cmd_json)] {
+    for (option, value) in [
+        ("@seat", seat_name),
+        ("@cwd", &cwd_json),
+        ("@cmd", &cmd_json),
+    ] {
         tmux_ok(prog, &["set-option", "-p", "-t", &pane_id, option, value])
             .map_err(|e| SeatError::StartFailed(seat_name.to_string(), e.to_string()))?;
     }
@@ -301,10 +304,10 @@ pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `seat gallery` — print the running seat names, one per line, then
-/// attach to the session (T018). With SEAT_TMUX set the names are
-/// printed and there is no attach. With nothing running it reports
-/// `gallery: empty`, exits 0, and registers no seat.
+/// `seat gallery` — print the pane names, one per line, then attach to
+/// the session (T018). With SEAT_TMUX set the names are printed and
+/// there is no attach. With no pane it reports `gallery: empty`, exits
+/// 0, and registers no seat. Awake and unattended seats are not listed.
 pub fn cmd_gallery(root: &Path) -> Result<()> {
     board::ensure_board(root)?;
     let registered: BTreeSet<String> = verbs::sorted_seat_names(root)?.into_iter().collect();
@@ -313,7 +316,8 @@ pub fn cmd_gallery(root: &Path) -> Result<()> {
 }
 
 /// The gallery body. `attach` is false whenever SEAT_TMUX is set.
-/// Only registered seats count, so the printed set matches `status`.
+/// Only registered seats count, so the printed set is the seats whose
+/// presence is `pane`.
 fn gallery(
     prog: &str,
     attach: bool,
@@ -344,39 +348,55 @@ fn gallery(
     Ok(())
 }
 
-/// The three states of FR-009, in priority order: running beats
-/// stopped-with-unread, which beats needs-operator. A stopped seat
-/// with an empty inbox is needs-operator. Unread means a non-empty
-/// inbox (T022).
-fn classify(running: bool, unread: usize) -> &'static str {
-    match (running, unread) {
-        (true, _) => "running",
-        (false, n) if n > 0 => "stopped-with-unread",
-        (false, _) => "needs-operator",
+/// One `seat status` row. Presence and the mail count are separate.
+#[derive(Debug, PartialEq, Eq)]
+struct StatusRow {
+    name: String,
+    presence: &'static str,
+    mail: usize,
+}
+
+/// Presence, separate from the mail count. A live swarm pane is
+/// `pane` even when a waiter is also alive. A live or orphan waiter
+/// with no pane is `awake`. No pane and no live waiter is
+/// `unattended`. Mail never changes the word.
+fn presence(in_pane: bool, waiter: seat::WaiterState) -> &'static str {
+    if in_pane {
+        "pane"
+    } else if matches!(waiter, seat::WaiterState::Live | seat::WaiterState::Orphan) {
+        "awake"
+    } else {
+        "unattended"
     }
 }
 
-/// One row of `status`: the seat name and its one state.
-fn status_rows(root: &Path, prog: &str) -> Result<Vec<(String, &'static str)>> {
+/// One row of `status` per registered seat, sorted by name.
+/// `mail` is the inbox file count, not followed rooms.
+fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
     board::ensure_board(root)?;
     let running = running_seats(prog)?;
     let mut rows = Vec::new();
     for name in verbs::sorted_seat_names(root)? {
-        let is_running = running.contains(&name);
-        let unread = msg::list_msg_dir(&seat::seat_dir(root, &name).join("inbox"))?.len();
-        rows.push((name, classify(is_running, unread)));
+        let dir = seat::seat_dir(root, &name);
+        let mail = msg::list_msg_dir(&dir.join("inbox"))?.len();
+        let in_pane = running.contains(&name);
+        rows.push(StatusRow {
+            name,
+            presence: presence(in_pane, seat::waiter_state(&dir)),
+            mail,
+        });
     }
     Ok(rows)
 }
 
 /// `seat status` — one row per registered seat, sorted by name, as
-/// `<name> <state>`. The running set is the same query `gallery`
-/// prints (T021).
+/// `<name> <presence> mail=<N>`. The pane set is the same query
+/// `gallery` prints.
 pub fn cmd_status(root: &Path) -> Result<()> {
     let rows = status_rows(root, &tmux_prog())?;
     let mut out = std::io::stdout().lock();
-    for (name, state) in rows {
-        writeln!(out, "{name} {state}")?;
+    for row in rows {
+        writeln!(out, "{} {} mail={}", row.name, row.presence, row.mail)?;
     }
     Ok(())
 }
@@ -397,17 +417,100 @@ mod tests {
     }
 
     #[test]
-    fn state_priority_is_running_then_unread_then_needs_operator() {
-        assert_eq!(classify(true, 0), "running");
-        assert_eq!(classify(true, 7), "running", "running beats unread");
-        assert_eq!(classify(false, 1), "stopped-with-unread");
-        assert_eq!(classify(false, 0), "needs-operator");
+    fn presence_is_pane_then_awake_then_unattended() {
+        use seat::WaiterState;
+        assert_eq!(presence(true, WaiterState::Idle), "pane");
+        assert_eq!(
+            presence(true, WaiterState::Live),
+            "pane",
+            "a pane beats a waiter"
+        );
+        assert_eq!(presence(true, WaiterState::Orphan), "pane");
+        assert_eq!(presence(false, WaiterState::Live), "awake");
+        assert_eq!(
+            presence(false, WaiterState::Orphan),
+            "awake",
+            "a waiter reparented to pid 1 is awake"
+        );
+        assert_eq!(presence(false, WaiterState::Idle), "unattended");
     }
 
     /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE:
     /// process-wide env is safe under the parallel test threads only
     /// one such test runs at a time.
     static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pane beats a live waiter. A live waiter with no pane is awake.
+    /// A missing, unparseable, or stale pidfile is unattended. Mail is
+    /// the inbox file count and does not change presence.
+    #[test]
+    fn status_presence_and_mail_are_separate() {
+        let _guard = FAKE_LOCK.lock().unwrap();
+        let root = temp_root("status-presence");
+        board::init(&root).unwrap();
+        let cwd = root.display().to_string();
+        verbs::cmd_register(
+            &root,
+            "paned",
+            "sb",
+            None,
+            None,
+            Some(cwd),
+            vec!["/bin/sleep".into(), "30".into()],
+        )
+        .unwrap();
+        verbs::cmd_register(&root, "waiter", "sb", None, None, None, vec![]).unwrap();
+        verbs::cmd_register(&root, "quiet", "sb", None, None, None, vec![]).unwrap();
+        let state = root.join("tmux.state");
+        std::env::set_var("SEAT_TMUX", fake_tmux());
+        std::env::set_var("SEAT_FAKE_STATE", &state);
+
+        cmd_up(&root, &["paned".to_string()]).unwrap();
+        seat::write_wait_pid(&seat::seat_dir(&root, "paned"), std::process::id()).unwrap();
+        seat::write_wait_pid(&seat::seat_dir(&root, "waiter"), std::process::id()).unwrap();
+        verbs::cmd_send(&root, "quiet", "paned", "while up").unwrap();
+        verbs::cmd_send(&root, "quiet", "waiter", "one").unwrap();
+        verbs::cmd_send(&root, "paned", "waiter", "two").unwrap();
+
+        let rows = status_rows(&root, &fake_tmux()).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                StatusRow {
+                    name: "paned".into(),
+                    presence: "pane",
+                    mail: 1
+                },
+                StatusRow {
+                    name: "quiet".into(),
+                    presence: "unattended",
+                    mail: 0
+                },
+                StatusRow {
+                    name: "waiter".into(),
+                    presence: "awake",
+                    mail: 2
+                },
+            ]
+        );
+
+        let quiet = seat::seat_dir(&root, "quiet");
+        std::fs::write(seat::wait_pid_path(&quiet), "nope\n").unwrap();
+        assert_eq!(
+            status_rows(&root, &fake_tmux()).unwrap()[1].presence,
+            "unattended",
+            "an unparseable pidfile is unattended"
+        );
+        seat::write_wait_pid(&quiet, u32::MAX).unwrap();
+        let again = status_rows(&root, &fake_tmux()).unwrap();
+        assert_eq!(
+            again[1].presence, "unattended",
+            "a stale pidfile is unattended"
+        );
+        assert_eq!(again[1].mail, 0);
+        assert_eq!(again[2].presence, "awake");
+        assert_eq!(again[2].mail, 2);
+    }
 
     /// The whole session story against the fake (T015's consumer).
     #[test]
@@ -447,10 +550,7 @@ mod tests {
         // down kills the pane and prints nothing on stdout (T017);
         // already-stopped is success.
         cmd_down(&root, &["beta".to_string()]).unwrap();
-        let running: Vec<String> = running_seats(&fake_tmux())
-            .unwrap()
-            .into_iter()
-            .collect();
+        let running: Vec<String> = running_seats(&fake_tmux()).unwrap().into_iter().collect();
         assert_eq!(running, vec!["alpha".to_string(), "gamma".to_string()]);
         cmd_down(&root, &["beta".to_string()]).unwrap();
 
@@ -464,26 +564,39 @@ mod tests {
             Err(SeatError::UnknownSeat(ref s)) if s == "ghost"
         ));
 
-        // status: three seats, three states, sorted (T021/T022). beta
-        // gets mail while stopped; gamma stopped with an empty inbox.
+        // status: three seats, sorted. beta has mail and no pane;
+        // gamma has an empty inbox and no pane. Mail does not change
+        // presence, so both are unattended.
         verbs::cmd_send(&root, "alpha", "beta", "unread while stopped").unwrap();
         cmd_down(&root, &["gamma".to_string()]).unwrap();
         let rows = status_rows(&root, &fake_tmux()).unwrap();
         assert_eq!(
             rows,
             vec![
-                ("alpha".to_string(), "running"),
-                ("beta".to_string(), "stopped-with-unread"),
-                ("gamma".to_string(), "needs-operator"),
+                StatusRow {
+                    name: "alpha".into(),
+                    presence: "pane",
+                    mail: 0
+                },
+                StatusRow {
+                    name: "beta".into(),
+                    presence: "unattended",
+                    mail: 1
+                },
+                StatusRow {
+                    name: "gamma".into(),
+                    presence: "unattended",
+                    mail: 0
+                },
             ]
         );
 
-        // The running set matches what gallery prints (SC-005/FR-008),
-        // and down drained nothing: beta's mail is still unread.
+        // The pane set matches what gallery prints, and down drained
+        // nothing: beta's mail is still in the inbox.
         let running_names: Vec<String> = rows
             .iter()
-            .filter(|(_, s)| *s == "running")
-            .map(|(n, _)| n.clone())
+            .filter(|row| row.presence == "pane")
+            .map(|row| row.name.clone())
             .collect();
         assert_eq!(running_names, vec!["alpha".to_string()]);
         assert_eq!(
@@ -516,7 +629,15 @@ mod tests {
         // appear: gallery's set is status's running set (FR-008).
         let stray = std::process::Command::new(fake_tmux())
             .args([
-                "new-window", "-d", "-t", "swarm", "-n", "stray", "-P", "-F", "#{pane_id}",
+                "new-window",
+                "-d",
+                "-t",
+                "swarm",
+                "-n",
+                "stray",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .output()
             .unwrap();
@@ -575,10 +696,7 @@ mod tests {
         // spec 003 US1 scenario 5): mailbox and nocmd are not started
         // and are not errors.
         cmd_up(&root, &[]).unwrap();
-        let live: Vec<String> = running_seats(&fake_tmux())
-            .unwrap()
-            .into_iter()
-            .collect();
+        let live: Vec<String> = running_seats(&fake_tmux()).unwrap().into_iter().collect();
         assert_eq!(live, vec!["runner".to_string()]);
 
         // The record shows the command words and the directory, once
@@ -667,7 +785,10 @@ mod tests {
             "die is not running, earlier seats stay"
         );
         assert!(listed.iter().any(|p| p.seat == "die" && p.dead));
-        assert!(!listed.iter().any(|p| p.seat == "zzz"), "later target unstarted");
+        assert!(
+            !listed.iter().any(|p| p.seat == "zzz"),
+            "later target unstarted"
+        );
 
         // The multiplexer refusing the spawn (seat-fail) is the same
         // failure: named, nonzero, no pane.

@@ -89,8 +89,7 @@ enum Command {
     },
     /// Print the running seats, then attach to the swarm session
     Gallery,
-    /// One row per registered seat: running | stopped-with-unread |
-    /// needs-operator
+    /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
     Status,
     /// Remove the board under the root (marker, seats/, rooms/)
     Reset,

@@ -238,20 +238,34 @@ tm5() { SEAT_TMUX="$FAKE" SEAT_FAKE_STATE="$F5" "$S" --root "$R5" "$@"; }
 tm5 up runner >/dev/null 2>&1;                     note $? "bring runner up"
 tm5 up parked >/dev/null 2>&1;                     note $? "bring parked up before stopping it"
 
-# Mail is unread while parked runs: running beats stopped-with-unread.
-tm5 status | grep -qx "parked running";            note $? "running beats stopped-with-unread"
+# Mail does not change presence: a live pane is pane.
+tm5 status | grep -qx "parked pane mail=1";        note $? "a pane stays pane while it has mail"
 
 out="$(tm5 down parked)"; rc=$?
 [ "$rc" -eq 0 ] && [ -z "$out" ];                  note $? "down prints no message body (parked)"
 out="$(tm5 status)"; rc=$?
-[ "$rc" -eq 0 ] && [ "$out" = "$(printf 'fresh needs-operator\nparked stopped-with-unread\nrunner running')" ]
-                                                   note $? "status prints three rows and three states"
-out="$(tm5 gallery)"; [ "$out" = "runner" ];       note $? "gallery prints only the running seat"
-r1="$(tm5 status | awk '$2 == "running" { print $1 }')"
+[ "$rc" -eq 0 ] && [ "$out" = "$(printf 'fresh unattended mail=0\nparked unattended mail=1\nrunner pane mail=0')" ]
+                                                   note $? "status prints presence and a mail count"
+out="$(tm5 gallery)"; [ "$out" = "runner" ];       note $? "gallery prints only the pane seat"
+r1="$(tm5 status | awk '$2 == "pane" { print $1 }')"
 r2="$(tm5 gallery)"
-[ "$r1" = "$r2" ];                                 note $? "the running set matches gallery"
+[ "$r1" = "$r2" ];                                 note $? "the pane set matches gallery"
 [ "$(ls "$R5/seats/parked/inbox" | wc -l)" -eq 1 ]
                                                    note $? "down drained nothing: parked keeps its mail"
+
+# A live wait.pid and no pane is awake. A dead pid is unattended.
+# A pane still wins when that seat also has a live waiter.
+sleep 60 &
+awake_pid=$!
+BG_PIDS="$BG_PIDS $awake_pid"
+printf '%s\n' "$awake_pid" > "$R5/seats/fresh/wait.pid"
+tm5 status | grep -qx "fresh awake mail=0";        note $? "a live waiter with no pane is awake"
+printf '%s\n' "$$" > "$R5/seats/runner/wait.pid"
+tm5 status | grep -qx "runner pane mail=0";        note $? "a pane beats a live waiter"
+kill "$awake_pid" 2>/dev/null
+wait "$awake_pid" 2>/dev/null
+printf '%s\n' "4294967295" > "$R5/seats/fresh/wait.pid"
+tm5 status | grep -qx "fresh unattended mail=0";   note $? "a stale waiter pid is unattended"
 
 ## seat-launch quickstart (003) steps 1, 2, 3, 6, 7 ---------------------
 # The session record, read without attaching: tab-separated session,
