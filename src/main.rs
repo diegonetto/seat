@@ -87,7 +87,7 @@ enum Command {
         /// Registered seats to stop (default: every registered seat)
         names: Vec<String>,
     },
-    /// Print the running seats, then attach to the swarm session
+    /// Print the running seats, tile them into one window, then attach
     Gallery,
     /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
     Status,

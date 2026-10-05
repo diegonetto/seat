@@ -1,4 +1,4 @@
-use crate::error::{SeatError, Result};
+use crate::error::{Result, SeatError};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -252,7 +252,10 @@ mod tests {
         let dir = create(&root, "alpha").unwrap();
         // Absent launch fields are omitted from the file, and a meta
         // written before this feature parses unchanged (T001).
-        let old = Meta { harness: "h".into(), ..Default::default() };
+        let old = Meta {
+            harness: "h".into(),
+            ..Default::default()
+        };
         write_meta(&dir, &old).unwrap();
         let raw = std::fs::read_to_string(meta_path(&dir)).unwrap();
         assert!(!raw.contains("\"cwd\""), "cwd omitted: {raw}");
@@ -268,10 +271,19 @@ mod tests {
         };
         write_meta(&dir, &launched).unwrap();
         let back = read_meta(&dir).unwrap();
-        assert_eq!(back.cwd.as_deref(), Some(root.display().to_string().as_str()));
+        assert_eq!(
+            back.cwd.as_deref(),
+            Some(root.display().to_string().as_str())
+        );
         assert_eq!(
             back.cmd.as_deref(),
-            Some(&["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()][..])
+            Some(
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string()
+                ][..]
+            )
         );
     }
 

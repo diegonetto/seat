@@ -384,7 +384,16 @@ mod tests {
     #[test]
     fn exit_wake_with_waiting_mail_notices_and_exits_zero() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::ExitWake), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::ExitWake),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "wake now").unwrap();
 
         let Spawned { stop, buf, rx } = spawn(&root, opts("beta", None, None, false));
@@ -407,7 +416,16 @@ mod tests {
     #[test]
     fn exit_wake_blocks_then_wakes_within_5s_of_arriving_mail() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::ExitWake), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::ExitWake),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
 
         let Spawned { buf, rx, .. } = spawn(&root, opts("beta", None, None, false));
         std::thread::sleep(Duration::from_millis(300));
@@ -428,7 +446,16 @@ mod tests {
     #[test]
     fn lifecycle_flag_overrides_meta_ephemerally() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::Poller), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::Poller),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "override wake").unwrap();
 
         // Poller meta would stay up; the exit-wake override wakes and returns.
@@ -472,7 +499,16 @@ mod tests {
     #[test]
     fn second_arm_reports_live_waiter_and_exits_zero() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::Poller), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::Poller),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         // A live holder: this test process itself.
         let dir = seat::seat_dir(&root, "beta");
         seat::write_wait_pid(&dir, std::process::id()).unwrap();
@@ -491,7 +527,10 @@ mod tests {
             "reports the waiter: {text}"
         );
         assert!(text.contains(&std::process::id().to_string()), "{text}");
-        assert!(!text.contains("waiting for mail"), "started nothing: {text}");
+        assert!(
+            !text.contains("waiting for mail"),
+            "started nothing: {text}"
+        );
         // Refused arm did not steal the pidfile.
         assert_eq!(seat::read_wait_pid(&dir), Some(std::process::id()));
     }
@@ -499,7 +538,16 @@ mod tests {
     #[test]
     fn stale_pidfile_is_reclaimed_without_takeover() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::ExitWake), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::ExitWake),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "reclaim me").unwrap();
         // A pid that cannot exist: stale pidfile must not block arming.
         seat::write_wait_pid(&seat::seat_dir(&root, "beta"), u32::MAX).unwrap();
@@ -520,7 +568,16 @@ mod tests {
     #[test]
     fn takeover_terms_live_waiter_and_takes_the_seat() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::ExitWake), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::ExitWake),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "steal me").unwrap();
 
         // A real live waiter that is not this process.
@@ -548,7 +605,16 @@ mod tests {
     #[test]
     fn poller_wakes_on_each_arrival_and_stays_up_until_stopped() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::Poller), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::Poller),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
 
         let Spawned { stop, buf, rx } = spawn(&root, opts("beta", None, None, false));
         std::thread::sleep(Duration::from_millis(300));
@@ -580,7 +646,16 @@ mod tests {
     #[test]
     fn poller_wakes_on_waiting_mail_at_arm_time() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::Poller), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::Poller),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "already here").unwrap();
 
         let Spawned { stop, buf, rx } = spawn(&root, opts("beta", None, None, false));
@@ -594,7 +669,16 @@ mod tests {
     #[test]
     fn exec_runs_on_each_wake_and_is_notice_plus_signal() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::Poller), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::Poller),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "signal only").unwrap();
 
         let marker_dir = temp_root("serve-exec");
@@ -629,7 +713,16 @@ mod tests {
     #[test]
     fn exec_with_exit_wake_runs_once_and_exits_zero() {
         let root = setup();
-        verbs::cmd_register(&root, "beta", "sb", None, Some(Lifecycle::ExitWake), None, Vec::new()).unwrap();
+        verbs::cmd_register(
+            &root,
+            "beta",
+            "sb",
+            None,
+            Some(Lifecycle::ExitWake),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         verbs::cmd_send(&root, "alpha", "beta", "one shot").unwrap();
 
         let marker_dir = temp_root("serve-exec-ew");

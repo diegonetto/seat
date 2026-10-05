@@ -8,7 +8,9 @@ pub enum SeatError {
     #[error("no seat board at {0} (run `seat init` or set SEAT_ROOT)")]
     MissingBoard(PathBuf),
 
-    #[error("unrecognized root {0}: marker is missing or not 'seat' (only `seat reset` may touch it)")]
+    #[error(
+        "unrecognized root {0}: marker is missing or not 'seat' (only `seat reset` may touch it)"
+    )]
     ForeignRoot(PathBuf),
 
     #[error("corrupt seat meta at {path}")]

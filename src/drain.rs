@@ -336,7 +336,10 @@ mod tests {
 
         let (r, text) = drain_str(&root, "beta");
         let err = r.unwrap_err();
-        assert!(matches!(err, SeatError::BadMark(ref f) if f == "alpha"), "{err}");
+        assert!(
+            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
+            "{err}"
+        );
         assert!(err.to_string().contains("from 'alpha'"), "{err}");
         assert!(!text.contains("tampered body"), "no body printed: {text}");
         let qdir = seat::seat_dir(&root, "beta").join("quarantine");
@@ -353,7 +356,11 @@ mod tests {
         let root = setup();
         verbs::cmd_send(&root, "alpha", "beta", "byte flip").unwrap();
         let inbox = seat::seat_dir(&root, "beta").join("inbox");
-        let p = msg::list_msg_dir(&inbox).unwrap().into_iter().next().unwrap();
+        let p = msg::list_msg_dir(&inbox)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         let mut raw = std::fs::read(&p).unwrap();
         let i = raw.windows(9).position(|w| w == b"byte flip").unwrap();
         raw[i] = 0xff;
@@ -361,7 +368,10 @@ mod tests {
 
         let (r, text) = drain_str(&root, "beta");
         let err = r.unwrap_err();
-        assert!(matches!(err, SeatError::BadMark(ref f) if f == "alpha"), "{err}");
+        assert!(
+            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
+            "{err}"
+        );
         assert!(err.to_string().contains("from 'alpha'"), "{err}");
         assert!(!text.contains("byte"), "no body printed: {text}");
         assert!(msg::list_msg_dir(&inbox).unwrap().is_empty());
@@ -423,7 +433,10 @@ mod tests {
 
         let (r, text) = drain_str(&root, "beta");
         let err = r.unwrap_err();
-        assert!(matches!(err, SeatError::BadMark(ref f) if f == "alpha"), "{err}");
+        assert!(
+            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
+            "{err}"
+        );
         assert!(!text.contains("misfiled"));
         // Cursor advanced past it: a bad post does not wedge the seat.
         let (r2, text2) = drain_str(&root, "beta");
@@ -437,13 +450,20 @@ mod tests {
         room::create(&root, "ops").unwrap();
         room::cmd_post(&root, "ops", "alpha", "room original").unwrap();
         room::cmd_follow(&root, "ops", "beta").unwrap();
-        let p = room::posts(&root, "ops").unwrap().into_iter().next().unwrap();
+        let p = room::posts(&root, "ops")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         std::fs::write(&p, raw.replace("room original", "room tampered")).unwrap();
 
         let (r, text) = drain_str(&root, "beta");
         let err = r.unwrap_err();
-        assert!(matches!(err, SeatError::BadMark(ref f) if f == "alpha"), "{err}");
+        assert!(
+            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
+            "{err}"
+        );
         assert!(!text.contains("room tampered"), "{text}");
     }
 

@@ -3,7 +3,7 @@
 // seat, and never blocks on mail — data comes from the same read-only
 // helpers the `seats` verb uses. The only writer here is the terminal.
 use crate::board;
-use crate::error::{SeatError, Result};
+use crate::error::{Result, SeatError};
 use crate::msg;
 use crate::room;
 use crate::seat::{self, Lifecycle, WaiterState};

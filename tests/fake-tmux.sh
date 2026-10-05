@@ -139,7 +139,7 @@ while [ $# -gt 0 ]; do
         -p) paneflag=1; shift ;;
         -P) print=1; shift ;;
         -a) all=1; shift ;;
-        -d) shift ;;
+        -d|-w) shift ;;
         # Everything after -- is the command's raw argv: recorded, and
         # never executed. Words here may start with '-'.
         --) shift; while [ $# -gt 0 ]; do pos+=("$1"); shift; done ;;
@@ -204,9 +204,12 @@ case "$cmd" in
         exit 0
         ;;
     set-option)
-        [ "$paneflag" -eq 1 ] || die "set-option: only -p is supported here"
-        [ -n "$target" ] || die "set-option needs -t"
         [ "${#pos[@]}" -eq 2 ] || die "set-option needs OPTION VALUE"
+        if [ "$paneflag" -eq 0 ]; then
+            printf 'X|option|%s|%s|%s\n' "$target" "${pos[0]}" "${pos[1]}" >>"$STATE"
+            exit 0
+        fi
+        [ -n "$target" ] || die "set-option needs -t"
         pane_exists "$target" || die "no such pane: $target"
         printf 'O|%s|%s|%s\n' "$target" "${pos[0]}" "${pos[1]}" >>"$STATE"
         exit 0
@@ -239,6 +242,53 @@ case "$cmd" in
         # it and returns immediately so a test never hangs.
         [ -n "$target" ] || die "attach needs -t"
         printf 'X|attach|%s\n' "$target" >>"$STATE"
+        exit 0
+        ;;
+    join-pane)
+        # -s is the source pane. -t is the destination pane.
+        [ -n "$sess" ] || die "join-pane needs -s"
+        [ -n "$target" ] || die "join-pane needs -t"
+        pane_exists "$sess" || die "no such pane: $sess"
+        pane_exists "$target" || die "no such pane: $target"
+        destw="$(awk -F'|' -v p="$target" '$1 == "P" && $4 == p { print $3; exit }' "$STATE")"
+        [ -n "$destw" ] || die "no window for $target"
+        tmp="${STATE}.tmp.$$"
+        awk -F'|' -v p="$sess" -v w="$destw" '
+            BEGIN { OFS = "|" }
+            $1 == "P" && $4 == p { $3 = w }
+            { print }' "$STATE" >"$tmp" || { rm -f "$tmp"; die "state rewrite failed"; }
+        mv "$tmp" "$STATE"
+        exit 0
+        ;;
+    rename-window)
+        [ -n "$target" ] || die "rename-window needs -t"
+        [ "${#pos[@]}" -eq 1 ] || die "rename-window needs a name"
+        pane_exists "$target" || die "no such pane: $target"
+        old="$(awk -F'|' -v p="$target" '$1 == "P" && $4 == p { print $3; exit }' "$STATE")"
+        [ -n "$old" ] || die "no window for $target"
+        tmp="${STATE}.tmp.$$"
+        awk -F'|' -v o="$old" -v n="${pos[0]}" '
+            BEGIN { OFS = "|" }
+            $1 == "P" && $3 == o { $3 = n }
+            { print }' "$STATE" >"$tmp" || { rm -f "$tmp"; die "state rewrite failed"; }
+        mv "$tmp" "$STATE"
+        exit 0
+        ;;
+    select-layout)
+        [ -n "$target" ] || die "select-layout needs -t"
+        [ "${#pos[@]}" -eq 1 ] || die "select-layout needs a layout name"
+        printf 'X|layout|%s|%s\n' "${pos[0]}" "$target" >>"$STATE"
+        exit 0
+        ;;
+    select-window)
+        [ -n "$target" ] || die "select-window needs -t"
+        printf 'X|select|%s\n' "$target" >>"$STATE"
+        exit 0
+        ;;
+    set-hook)
+        [ -n "$target" ] || die "set-hook needs -t"
+        [ "${#pos[@]}" -eq 2 ] || die "set-hook needs a name and a command"
+        printf 'X|hook|%s|%s|%s\n' "$target" "${pos[0]}" "${pos[1]}" >>"$STATE"
         exit 0
         ;;
     *)

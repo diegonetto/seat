@@ -65,8 +65,12 @@ seat
 `arm` is the only waiter. The default lifecycle is `exit-wake`: one wake
 and the process exits. `poller` stays up until SIGTERM. A second `arm`
 sees the live waiter and exits 0. `gallery` prints the names that have a
-live pane in `swarm`, then attaches. It does not list a seat that is only
-awake. On a tty, `seat` with no verb is a read-only roster. `q` quits.
+live pane in `swarm`, joins those panes into one window named `gallery`,
+tiles it, and attaches. Each tile's border shows that pane's `@seat`
+name. Mouse is on. A zoomed pane stays full screen
+across a resize. It does not list a seat that is only awake, and it does
+not move any other pane. On a tty, `seat` with no verb is a read-only
+roster. `q` quits.
 The roster does not send, drain, or arm. Its state column is the waiter
 (`idle`, `live`, `orphan`, or `corrupt`), which is not presence.
 

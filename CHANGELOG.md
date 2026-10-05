@@ -10,6 +10,10 @@ Presence is `pane`, `awake`, or `unattended`. `pane` is a live pane in tmux sess
 
 The words `running`, `stopped-with-unread`, and `needs-operator` are no longer printed. `seat gallery` still prints only the pane names. The roster state column is still the waiter word (`idle`, `live`, `orphan`, or `corrupt`).
 
+`seat gallery` attaches on the caller's terminal. Capturing tmux's stdout made that attach exit with `open terminal failed: not a terminal` after the names had already been printed.
+
+`seat gallery` joins every live seat pane into one window named `gallery` and tiles it, so one terminal shows every running seat. Each tile's top border shows that pane's `@seat` name. A zoomed pane stays zoomed when the window resizes. Mouse is on.
+
 ## 0.1.3 — 2026-09-30
 
 crates.io categories are command-line-utilities and development-tools.

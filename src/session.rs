@@ -16,10 +16,15 @@ pub const SESSION: &str = "swarm";
 /// `pane_dead`, `@cwd` (JSON string), `@cmd` (JSON array). Compact
 /// JSON escapes tabs, so a tab inside a path or word cannot split a
 /// field. Seat names cannot contain whitespace.
-const PANE_FMT: &str = "#{session_name}\t#{pane_id}\t#{@seat}\t#{pane_dead}\t#{@cwd}\t#{@cmd}";
+const PANE_FMT: &str =
+    "#{session_name}\t#{pane_id}\t#{@seat}\t#{pane_dead}\t#{@cwd}\t#{@cmd}\t#{window_name}";
 
-/// Every tmux invocation funnels through here (T019): SEAT_TMUX is the
-/// program invoked instead of tmux, with the same arguments.
+/// The window `gallery` builds so every live seat is on one screen.
+const GALLERY_WINDOW: &str = "gallery";
+
+/// Every tmux query funnels through here (T019): SEAT_TMUX is the
+/// program invoked instead of tmux, with the same arguments. `attach`
+/// does not: see `tmux_attach`.
 fn tmux_prog() -> String {
     std::env::var_os("SEAT_TMUX")
         .filter(|v| !v.is_empty())
@@ -40,6 +45,28 @@ fn tmux(prog: &str, args: &[&str]) -> Result<std::process::Output> {
         .args(args)
         .output()
         .map_err(|e| SeatError::Tmux(format!("cannot run {prog:?}: {e}")))
+}
+
+/// Attach to `session` on the caller's terminal.
+///
+/// `tmux()` uses `.output()`, which pipes stdout. tmux then exits with
+/// `open terminal failed: not a terminal` after `gallery` has already
+/// printed the pane names. Attach must inherit stdin, stdout, and
+/// stderr. Do not route it through `tmux()`.
+fn tmux_attach(prog: &str, target: &str) -> Result<()> {
+    let status = std::process::Command::new(prog)
+        .args(["attach", "-t", target])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| SeatError::Tmux(format!("cannot run {prog:?}: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(SeatError::Tmux(format!(
+        "`{prog} attach -t {target}` failed: {status}"
+    )))
 }
 
 /// Run tmux and refuse to continue when it fails.
@@ -67,6 +94,7 @@ pub struct Pane {
     pub dead: bool,
     pub cwd: String,
     pub cmd: String,
+    pub window: String,
 }
 
 /// The liveness query (T021): `list-panes -a -F` over every session.
@@ -90,6 +118,7 @@ pub fn panes(prog: &str) -> Result<Vec<Pane>> {
                     dead: fields.next() == Some("1"),
                     cwd: fields.next().unwrap_or("").to_string(),
                     cmd: fields.next().unwrap_or("").to_string(),
+                    window: fields.next().unwrap_or("").to_string(),
                 });
             }
             _ => continue,
@@ -304,10 +333,11 @@ pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `seat gallery` — print the pane names, one per line, then attach to
-/// the session (T018). With SEAT_TMUX set the names are printed and
-/// there is no attach. With no pane it reports `gallery: empty`, exits
-/// 0, and registers no seat. Awake and unattended seats are not listed.
+/// `seat gallery` — print the live seat names, tile those panes into
+/// one window, then attach (T018). With SEAT_TMUX set the names are
+/// printed and there is no tile and no attach. With no pane it reports
+/// `gallery: empty`, exits 0, and registers no seat. Awake and
+/// unattended seats are not listed and their panes are not moved.
 pub fn cmd_gallery(root: &Path) -> Result<()> {
     board::ensure_board(root)?;
     let registered: BTreeSet<String> = verbs::sorted_seat_names(root)?.into_iter().collect();
@@ -336,15 +366,72 @@ fn gallery(
         writeln!(out, "{name}")?;
     }
     if attach {
-        let res = tmux(prog, &["attach", "-t", SESSION])?;
-        if !res.status.success() {
-            return Err(SeatError::Tmux(format!(
-                "`{} attach -t {SESSION}` failed: {}",
-                prog,
-                String::from_utf8_lossy(&res.stderr).trim()
-            )));
-        }
+        out.flush()?;
+        tile_seats(prog, &running)?;
+        tmux_attach(prog, &format!("{SESSION}:{GALLERY_WINDOW}"))?;
     }
+    Ok(())
+}
+
+/// Join every live registered seat pane into one window and tile it.
+///
+/// The join target is a pane id, the same way the previous gallery did
+/// it. A pane that is not in `seats` stays where it is. The resize hook
+/// re-tiles after a size change and leaves a zoomed pane alone, so one
+/// seat can still fill the screen. Mouse is on so a click focuses a pane.
+fn tile_seats(prog: &str, seats: &BTreeSet<String>) -> Result<()> {
+    let mut mine: Vec<Pane> = panes(prog)?
+        .into_iter()
+        .filter(|p| p.session == SESSION && !p.dead && seats.contains(&p.seat))
+        .collect();
+    mine.sort_by(|a, b| a.seat.cmp(&b.seat));
+    if mine.is_empty() {
+        return Ok(());
+    }
+    let dest_id = mine
+        .iter()
+        .find(|p| p.window == GALLERY_WINDOW)
+        .map(|p| p.id.clone())
+        .unwrap_or_else(|| mine[0].id.clone());
+    let dest_window = mine
+        .iter()
+        .find(|p| p.id == dest_id)
+        .map(|p| p.window.clone())
+        .unwrap_or_default();
+    for pane in &mine {
+        if pane.id == dest_id || pane.window == dest_window {
+            continue;
+        }
+        tmux_ok(prog, &["join-pane", "-s", &pane.id, "-t", &dest_id])?;
+    }
+    tmux_ok(prog, &["rename-window", "-t", &dest_id, GALLERY_WINDOW])?;
+    let target = format!("{SESSION}:{GALLERY_WINDOW}");
+    // A window has one name. The seat name stays on the pane as @seat,
+    // and the border shows that. Programs rewrite pane titles.
+    tmux_ok(
+        prog,
+        &["set-option", "-w", "-t", &target, "pane-border-status", "top"],
+    )?;
+    tmux_ok(
+        prog,
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            &target,
+            "pane-border-format",
+            "#{?pane_active,#[reverse],}#{@seat}",
+        ],
+    )?;
+    tmux_ok(prog, &["select-layout", "-t", &target, "tiled"])?;
+    let hook =
+        format!("if-shell -F '#{{window_zoomed_flag}}' '' 'select-layout -t {target} tiled'");
+    tmux_ok(
+        prog,
+        &["set-hook", "-w", "-t", &target, "window-resized", &hook],
+    )?;
+    tmux_ok(prog, &["set-option", "-t", SESSION, "mouse", "on"])?;
+    tmux_ok(prog, &["select-window", "-t", &target])?;
     Ok(())
 }
 
@@ -651,9 +738,30 @@ mod tests {
         let mut shown = Vec::new();
         gallery(&fake_tmux(), false, &registered, &mut shown).unwrap();
         assert_eq!(String::from_utf8(shown).unwrap(), "alpha\n");
+        cmd_up(&root, &["beta".to_string()]).unwrap();
         gallery(&fake_tmux(), true, &registered, &mut Vec::new()).unwrap();
         let recorded = std::fs::read_to_string(&state).unwrap();
-        assert!(recorded.contains("X|attach|swarm"), "{recorded}");
+        assert!(recorded.contains("X|attach|swarm:gallery\n"), "{recorded}");
+        assert!(
+            recorded.contains("X|layout|tiled|swarm:gallery"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("window_zoomed_flag"), "{recorded}");
+        assert!(
+            recorded.contains("X|option|swarm:gallery|pane-border-status|top"),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains("pane-border-format|#{?pane_active,#[reverse],}#{@seat}"),
+            "{recorded}"
+        );
+        let after = panes(&fake_tmux()).unwrap();
+        for name in ["alpha", "beta"] {
+            let pane = after.iter().find(|p| p.seat == name).unwrap();
+            assert_eq!(pane.window, "gallery", "{name} was left in its own window");
+        }
+        let stray_pane = after.iter().find(|p| p.id == stray_id).unwrap();
+        assert_eq!(stray_pane.window, "stray", "unregistered pane was moved");
 
         // Drop the unregistered pane so the next check is about seats.
         let killed = std::process::Command::new(fake_tmux())
@@ -669,6 +777,97 @@ mod tests {
 
         std::env::remove_var("SEAT_TMUX");
         std::env::remove_var("SEAT_FAKE_STATE");
+    }
+
+    /// `gallery` used to capture tmux's stdout, so attach failed with
+    /// "not a terminal" on a real shell. The probe is re-exec'd with a
+    /// pty as its terminal and a script that exits 0 only when both
+    /// stdin and stdout are ttys.
+    #[test]
+    fn attach_inherits_the_callers_terminal() {
+        if std::env::var_os("SEAT_TTY_PROBE").is_some() {
+            let prog = std::env::var("SEAT_TTY_PROBE_PROG").expect("probe prog");
+            tmux_attach(&prog, SESSION).expect("attach must see a terminal");
+            return;
+        }
+
+        let dir = temp_root("attach-tty");
+        let prog = dir.join("tty-check.sh");
+        std::fs::write(
+            &prog,
+            "#!/bin/sh\nif [ -t 0 ] && [ -t 1 ]; then exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+
+        let bin = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("--exact")
+            .arg("session::tests::attach_inherits_the_callers_terminal")
+            .arg("--test-threads=1")
+            .env("SEAT_TTY_PROBE", "1")
+            .env("SEAT_TTY_PROBE_PROG", &prog);
+        unsafe {
+            use std::os::unix::io::FromRawFd;
+            use std::os::unix::process::CommandExt;
+            cmd.stdin(std::process::Stdio::from_raw_fd(libc::dup(slave)))
+                .stdout(std::process::Stdio::from_raw_fd(libc::dup(slave)))
+                .stderr(std::process::Stdio::from_raw_fd(libc::dup(slave)))
+                .pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            libc::close(slave);
+        }
+
+        let mut child = cmd.spawn().expect("spawn tty probe");
+        // Command keeps its slave fds until dropped. The master read
+        // only sees EOF once those fds close.
+        drop(cmd);
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let mut acc = Vec::new();
+            loop {
+                let n =
+                    unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe { libc::close(master) };
+            acc
+        });
+        let status = child.wait().unwrap();
+        let acc = drain.join().unwrap();
+        let text = String::from_utf8_lossy(&acc);
+        assert!(
+            status.success(),
+            "attach child failed: {status}, output:\n{text}"
+        );
+        assert!(
+            text.contains("attach_inherits_the_callers_terminal"),
+            "probe did not run the attach test:\n{text}"
+        );
     }
 
     /// The launch story (003 US1): `up` starts the stored command in

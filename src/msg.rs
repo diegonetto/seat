@@ -1,4 +1,4 @@
-use crate::error::{SeatError, Result};
+use crate::error::{Result, SeatError};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};

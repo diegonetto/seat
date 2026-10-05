@@ -28,7 +28,7 @@ A background process the board cannot see, because it has no pane and no `wait.p
 
 ## What this does not change
 
-- `seat gallery` prints only the pane names, then attaches. It does not list awake or unattended seats. It does not tile.
+- `seat gallery` prints only the pane names, joins those panes into one window, tiles it, then attaches. It does not list awake or unattended seats. It does not move a pane that is not a registered live seat.
 - The roster state column stays `idle`, `live`, `orphan`, or `corrupt`. That column is who holds `wait.pid`. It is not presence.
 - Wake method (exit-wake, poller, queue, send-keys) is not a status field.
 - `seat arm` polls and does not drain. This change does not add a periodic drain.

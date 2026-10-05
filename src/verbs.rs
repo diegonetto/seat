@@ -182,12 +182,25 @@ mod tests {
     #[test]
     fn register_persists_default_lifecycle() {
         let root = setup();
-        cmd_register(&root, "alpha", "sb", Some("glm".into()), None, None, Vec::new()).unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            Some("glm".into()),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let dir = seat::seat_dir(&root, "alpha");
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.harness, "sb");
         assert_eq!(meta.model.as_deref(), Some("glm"));
-        assert_eq!(meta.lifecycle, Some(Lifecycle::ExitWake), "default lifecycle");
+        assert_eq!(
+            meta.lifecycle,
+            Some(Lifecycle::ExitWake),
+            "default lifecycle"
+        );
         assert!(meta.last_seen.is_some());
         assert!(seat::token_path(&dir).is_file());
     }
@@ -212,7 +225,16 @@ mod tests {
         let inbox_before = msg::list_msg_dir(&dir.join("inbox")).unwrap();
 
         // Duplicate register succeeds and touches nothing.
-        cmd_register(&root, "alpha", "other-harness", None, None, None, Vec::new()).unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "other-harness",
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(seat::token_path(&dir)).unwrap(),
@@ -290,15 +312,21 @@ mod tests {
         assert_eq!(meta.cwd.as_deref(), Some(cwd.as_str()));
         assert_eq!(
             meta.cmd.as_deref(),
-            Some(&["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()][..])
+            Some(
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string()
+                ][..]
+            )
         );
         // A mail-only seat stores neither field.
         cmd_register(&root, "mailbox", "sb", None, None, None, Vec::new()).unwrap();
         let meta = seat::read_meta(&seat::seat_dir(&root, "mailbox")).unwrap();
         assert_eq!(meta.cwd, None);
         assert_eq!(meta.cmd, None);
-        let raw = std::fs::read_to_string(seat::meta_path(&seat::seat_dir(&root, "mailbox")))
-            .unwrap();
+        let raw =
+            std::fs::read_to_string(seat::meta_path(&seat::seat_dir(&root, "mailbox"))).unwrap();
         assert!(!raw.contains("\"cwd\""), "{raw}");
         assert!(!raw.contains("\"cmd\""), "{raw}");
     }
@@ -322,7 +350,10 @@ mod tests {
                 Err(SeatError::BadCwd(_))
             ));
         }
-        assert!(!seat::seat_dir(&root, "new").exists(), "refused register created nothing");
+        assert!(
+            !seat::seat_dir(&root, "new").exists(),
+            "refused register created nothing"
+        );
 
         // An existing seat keeps its stored launch, byte for byte.
         let cwd = root.display().to_string();
@@ -356,7 +387,10 @@ mod tests {
             before,
             "refused register wrote no meta.json"
         );
-        assert_eq!(std::fs::read_to_string(seat::token_path(&dir)).unwrap(), token);
+        assert_eq!(
+            std::fs::read_to_string(seat::token_path(&dir)).unwrap(),
+            token
+        );
     }
 
     /// The duplicate-register rows quickstart step 4 exercises (003
@@ -412,11 +446,23 @@ mod tests {
 
         // Omitted launch fields stay as stored: a cmd-only pass keeps
         // the directory; a pass with neither keeps both.
-        cmd_register(&root, "box", "sb", None, None, None, vec!["/bin/sleep".into(), "9".into()])
-            .unwrap();
+        cmd_register(
+            &root,
+            "box",
+            "sb",
+            None,
+            None,
+            None,
+            vec!["/bin/sleep".into(), "9".into()],
+        )
+        .unwrap();
         cmd_register(&root, "box", "sb", None, None, None, Vec::new()).unwrap();
         let meta = seat::read_meta(&dir).unwrap();
-        assert_eq!(meta.cwd.as_deref(), Some(cwd.as_str()), "cwd omitted: unchanged");
+        assert_eq!(
+            meta.cwd.as_deref(),
+            Some(cwd.as_str()),
+            "cwd omitted: unchanged"
+        );
         assert_eq!(
             meta.cmd.as_deref(),
             Some(&["/bin/sleep".to_string(), "9".to_string()][..]),
@@ -448,21 +494,47 @@ mod tests {
         // Zero words after `--` is an omission, not a clear.
         cmd_register(&root, "alpha", "sb", None, None, None, Vec::new()).unwrap();
         let meta = seat::read_meta(&dir).unwrap();
-        assert_eq!(meta.cmd.as_deref(), Some(&["/bin/sleep".to_string(), "5".to_string()][..]));
+        assert_eq!(
+            meta.cmd.as_deref(),
+            Some(&["/bin/sleep".to_string(), "5".to_string()][..])
+        );
 
         // Only the command passed: the directory stays.
-        cmd_register(&root, "alpha", "sb", None, None, None, vec!["/bin/sleep".into(), "9".into()])
-            .unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            None,
+            None,
+            vec!["/bin/sleep".into(), "9".into()],
+        )
+        .unwrap();
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.cwd.as_deref(), Some(cwd.as_str()));
-        assert_eq!(meta.cmd.as_deref(), Some(&["/bin/sleep".to_string(), "9".to_string()][..]));
+        assert_eq!(
+            meta.cmd.as_deref(),
+            Some(&["/bin/sleep".to_string(), "9".to_string()][..])
+        );
 
         // Only the directory passed: the command stays.
         let other = root.join("elsewhere").display().to_string();
         std::fs::create_dir_all(&other).unwrap();
-        cmd_register(&root, "alpha", "sb", None, None, Some(other.clone()), Vec::new()).unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            None,
+            Some(other.clone()),
+            Vec::new(),
+        )
+        .unwrap();
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.cwd.as_deref(), Some(other.as_str()));
-        assert_eq!(meta.cmd.as_deref(), Some(&["/bin/sleep".to_string(), "9".to_string()][..]));
+        assert_eq!(
+            meta.cmd.as_deref(),
+            Some(&["/bin/sleep".to_string(), "9".to_string()][..])
+        );
     }
 }

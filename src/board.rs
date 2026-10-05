@@ -151,7 +151,10 @@ mod tests {
         init(&root).unwrap();
         std::fs::create_dir_all(seats_dir(&root).join("alpha")).unwrap();
         init(&root).unwrap(); // non-empty, but ours
-        assert!(seats_dir(&root).join("alpha").is_dir(), "init kept the seat");
+        assert!(
+            seats_dir(&root).join("alpha").is_dir(),
+            "init kept the seat"
+        );
     }
 
     #[test]
@@ -167,7 +170,10 @@ mod tests {
         std::fs::write(root.join("junk"), "not ours").unwrap();
         let err = init(&root).unwrap_err();
         assert!(matches!(err, SeatError::ForeignRoot(_)));
-        assert!(err.to_string().contains(&root.display().to_string()), "{err}");
+        assert!(
+            err.to_string().contains(&root.display().to_string()),
+            "{err}"
+        );
         // A wrong marker is foreign too.
         let wrong = temp_root("board-wrong-marker");
         std::fs::write(marker_path(&wrong), "memo").unwrap();
@@ -260,7 +266,10 @@ mod tests {
 
         std::env::set_var("SEAT_ROOT", &thrown);
         assert_eq!(resolve_root(None), thrown);
-        assert_eq!(resolve_root(Some("/elsewhere")), PathBuf::from("/elsewhere"));
+        assert_eq!(
+            resolve_root(Some("/elsewhere")),
+            PathBuf::from("/elsewhere")
+        );
         std::env::remove_var("SEAT_ROOT");
         std::env::remove_var("MEMO_ROOT");
     }
