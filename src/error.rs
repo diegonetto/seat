@@ -78,9 +78,6 @@ pub enum SeatError {
     #[error("up: seat {0} did not start: {1}")]
     StartFailed(String, String),
 
-    #[error("tui: {0}")]
-    Tui(String),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

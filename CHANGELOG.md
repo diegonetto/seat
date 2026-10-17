@@ -2,6 +2,12 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## 0.2.1 — 2026-10-17
+
+### Removed
+
+- The interactive roster TUI (`src/tui.rs`, the `ratatui` and `crossterm` dependencies): bare `seat` now prints the CLI help.
+
 ## 0.2.0 — 2026-10-04
 
 `seat status` prints two fields. The line is `<name> <presence> mail=<N>`.

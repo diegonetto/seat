@@ -10,10 +10,9 @@ mod serve;
 mod session;
 #[cfg(test)]
 mod testutil;
-mod tui;
 mod verbs;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use seat::Lifecycle;
 use std::path::Path;
 
@@ -215,10 +214,7 @@ fn main() {
     let cli = Cli::parse();
     let root = board::resolve_root(cli.root.as_deref());
     let code = match cli.command {
-        // Bare seat on a tty is the interactive roster (FR-005); it
-        // only reads. tui::launch decides and fails with one clean
-        // line, never a panic.
-        None => match tui::launch(&root) {
+        None => match Cli::command().print_help() {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("seat: {e}");
