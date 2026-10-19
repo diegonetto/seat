@@ -54,6 +54,12 @@ pub enum SeatError {
     #[error("token for seat {0} is not valid hex")]
     BadToken(String),
 
+    #[error("seat '{0}' is busy: another drain holds its lock (gave up after 30s)")]
+    SeatBusy(String),
+
+    #[error("{0}")]
+    Identity(String),
+
     #[error("arm: seat {0} already has a live waiter (pid {1}); pass --takeover to replace it")]
     WaiterBusy(String, u32),
 

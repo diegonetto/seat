@@ -34,3 +34,22 @@ pub fn assert_throwaway(root: &std::path::Path) {
         "test board root {root:?} must live under the system temp dir"
     );
 }
+
+/// Write a throwaway `<root>/hapi-sessions.json` binding each seat to
+/// a session id (the id becomes the url's last path segment), the same
+/// shape seat-role writes.
+pub fn write_bindings(root: &std::path::Path, seats: &[(&str, &str)]) {
+    let mut map = serde_json::Map::new();
+    for (seat, id) in seats {
+        map.insert(
+            seat.to_string(),
+            serde_json::json!({
+                "url": format!("https://hapi.bll.dev/sessions/{id}"),
+                "moved_at": "2026-10-19T00:00:00Z",
+            }),
+        );
+    }
+    let doc = serde_json::json!({ "schema_version": 1, "seats": map });
+    std::fs::write(root.join(crate::identity::BINDINGS_FILE), doc.to_string())
+        .expect("write test bindings");
+}

@@ -1,6 +1,7 @@
 use crate::board::{self, valid_name};
 use crate::drain;
 use crate::error::{Result, SeatError};
+use crate::identity;
 use crate::msg;
 use crate::room;
 use crate::seat::{self, Lifecycle};
@@ -44,14 +45,14 @@ pub fn cmd_register(
             println!("seat '{name}' already registered (token and mail kept)");
             return Ok(());
         }
-        let mut meta = seat::read_meta(&dir)?;
-        if let Some(c) = cwd {
-            meta.cwd = Some(c);
-        }
-        if !cmd.is_empty() {
-            meta.cmd = Some(cmd);
-        }
-        seat::write_meta(&dir, &meta)?;
+        seat::update_meta(&dir, |m| {
+            if let Some(c) = cwd {
+                m.cwd = Some(c);
+            }
+            if !cmd.is_empty() {
+                m.cmd = Some(cmd);
+            }
+        })?;
         println!("seat '{name}' already registered (token and mail kept)");
         println!("seat '{name}' launch updated");
         return Ok(());
@@ -92,9 +93,21 @@ pub fn sender_token(root: &Path, seat_name: &str) -> Result<String> {
 }
 
 /// Send a direct message: MAC keyed by the *sender's* token, file lands
-/// in the destination seat's inbox.
-pub fn cmd_send(root: &Path, from: &str, to: &str, body: &str) -> Result<()> {
+/// in the destination seat's inbox. The sender is fixed by the identity
+/// rule (`--from` optional; see `crate::identity`): a bound session
+/// sends only as its seat, an unbound caller's omitted `--from` sends
+/// as `inbox` to a factory seat. `env_session` is the caller's
+/// `HAPI_SESSION_ID`, read at the CLI edge.
+pub fn cmd_send(
+    root: &Path,
+    from: Option<&str>,
+    to: &str,
+    body: &str,
+    env_session: Option<&str>,
+) -> Result<()> {
     board::ensure_board(root)?;
+    let who = identity::resolve_for_send(root, from, env_session, to)?;
+    let from = who.from.as_str();
     valid_name(from)?;
     valid_name(to)?;
     seat::read_meta(&seat::seat_dir(root, to)).map_err(|e| match e {
@@ -108,6 +121,7 @@ pub fn cmd_send(root: &Path, from: &str, to: &str, body: &str) -> Result<()> {
         from,
         &token,
         body,
+        who.session.as_deref(),
     )?;
     touch_last_seen(root, from)?;
     println!("sent {} from {from} to {to}", header.id);
@@ -115,11 +129,15 @@ pub fn cmd_send(root: &Path, from: &str, to: &str, body: &str) -> Result<()> {
 }
 
 /// Bump `meta.last_seen` for a seat that just acted on the board.
+/// Atomic read-modify-write under the metadata lock (never the drain
+/// lock), so a send never waits on a drain and never clobbers a
+/// concurrent change to another field.
 pub fn touch_last_seen(root: &Path, seat_name: &str) -> Result<()> {
     let dir = seat::seat_dir(root, seat_name);
-    let mut meta = seat::read_meta(&dir)?;
-    meta.last_seen = Some(seat::now_ts());
-    seat::write_meta(&dir, &meta)
+    seat::update_meta(&dir, |meta| {
+        meta.last_seen = Some(seat::now_ts());
+    })?;
+    Ok(())
 }
 
 /// The burn switch: remove the board under the root (FR-010).
@@ -219,7 +237,7 @@ mod tests {
         )
         .unwrap();
         cmd_register(&root, "beta", "sb", None, None, None, Vec::new()).unwrap();
-        cmd_send(&root, "beta", "alpha", "keep my mail").unwrap();
+        cmd_send(&root, Some("beta"), "alpha", "keep my mail", None).unwrap();
         let dir = seat::seat_dir(&root, "alpha");
         let token_before = std::fs::read_to_string(seat::token_path(&dir)).unwrap();
         let inbox_before = msg::list_msg_dir(&dir.join("inbox")).unwrap();
@@ -271,15 +289,15 @@ mod tests {
         cmd_register(&root, "beta", "sb", None, None, None, Vec::new()).unwrap();
 
         assert!(matches!(
-            cmd_send(&root, "ghost", "beta", "hi"),
+            cmd_send(&root, Some("ghost"), "beta", "hi", None),
             Err(SeatError::GhostSeat(_))
         ));
         assert!(matches!(
-            cmd_send(&root, "alpha", "ghost", "hi"),
+            cmd_send(&root, Some("alpha"), "ghost", "hi", None),
             Err(SeatError::UnknownSeat(_))
         ));
 
-        cmd_send(&root, "alpha", "beta", "hello verbs").unwrap();
+        cmd_send(&root, Some("alpha"), "beta", "hello verbs", None).unwrap();
         let inbox = seat::seat_dir(&root, "beta").join("inbox");
         assert_eq!(msg::list_msg_dir(&inbox).unwrap().len(), 1);
         let meta = seat::read_meta(&seat::seat_dir(&root, "alpha")).unwrap();
@@ -412,7 +430,7 @@ mod tests {
         )
         .unwrap();
         cmd_register(&root, "box", "sb", None, None, None, Vec::new()).unwrap();
-        cmd_send(&root, "run", "box", "kept").unwrap();
+        cmd_send(&root, Some("run"), "box", "kept", None).unwrap();
         let dir = seat::seat_dir(&root, "box");
         let token_before = std::fs::read(seat::token_path(&dir)).unwrap();
 
@@ -536,5 +554,161 @@ mod tests {
             meta.cmd.as_deref(),
             Some(&["/bin/sleep".to_string(), "9".to_string()][..])
         );
+    }
+
+    /// The identity-rule board: inbox, a bound seat, and an ordinary
+    /// seat, with bindings tying the bound seat to a session id.
+    fn identity_setup() -> std::path::PathBuf {
+        let root = temp_root("verbs-identity");
+        board::init(&root).unwrap();
+        for name in ["alpha", "inbox", "opus-main", "bll-factory"] {
+            cmd_register(&root, name, "sb", None, None, None, Vec::new()).unwrap();
+        }
+        crate::testutil::write_bindings(
+            &root,
+            &[("opus-main", "sid-opus"), ("bll-factory", "sid-factory")],
+        );
+        root
+    }
+
+    fn one_inbox_message(root: &std::path::Path, to: &str) -> std::path::PathBuf {
+        let inbox = seat::seat_dir(root, to).join("inbox");
+        let messages = msg::list_msg_dir(&inbox).unwrap();
+        assert_eq!(messages.len(), 1);
+        messages[0].clone()
+    }
+
+    #[test]
+    fn bound_session_sends_as_itself() {
+        let root = identity_setup();
+        cmd_send(
+            &root,
+            None,
+            "alpha",
+            "from the bound seat",
+            Some("sid-opus"),
+        )
+        .unwrap();
+        let p = one_inbox_message(&root, "alpha");
+        let (header, body) = msg::read_msg(&p).unwrap();
+        assert_eq!(header.from, "opus-main");
+        assert_eq!(
+            header.session, None,
+            "bound senders write no session header"
+        );
+        assert_eq!(body, "from the bound seat");
+        let token = sender_token(&root, "opus-main").unwrap();
+        assert!(msg::verify_msg(&p, &token).unwrap());
+        // Explicit and matching --from is the same send.
+        cmd_send(
+            &root,
+            Some("opus-main"),
+            "alpha",
+            "explicit match",
+            Some("sid-opus"),
+        )
+        .unwrap();
+        assert_eq!(
+            msg::list_msg_dir(&seat::seat_dir(&root, "alpha").join("inbox"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn bound_session_sending_as_another_seat_is_refused() {
+        let root = identity_setup();
+        let err = cmd_send(
+            &root,
+            Some("bll-factory"),
+            "alpha",
+            "nope",
+            Some("sid-opus"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bound to opus-main")
+                && err.to_string().contains("cannot send as bll-factory"),
+            "{err}"
+        );
+        assert!(matches!(err, SeatError::Identity(_)));
+        // Nothing was sent.
+        assert!(
+            msg::list_msg_dir(&seat::seat_dir(&root, "alpha").join("inbox"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unbound_explicit_from_is_unchanged() {
+        let root = identity_setup();
+        // No session id at all: exactly today's send.
+        cmd_send(&root, Some("alpha"), "bll-factory", "plain send", None).unwrap();
+        let p = one_inbox_message(&root, "bll-factory");
+        let (header, _) = msg::read_msg(&p).unwrap();
+        assert_eq!(header.from, "alpha");
+        assert_eq!(header.session, None);
+
+        // An unbound session id with an explicit --from: same sender,
+        // plus the session header, covered by the HMAC.
+        cmd_send(
+            &root,
+            Some("alpha"),
+            "bll-factory",
+            "with session",
+            Some("sid-adhoc"),
+        )
+        .unwrap();
+        let messages =
+            msg::list_msg_dir(&seat::seat_dir(&root, "bll-factory").join("inbox")).unwrap();
+        assert_eq!(messages.len(), 2);
+        let (header, _) = msg::read_msg(messages.last().unwrap()).unwrap();
+        assert_eq!(header.from, "alpha");
+        assert_eq!(header.session.as_deref(), Some("sid-adhoc"));
+        let token = sender_token(&root, "alpha").unwrap();
+        assert!(msg::verify_msg(messages.last().unwrap(), &token).unwrap());
+    }
+
+    #[test]
+    fn unbound_omitted_from_sends_as_inbox_to_a_factory_seat() {
+        let root = identity_setup();
+        cmd_send(&root, None, "bll-factory", "hq mail", None).unwrap();
+        let p = one_inbox_message(&root, "bll-factory");
+        let (header, body) = msg::read_msg(&p).unwrap();
+        assert_eq!(header.from, "inbox");
+        assert_eq!(body, "hq mail");
+        assert_eq!(header.session, None);
+        let token = sender_token(&root, "inbox").unwrap();
+        assert!(msg::verify_msg(&p, &token).unwrap());
+        // last_seen was stamped on the acting seat (inbox).
+        let meta = seat::read_meta(&seat::seat_dir(&root, "inbox")).unwrap();
+        assert!(meta.last_seen.is_some());
+    }
+
+    #[test]
+    fn unbound_omitted_from_to_a_non_factory_seat_is_refused() {
+        let root = identity_setup();
+        let err = cmd_send(&root, None, "alpha", "no diego here", None).unwrap_err();
+        assert!(matches!(err, SeatError::Identity(_)), "{err}");
+        assert!(err.to_string().contains("inbox"), "{err}");
+        assert!(err.to_string().contains("alpha"), "{err}");
+        assert!(
+            msg::list_msg_dir(&seat::seat_dir(&root, "alpha").join("inbox"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // An unbound session id fares the same, and writes nothing.
+        let err = cmd_send(&root, None, "alpha", "no diego here", Some("sid-adhoc")).unwrap_err();
+        assert!(matches!(err, SeatError::Identity(_)), "{err}");
+        // No bindings file at all: no seat is a factory seat.
+        let bare = temp_root("verbs-identity-bare");
+        board::init(&bare).unwrap();
+        for name in ["alpha", "inbox"] {
+            cmd_register(&bare, name, "sb", None, None, None, Vec::new()).unwrap();
+        }
+        assert!(cmd_send(&bare, None, "alpha", "no file", None).is_err());
     }
 }

@@ -3,6 +3,7 @@
 mod board;
 mod drain;
 mod error;
+mod identity;
 mod msg;
 mod room;
 mod seat;
@@ -41,10 +42,12 @@ enum Command {
     Init,
     /// Register a seat and mint its one-time token
     Register(RegisterArgs),
-    /// Send a message from one seat to another
+    /// Send a message from one seat to another. `--from` is fixed by
+    /// the identity rule when omitted (a bound session sends as its
+    /// seat; otherwise the message goes as `inbox` to a factory seat).
     Send {
         #[arg(long)]
-        from: String,
+        from: Option<String>,
         /// Destination seat
         to: String,
         body: String,
@@ -121,12 +124,13 @@ struct RegisterArgs {
 enum RoomAction {
     /// Create a room
     Create { room: String },
-    /// Post a message into a room
+    /// Post a message into a room. `--from` may be omitted only by a
+    /// session bound to the posting seat (the identity rule).
     Post {
         room: String,
         body: String,
         #[arg(long)]
-        from: String,
+        from: Option<String>,
     },
     /// Print a room's posts
     Read { room: String },
@@ -156,7 +160,16 @@ fn refuse_room(verb: &str) -> ! {
     std::process::exit(2);
 }
 
-fn dispatch(root: &Path, cmd: Command) -> error::Result<()> {
+/// The caller's session id, read once at the CLI edge (empty means
+/// none) and passed into the verbs — library code never reads the
+/// environment for this, so tests never race on it.
+fn env_session_id() -> Option<String> {
+    std::env::var("HAPI_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<()> {
     match cmd {
         Command::Init => verbs::cmd_init(root),
         Command::Register(args) => verbs::cmd_register(
@@ -168,12 +181,14 @@ fn dispatch(root: &Path, cmd: Command) -> error::Result<()> {
             args.cwd,
             args.cmd,
         ),
-        Command::Send { from, to, body } => verbs::cmd_send(root, &from, &to, &body),
+        Command::Send { from, to, body } => {
+            verbs::cmd_send(root, from.as_deref(), &to, &body, session)
+        }
         Command::Drain { seat } => {
             let mut out = std::io::stdout().lock();
             verbs::cmd_drain(root, &seat, &mut out)
         }
-        Command::Room { action } => dispatch_room(root, action),
+        Command::Room { action } => dispatch_room(root, action, session),
         Command::Up { names } => session::cmd_up(root, &names),
         Command::Down { names } => session::cmd_down(root, &names),
         Command::Gallery => session::cmd_gallery(root),
@@ -193,10 +208,12 @@ fn dispatch(root: &Path, cmd: Command) -> error::Result<()> {
     }
 }
 
-fn dispatch_room(root: &Path, action: RoomAction) -> error::Result<()> {
+fn dispatch_room(root: &Path, action: RoomAction, session: Option<&str>) -> error::Result<()> {
     match action {
         RoomAction::Create { room } => room::cmd_create(root, &room),
-        RoomAction::Post { room, body, from } => room::cmd_post(root, &room, &from, &body),
+        RoomAction::Post { room, body, from } => {
+            room::cmd_post(root, &room, from.as_deref(), &body, session)
+        }
         RoomAction::Read { room } => {
             let mut out = std::io::stdout().lock();
             room::cmd_read(root, &room, &mut out)
@@ -227,13 +244,16 @@ fn main() {
         Some(Command::Room {
             action: RoomAction::Unknown(words),
         }) => refuse_room(words.first().map(|w| w.as_str()).unwrap_or_default()),
-        Some(cmd) => match dispatch(&root, cmd) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("seat: {e}");
-                1
+        Some(cmd) => {
+            let session = env_session_id();
+            match dispatch(&root, cmd, session.as_deref()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("seat: {e}");
+                    1
+                }
             }
-        },
+        }
     };
     std::process::exit(code);
 }

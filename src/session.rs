@@ -555,9 +555,9 @@ mod tests {
         cmd_up(&root, &["paned".to_string()]).unwrap();
         seat::write_wait_pid(&seat::seat_dir(&root, "paned"), std::process::id()).unwrap();
         seat::write_wait_pid(&seat::seat_dir(&root, "waiter"), std::process::id()).unwrap();
-        verbs::cmd_send(&root, "quiet", "paned", "while up").unwrap();
-        verbs::cmd_send(&root, "quiet", "waiter", "one").unwrap();
-        verbs::cmd_send(&root, "paned", "waiter", "two").unwrap();
+        verbs::cmd_send(&root, Some("quiet"), "paned", "while up", None).unwrap();
+        verbs::cmd_send(&root, Some("quiet"), "waiter", "one", None).unwrap();
+        verbs::cmd_send(&root, Some("paned"), "waiter", "two", None).unwrap();
 
         let rows = status_rows(&root, &fake_tmux()).unwrap();
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
         // status: three seats, sorted. beta has mail and no pane;
         // gamma has an empty inbox and no pane. Mail does not change
         // presence, so both are unattended.
-        verbs::cmd_send(&root, "alpha", "beta", "unread while stopped").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "unread while stopped", None).unwrap();
         cmd_down(&root, &["gamma".to_string()]).unwrap();
         let rows = status_rows(&root, &fake_tmux()).unwrap();
         assert_eq!(
