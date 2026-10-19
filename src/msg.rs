@@ -27,6 +27,12 @@ pub struct Header {
     pub id: String,
     pub ts: String,
     pub hmac: String,
+    /// Optional sender session id (the unbound sender's
+    /// `HAPI_SESSION_ID`). Absent on every message written before the
+    /// identity rule and on every bound sender's message; covered by
+    /// the HMAC like the other header fields when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// Strip a leading UTF-8 BOM from a body before MACing (write and verify
@@ -46,7 +52,20 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
 }
 
 /// MAC input is `dest|from|id|ts|body` with the body BOM-stripped.
-fn mac_update(mac: &mut HmacSha256, dest: &str, from: &str, id: &str, ts: &str, body: &[u8]) {
+/// When the sender wrote a `session` header, its value is fed to the
+/// MAC after the body through the same `|` framing — so the input is
+/// exactly `dest|from|id|ts|body|session` when present, and stays
+/// byte-identical to the old format when absent (every existing
+/// message still verifies).
+fn mac_update(
+    mac: &mut HmacSha256,
+    dest: &str,
+    from: &str,
+    id: &str,
+    ts: &str,
+    body: &[u8],
+    session: Option<&str>,
+) {
     mac.update(dest.as_bytes());
     mac.update(b"|");
     mac.update(from.as_bytes());
@@ -56,6 +75,10 @@ fn mac_update(mac: &mut HmacSha256, dest: &str, from: &str, id: &str, ts: &str, 
     mac.update(ts.as_bytes());
     mac.update(b"|");
     mac.update(strip_bom(body));
+    if let Some(s) = session {
+        mac.update(b"|");
+        mac.update(s.as_bytes());
+    }
 }
 
 fn token_key(token_hex: &str) -> Result<Vec<u8>> {
@@ -70,11 +93,12 @@ pub fn compute_hmac(
     id: &str,
     ts: &str,
     body: &[u8],
+    session: Option<&str>,
 ) -> Result<String> {
     let key = token_key(token_hex)?;
     let mut mac =
         HmacSha256::new_from_slice(&key).map_err(|_| SeatError::BadToken("sender".to_string()))?;
-    mac_update(&mut mac, dest, from, id, ts, body);
+    mac_update(&mut mac, dest, from, id, ts, body, session);
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -87,6 +111,7 @@ pub fn verify_hmac(
     id: &str,
     ts: &str,
     body: &[u8],
+    session: Option<&str>,
     claimed_hex: &str,
 ) -> Result<bool> {
     let Ok(tag) = hex::decode(claimed_hex.trim()) else {
@@ -95,7 +120,7 @@ pub fn verify_hmac(
     let key = token_key(token_hex)?;
     let mut mac =
         HmacSha256::new_from_slice(&key).map_err(|_| SeatError::BadToken("sender".to_string()))?;
-    mac_update(&mut mac, dest, from, id, ts, body);
+    mac_update(&mut mac, dest, from, id, ts, body, session);
     Ok(mac.verify_slice(&tag).is_ok())
 }
 
@@ -133,6 +158,8 @@ pub fn filename_for(ts: &str, id: &str) -> String {
 }
 
 /// Write a `.msg` file: line 1 JSON header, blank line, raw body.
+/// `session` is the optional sender-session header field (fed to the
+/// MAC after the body); `None` writes none, exactly the old format.
 /// Returns the path and the header that was written.
 pub fn write_msg(
     dir: &Path,
@@ -140,16 +167,18 @@ pub fn write_msg(
     from: &str,
     token_hex: &str,
     body: &str,
+    session: Option<&str>,
 ) -> Result<(PathBuf, Header)> {
     let ts = now_ts();
     let id = new_id()?;
-    let mac = compute_hmac(token_hex, dest, from, &id, &ts, body.as_bytes())?;
+    let mac = compute_hmac(token_hex, dest, from, &id, &ts, body.as_bytes(), session)?;
     let mut header = Header {
         dest: dest.to_string(),
         from: from.to_string(),
         id: id.clone(),
         ts: ts.clone(),
         hmac: mac,
+        session: session.map(str::to_string),
     };
     let mut path = dir.join(filename_for(&ts, &id));
     // Same-microsecond + same random id is vanishingly rare, but never
@@ -160,7 +189,7 @@ pub fn write_msg(
         }
         let id2 = new_id()?;
         let ts2 = now_ts();
-        let mac2 = compute_hmac(token_hex, dest, from, &id2, &ts2, body.as_bytes())?;
+        let mac2 = compute_hmac(token_hex, dest, from, &id2, &ts2, body.as_bytes(), session)?;
         header = Header {
             hmac: mac2,
             id: id2.clone(),
@@ -203,7 +232,9 @@ pub fn read_msg(path: &Path) -> Result<(Header, String)> {
     Ok((header, body))
 }
 
-/// Read a message and verify its MAC with the sender's token.
+/// Read a message and verify its MAC with the sender's token. The
+/// header's optional `session` field (absent on old messages) is fed
+/// to the MAC when present.
 pub fn verify_msg(path: &Path, sender_token: &str) -> Result<bool> {
     let (header, body) = read_msg(path)?;
     verify_hmac(
@@ -213,6 +244,7 @@ pub fn verify_msg(path: &Path, sender_token: &str) -> Result<bool> {
         &header.id,
         &header.ts,
         body.as_bytes(),
+        header.session.as_deref(),
         &header.hmac,
     )
 }
@@ -255,7 +287,8 @@ mod tests {
     fn good_mac_verifies() {
         let root = temp_root("msg-good");
         let token = mint_token(&root.join("token")).unwrap();
-        let (path, header) = write_msg(&root, "beta", "alpha", &token, "hello board").unwrap();
+        let (path, header) =
+            write_msg(&root, "beta", "alpha", &token, "hello board", None).unwrap();
 
         // Layout: JSON header line, blank line, raw body.
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -279,7 +312,7 @@ mod tests {
     fn write_msg_publishes_atomically_no_tmp_left() {
         let root = temp_root("msg-atomic");
         let token = mint_token(&root.join("token")).unwrap();
-        let (path, _) = write_msg(&root, "beta", "alpha", &token, "atomic body").unwrap();
+        let (path, _) = write_msg(&root, "beta", "alpha", &token, "atomic body", None).unwrap();
         assert!(verify_msg(&path, &token).unwrap());
         // The scratch name is gone: only the final .msg (plus the token)
         // remains, and no non-.msg name lingers for a drain to trip on.
@@ -317,12 +350,12 @@ mod tests {
     #[test]
     fn dest_mismatch_does_not_verify() {
         let token = hex::encode([7u8; 16]);
-        let mac = compute_hmac(&token, "beta", "alpha", "id1", "ts1", b"hi").unwrap();
-        assert!(verify_hmac(&token, "beta", "alpha", "id1", "ts1", b"hi", &mac).unwrap());
-        assert!(!verify_hmac(&token, "gamma", "alpha", "id1", "ts1", b"hi", &mac).unwrap());
+        let mac = compute_hmac(&token, "beta", "alpha", "id1", "ts1", b"hi", None).unwrap();
+        assert!(verify_hmac(&token, "beta", "alpha", "id1", "ts1", b"hi", None, &mac).unwrap());
+        assert!(!verify_hmac(&token, "gamma", "alpha", "id1", "ts1", b"hi", None, &mac).unwrap());
         // Wrong key also fails.
         let other = hex::encode([8u8; 16]);
-        assert!(!verify_hmac(&other, "beta", "alpha", "id1", "ts1", b"hi", &mac).unwrap());
+        assert!(!verify_hmac(&other, "beta", "alpha", "id1", "ts1", b"hi", None, &mac).unwrap());
     }
 
     #[test]
@@ -330,21 +363,23 @@ mod tests {
         let root = temp_root("msg-bom");
         let token = mint_token(&root.join("token")).unwrap();
         let body = "\u{feff}hello".to_string();
-        let (path, _) = write_msg(&root, "beta", "alpha", &token, &body).unwrap();
+        let (path, _) = write_msg(&root, "beta", "alpha", &token, &body, None).unwrap();
         assert!(verify_msg(&path, &token).unwrap());
         // Direct: MAC of stripped body verifies against BOM'd body and vice versa.
-        let mac = compute_hmac(&token, "b", "a", "i", "t", "\u{feff}x".as_bytes()).unwrap();
-        assert!(verify_hmac(&token, "b", "a", "i", "t", "x".as_bytes(), &mac).unwrap());
+        let mac = compute_hmac(&token, "b", "a", "i", "t", "\u{feff}x".as_bytes(), None).unwrap();
+        assert!(verify_hmac(&token, "b", "a", "i", "t", "x".as_bytes(), None, &mac).unwrap());
         assert!(strip_bom(BOM) == b"".as_slice());
     }
 
     #[test]
     fn truncated_16_hex_mac_is_rejected() {
         let token = hex::encode([1u8; 16]);
-        let mac = compute_hmac(&token, "beta", "alpha", "id9", "ts9", b"body").unwrap();
+        let mac = compute_hmac(&token, "beta", "alpha", "id9", "ts9", b"body", None).unwrap();
         assert_eq!(mac.len(), 64);
         let truncated = &mac[..16];
-        assert!(!verify_hmac(&token, "beta", "alpha", "id9", "ts9", b"body", truncated).unwrap());
+        assert!(
+            !verify_hmac(&token, "beta", "alpha", "id9", "ts9", b"body", None, truncated).unwrap()
+        );
         // Any 16-hex claim is too short to verify.
         assert!(!verify_hmac(
             &token,
@@ -353,6 +388,7 @@ mod tests {
             "id9",
             "ts9",
             b"body",
+            None,
             &"a".repeat(16)
         )
         .unwrap());
@@ -362,7 +398,7 @@ mod tests {
     fn tampered_body_does_not_verify() {
         let root = temp_root("msg-tamper");
         let token = mint_token(&root.join("token")).unwrap();
-        let (path, _) = write_msg(&root, "beta", "alpha", &token, "original").unwrap();
+        let (path, _) = write_msg(&root, "beta", "alpha", &token, "original", None).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, raw.replace("original", "tampered")).unwrap();
         assert!(!verify_msg(&path, &token).unwrap());
@@ -382,7 +418,7 @@ mod tests {
         assert_eq!(read_token(&tpath).unwrap(), token);
         // Bad token hex is a named error, not a panic.
         assert!(matches!(
-            compute_hmac("nothex", "b", "a", "i", "t", b"x"),
+            compute_hmac("nothex", "b", "a", "i", "t", b"x", None),
             Err(SeatError::BadToken(_))
         ));
     }
@@ -395,5 +431,70 @@ mod tests {
         assert!(matches!(read_msg(&p), Err(SeatError::CorruptMsg { .. })));
         std::fs::write(&p, "{\"dest\":\"a\"}").unwrap();
         assert!(matches!(read_msg(&p), Err(SeatError::BadBody { .. })));
+    }
+
+    #[test]
+    fn session_header_is_written_covered_by_mac_and_readable() {
+        let root = temp_root("msg-session");
+        let token = mint_token(&root.join("token")).unwrap();
+        let (path, header) = write_msg(
+            &root,
+            "beta",
+            "alpha",
+            &token,
+            "with session",
+            Some("sess-42"),
+        )
+        .unwrap();
+        assert_eq!(header.session.as_deref(), Some("sess-42"));
+        // read_msg exposes it.
+        let (back, body) = read_msg(&path).unwrap();
+        assert_eq!(back.session.as_deref(), Some("sess-42"));
+        assert_eq!(body, "with session");
+        // The raw header line carries the field.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"session\":\"sess-42\""), "{raw}");
+        // It verifies — the MAC covered the session value.
+        assert!(verify_msg(&path, &token).unwrap());
+
+        // Tampering the session value breaks the MAC.
+        std::fs::write(&path, raw.replace("sess-42", "sess-99")).unwrap();
+        assert!(!verify_msg(&path, &token).unwrap());
+    }
+
+    #[test]
+    fn absent_session_omits_the_field_and_matches_the_old_mac_input() {
+        let root = temp_root("msg-no-session");
+        let token = mint_token(&root.join("token")).unwrap();
+        let (path, header) = write_msg(&root, "beta", "alpha", &token, "plain body", None).unwrap();
+        assert_eq!(header.session, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"session\""), "{raw}");
+        assert!(verify_msg(&path, &token).unwrap());
+    }
+
+    /// A message written before the identity rule — no `session` key in
+    /// the header, MAC over exactly `dest|from|id|ts|body` — still
+    /// parses and verifies.
+    #[test]
+    fn legacy_message_without_session_still_verifies() {
+        let root = temp_root("msg-legacy");
+        let token = hex::encode([9u8; 16]);
+        let dest = "beta";
+        let from = "alpha";
+        let id = "deadbeef";
+        let ts = "20260101T000000.000000";
+        let body = "written before sessions existed";
+        let mac = compute_hmac(&token, dest, from, id, ts, body.as_bytes(), None).unwrap();
+        // Hand-write the old wire format: exactly the five old fields.
+        let legacy = format!(
+            "{{\"dest\":\"{dest}\",\"from\":\"{from}\",\"id\":\"{id}\",\"ts\":\"{ts}\",\"hmac\":\"{mac}\"}}\n\n{body}"
+        );
+        let p = root.join("20260101T000000.000000-deadbeef.msg");
+        std::fs::write(&p, legacy).unwrap();
+        let (header, body_back) = read_msg(&p).unwrap();
+        assert_eq!(header.session, None, "old header parses with no session");
+        assert_eq!(body_back, body);
+        assert!(verify_msg(&p, &token).unwrap());
     }
 }

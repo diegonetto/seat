@@ -70,14 +70,33 @@ pub fn cmd_create(root: &Path, name: &str) -> Result<()> {
 }
 
 /// Post into a room: same `.msg` format as direct mail, `dest` is the
-/// room name, MAC keyed by the posting seat's token.
-pub fn cmd_post(root: &Path, room: &str, from: &str, body: &str) -> Result<()> {
+/// room name, MAC keyed by the posting seat's token. The poster is
+/// fixed by the identity rule (`--from` optional for bound sessions;
+/// an unbound caller must give it — no implicit Diego in rooms, since
+/// a room's followers include the Grok bots). `env_session` is the
+/// caller's `HAPI_SESSION_ID`, read at the CLI edge.
+pub fn cmd_post(
+    root: &Path,
+    room: &str,
+    from: Option<&str>,
+    body: &str,
+    env_session: Option<&str>,
+) -> Result<()> {
     board::ensure_board(root)?;
     if !exists(root, room) {
         return Err(SeatError::NoSuchRoom(room.to_string()));
     }
+    let who = crate::identity::resolve_for_room(root, from, env_session)?;
+    let from = who.from.as_str();
     let token = crate::verbs::sender_token(root, from)?;
-    let (_, header) = msg::write_msg(&room_dir(root, room), room, from, &token, body)?;
+    let (_, header) = msg::write_msg(
+        &room_dir(root, room),
+        room,
+        from,
+        &token,
+        body,
+        who.session.as_deref(),
+    )?;
     touch_last_seen(root, from)?;
     println!("posted {} to room '{room}'", header.id);
     Ok(())
@@ -175,8 +194,8 @@ mod tests {
     fn post_read_and_cursor_filtering() {
         let root = setup();
         create(&root, "ops").unwrap();
-        cmd_post(&root, "ops", "alpha", "first bulletin").unwrap();
-        cmd_post(&root, "ops", "alpha", "second bulletin").unwrap();
+        cmd_post(&root, "ops", Some("alpha"), "first bulletin", None).unwrap();
+        cmd_post(&root, "ops", Some("alpha"), "second bulletin", None).unwrap();
 
         let mut out = Vec::new();
         cmd_read(&root, "ops", &mut out).unwrap();
@@ -208,5 +227,84 @@ mod tests {
             Err(SeatError::NoSuchRoom(_))
         ));
         assert!(cmd_follow(&root, "ops", "ghost").is_err());
+    }
+
+    fn identity_setup() -> std::path::PathBuf {
+        let root = temp_root("room-identity");
+        board::init(&root).unwrap();
+        crate::verbs::cmd_register(&root, "alpha", "sb", None, None, None, Vec::new()).unwrap();
+        crate::verbs::cmd_register(&root, "opus-main", "sb", None, None, None, Vec::new()).unwrap();
+        crate::testutil::write_bindings(&root, &[("opus-main", "sid-opus")]);
+        create(&root, "ops").unwrap();
+        root
+    }
+
+    #[test]
+    fn bound_session_posts_as_itself() {
+        let root = identity_setup();
+        cmd_post(&root, "ops", None, "bound bulletin", Some("sid-opus")).unwrap();
+        cmd_post(
+            &root,
+            "ops",
+            Some("opus-main"),
+            "explicit match",
+            Some("sid-opus"),
+        )
+        .unwrap();
+        for p in posts(&root, "ops").unwrap() {
+            let (header, _) = msg::read_msg(&p).unwrap();
+            assert_eq!(header.from, "opus-main");
+            assert_eq!(
+                header.session, None,
+                "bound senders write no session header"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_session_posting_as_another_seat_is_refused() {
+        let root = identity_setup();
+        let err = cmd_post(&root, "ops", Some("alpha"), "nope", Some("sid-opus")).unwrap_err();
+        assert!(
+            err.to_string().contains("bound to opus-main")
+                && err.to_string().contains("cannot send as alpha"),
+            "{err}"
+        );
+        assert!(matches!(err, SeatError::Identity(_)));
+        assert!(posts(&root, "ops").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unbound_explicit_from_is_unchanged_and_carries_session() {
+        let root = identity_setup();
+        cmd_post(&root, "ops", Some("alpha"), "plain post", None).unwrap();
+        cmd_post(
+            &root,
+            "ops",
+            Some("alpha"),
+            "with session",
+            Some("sid-adhoc"),
+        )
+        .unwrap();
+        let all = posts(&root, "ops").unwrap();
+        assert_eq!(all.len(), 2);
+        let (h1, _) = msg::read_msg(&all[0]).unwrap();
+        assert_eq!(h1.from, "alpha");
+        assert_eq!(h1.session, None);
+        let (h2, _) = msg::read_msg(&all[1]).unwrap();
+        assert_eq!(h2.from, "alpha");
+        assert_eq!(h2.session.as_deref(), Some("sid-adhoc"));
+    }
+
+    /// No implicit Diego in rooms: an unbound caller must give --from.
+    #[test]
+    fn unbound_omitted_from_is_refused() {
+        let root = identity_setup();
+        let err = cmd_post(&root, "ops", None, "who am i", None).unwrap_err();
+        assert!(matches!(err, SeatError::Identity(_)), "{err}");
+        assert!(err.to_string().contains("--from"), "{err}");
+        let err = cmd_post(&root, "ops", None, "who am i", Some("sid-adhoc")).unwrap_err();
+        assert!(matches!(err, SeatError::Identity(_)), "{err}");
+        assert!(posts(&root, "ops").unwrap().is_empty());
     }
 }

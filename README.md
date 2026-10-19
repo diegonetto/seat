@@ -50,7 +50,7 @@ the inbox.
 ```
 seat init
 seat register --seat <name> --harness <h> [--model M] [--lifecycle exit-wake|poller] [--cwd ABS] [-- CMD...]
-seat send --from <from> <to> <body>
+seat send [--from <from>] <to> <body>
 seat arm --seat <name>
 seat drain --seat <name>
 seat room create|post|read|follow|list
@@ -69,6 +69,33 @@ tiles it, and attaches. Each tile's border shows that pane's `@seat`
 name. Mouse is on. A zoomed pane stays full screen
 across a resize. It does not list a seat that is only awake, and it does
 not move any other pane.
+
+`drain` takes a per-seat lock (`<seat>/lock`) for its whole run: a
+second drain of the same seat waits, and gives up after 30 seconds with
+an error naming the seat. Drains of other seats never wait.
+
+### The identity rule on `--from`
+
+`send` and `room post` accept an optional `--from`. Who the message is
+from is decided like this:
+
+- Sessions are bound to seats by `<root>/hapi-sessions.json` (written by
+  seat-role; a missing or unreadable file means no bindings). When the
+  caller's `HAPI_SESSION_ID` is bound to seat X, the message is from X:
+  an omitted `--from` means X, and any other `--from` is refused with a
+  line naming both seats.
+- Without a binding (services, bridges, an ad-hoc terminal), an explicit
+  `--from` behaves exactly as `--from` always did.
+- An omitted `--from` on `send` means the message goes as `inbox`, and
+  only to a factory seat: a seat named in `hapi-sessions.json`. Any
+  other destination is refused. In rooms there is no implicit sender:
+  an unbound caller must give `--from`.
+- An unbound sender that has a `HAPI_SESSION_ID` writes it as an
+  optional `session` field in the message header, covered by the
+  message HMAC like the other header fields. Messages written before
+  this field existed still verify.
+
+This rule prevents mistakes on one Unix user, not a deliberate forgery.
 
 `status` prints one row per registered seat, sorted by name:
 

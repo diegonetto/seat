@@ -394,7 +394,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "wake now").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "wake now", None).unwrap();
 
         let Spawned { stop, buf, rx } = spawn(&root, opts("beta", None, None, false));
         rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
@@ -433,7 +433,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         let sent_at = Instant::now();
-        verbs::cmd_send(&root, "alpha", "beta", "arriving mail").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "arriving mail", None).unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         let elapsed = sent_at.elapsed();
         assert!(elapsed < Duration::from_secs(5), "wake took {elapsed:?}");
@@ -456,7 +456,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "override wake").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "override wake", None).unwrap();
 
         // Poller meta would stay up; the exit-wake override wakes and returns.
         let Spawned { stop, buf, rx } =
@@ -548,7 +548,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "reclaim me").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "reclaim me", None).unwrap();
         // A pid that cannot exist: stale pidfile must not block arming.
         seat::write_wait_pid(&seat::seat_dir(&root, "beta"), u32::MAX).unwrap();
 
@@ -578,7 +578,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "steal me").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "steal me", None).unwrap();
 
         // A real live waiter that is not this process.
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
@@ -621,7 +621,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         let sent_at = Instant::now();
-        verbs::cmd_send(&root, "alpha", "beta", "poller ping").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "poller ping", None).unwrap();
         wait_for(&buf, "has 1 new message");
         assert!(sent_at.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(300));
@@ -631,7 +631,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         // A second arrival wakes it again (two notices total).
-        verbs::cmd_send(&root, "alpha", "beta", "poller pong").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "poller pong", None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while buf_str(&buf).matches("new message").count() < 2 {
             assert!(Instant::now() < deadline, "poller never woke twice");
@@ -656,7 +656,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "already here").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "already here", None).unwrap();
 
         let Spawned { stop, buf, rx } = spawn(&root, opts("beta", None, None, false));
         wait_for(&buf, "has 1 new message");
@@ -679,7 +679,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "signal only").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "signal only", None).unwrap();
 
         let marker_dir = temp_root("serve-exec");
         let marker = marker_dir.join("marker");
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(msg::list_msg_dir(&inbox).unwrap().len(), 1);
 
         // Re-arm: a second send fires the command again (append proves 2 runs).
-        verbs::cmd_send(&root, "alpha", "beta", "more signal").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "more signal", None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while std::fs::read_to_string(&marker).unwrap().lines().count() < 2 {
             assert!(Instant::now() < deadline, "--exec did not re-arm");
@@ -723,7 +723,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        verbs::cmd_send(&root, "alpha", "beta", "one shot").unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "one shot", None).unwrap();
 
         let marker_dir = temp_root("serve-exec-ew");
         let marker = marker_dir.join("marker");
