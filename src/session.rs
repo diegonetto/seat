@@ -443,15 +443,13 @@ struct StatusRow {
     mail: usize,
 }
 
-/// Presence, separate from the mail count. A live swarm pane is
-/// `pane` even when a waiter is also alive. A live or orphan waiter
-/// with no pane is `awake`. No pane and no live waiter is
-/// `unattended`. Mail never changes the word.
-fn presence(in_pane: bool, waiter: seat::WaiterState) -> &'static str {
+/// Presence, separate from the mail count. Interim rule (0.4.0, with
+/// `seat arm` deleted): a live swarm pane is `pane`; every other seat
+/// is `unattended`. `awake` is unused until the dispatcher lands and
+/// derives it from its own delivery state. Mail never changes the word.
+fn presence(in_pane: bool) -> &'static str {
     if in_pane {
         "pane"
-    } else if matches!(waiter, seat::WaiterState::Live | seat::WaiterState::Orphan) {
-        "awake"
     } else {
         "unattended"
     }
@@ -469,7 +467,7 @@ fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
         let in_pane = running.contains(&name);
         rows.push(StatusRow {
             name,
-            presence: presence(in_pane, seat::waiter_state(&dir)),
+            presence: presence(in_pane),
             mail,
         });
     }
@@ -504,22 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn presence_is_pane_then_awake_then_unattended() {
-        use seat::WaiterState;
-        assert_eq!(presence(true, WaiterState::Idle), "pane");
-        assert_eq!(
-            presence(true, WaiterState::Live),
-            "pane",
-            "a pane beats a waiter"
-        );
-        assert_eq!(presence(true, WaiterState::Orphan), "pane");
-        assert_eq!(presence(false, WaiterState::Live), "awake");
-        assert_eq!(
-            presence(false, WaiterState::Orphan),
-            "awake",
-            "a waiter reparented to pid 1 is awake"
-        );
-        assert_eq!(presence(false, WaiterState::Idle), "unattended");
+    fn presence_is_pane_or_unattended_until_the_dispatcher_lands() {
+        assert_eq!(presence(true), "pane");
+        assert_eq!(presence(false), "unattended");
     }
 
     /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE:
@@ -527,9 +512,10 @@ mod tests {
     /// one such test runs at a time.
     static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Pane beats a live waiter. A live waiter with no pane is awake.
-    /// A missing, unparseable, or stale pidfile is unattended. Mail is
-    /// the inbox file count and does not change presence.
+    /// Interim presence (0.4.0, arm deleted, dispatcher not yet here):
+    /// a live pane is `pane`, everything else — mail or not — is
+    /// `unattended`. Mail is the inbox file count and does not change
+    /// presence.
     #[test]
     fn status_presence_and_mail_are_separate() {
         let _guard = FAKE_LOCK.lock().unwrap();
@@ -541,23 +527,20 @@ mod tests {
             "paned",
             "sb",
             None,
-            None,
             Some(cwd),
             vec!["/bin/sleep".into(), "30".into()],
         )
         .unwrap();
-        verbs::cmd_register(&root, "waiter", "sb", None, None, None, vec![]).unwrap();
-        verbs::cmd_register(&root, "quiet", "sb", None, None, None, vec![]).unwrap();
+        verbs::cmd_register(&root, "quiet", "sb", None, None, vec![]).unwrap();
+        verbs::cmd_register(&root, "stocked", "sb", None, None, vec![]).unwrap();
         let state = root.join("tmux.state");
         std::env::set_var("SEAT_TMUX", fake_tmux());
         std::env::set_var("SEAT_FAKE_STATE", &state);
 
         cmd_up(&root, &["paned".to_string()]).unwrap();
-        seat::write_wait_pid(&seat::seat_dir(&root, "paned"), std::process::id()).unwrap();
-        seat::write_wait_pid(&seat::seat_dir(&root, "waiter"), std::process::id()).unwrap();
         verbs::cmd_send(&root, Some("quiet"), "paned", "while up", None).unwrap();
-        verbs::cmd_send(&root, Some("quiet"), "waiter", "one", None).unwrap();
-        verbs::cmd_send(&root, Some("paned"), "waiter", "two", None).unwrap();
+        verbs::cmd_send(&root, Some("quiet"), "stocked", "one", None).unwrap();
+        verbs::cmd_send(&root, Some("paned"), "stocked", "two", None).unwrap();
 
         let rows = status_rows(&root, &fake_tmux()).unwrap();
         assert_eq!(
@@ -574,29 +557,12 @@ mod tests {
                     mail: 0
                 },
                 StatusRow {
-                    name: "waiter".into(),
-                    presence: "awake",
+                    name: "stocked".into(),
+                    presence: "unattended",
                     mail: 2
                 },
             ]
         );
-
-        let quiet = seat::seat_dir(&root, "quiet");
-        std::fs::write(seat::wait_pid_path(&quiet), "nope\n").unwrap();
-        assert_eq!(
-            status_rows(&root, &fake_tmux()).unwrap()[1].presence,
-            "unattended",
-            "an unparseable pidfile is unattended"
-        );
-        seat::write_wait_pid(&quiet, u32::MAX).unwrap();
-        let again = status_rows(&root, &fake_tmux()).unwrap();
-        assert_eq!(
-            again[1].presence, "unattended",
-            "a stale pidfile is unattended"
-        );
-        assert_eq!(again[1].mail, 0);
-        assert_eq!(again[2].presence, "awake");
-        assert_eq!(again[2].mail, 2);
     }
 
     /// The whole session story against the fake (T015's consumer).
@@ -611,7 +577,6 @@ mod tests {
                 &root,
                 name,
                 "sb",
-                None,
                 None,
                 Some(cwd.clone()),
                 vec!["/bin/sleep".into(), "30".into()],
@@ -881,7 +846,7 @@ mod tests {
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
         let reg = |name: &str, cwd: Option<String>, cmd: Vec<String>| {
-            verbs::cmd_register(&root, name, "sb", None, None, cwd, cmd).unwrap();
+            verbs::cmd_register(&root, name, "sb", None, cwd, cmd).unwrap();
         };
         let sleep30 = || vec!["/bin/sleep".to_string(), "30".to_string()];
         reg("runner", Some(cwd.clone()), sleep30());

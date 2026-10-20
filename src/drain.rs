@@ -332,8 +332,8 @@ mod tests {
     fn setup() -> std::path::PathBuf {
         let root = temp_root("drain");
         board::init(&root).unwrap();
-        verbs::cmd_register(&root, "alpha", "sb", None, None, None, Vec::new()).unwrap();
-        verbs::cmd_register(&root, "beta", "sb", None, None, None, Vec::new()).unwrap();
+        verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
+        verbs::cmd_register(&root, "beta", "sb", None, None, Vec::new()).unwrap();
         root
     }
 
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn drain_of_one_seat_is_not_blocked_by_anothers_lock() {
         let root = setup();
-        verbs::cmd_register(&root, "gamma", "sb", None, None, None, Vec::new()).unwrap();
+        verbs::cmd_register(&root, "gamma", "sb", None, None, Vec::new()).unwrap();
         verbs::cmd_send(&root, Some("alpha"), "beta", "other seat", None).unwrap();
         let _gamma_lock =
             seat::SeatLock::acquire(&seat::seat_dir(&root, "gamma"), "gamma").unwrap();

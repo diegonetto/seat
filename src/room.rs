@@ -171,7 +171,7 @@ mod tests {
     fn setup() -> std::path::PathBuf {
         let root = temp_root("room");
         board::init(&root).unwrap();
-        crate::verbs::cmd_register(&root, "alpha", "sb", None, None, None, Vec::new()).unwrap();
+        crate::verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
         root
     }
 
@@ -232,8 +232,8 @@ mod tests {
     fn identity_setup() -> std::path::PathBuf {
         let root = temp_root("room-identity");
         board::init(&root).unwrap();
-        crate::verbs::cmd_register(&root, "alpha", "sb", None, None, None, Vec::new()).unwrap();
-        crate::verbs::cmd_register(&root, "opus-main", "sb", None, None, None, Vec::new()).unwrap();
+        crate::verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
+        crate::verbs::cmd_register(&root, "opus-main", "sb", None, None, Vec::new()).unwrap();
         crate::testutil::write_bindings(&root, &[("opus-main", "sid-opus")]);
         create(&root, "ops").unwrap();
         root

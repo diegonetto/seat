@@ -2,6 +2,16 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.4.0] - 2026-10-19
+
+### Removed
+
+- `seat arm` and everything waiter-shaped: `src/serve.rs`, the `arm` CLI entry and help, `wait.pid` and its helpers, and `register --lifecycle`. `meta.lifecycle` is still accepted when reading old `meta.json` files but is never written again (any metadata update drops it). `status`'s waiter-derived `awake` went with it: presence is `pane` or `unattended` until the dispatcher lands and redefines `awake` from its own delivery state.
+
+### Fixed
+
+- The session MAC framing. The optional `session` header value is now fed to the MAC inside the id slot (`dest|from|<id>:<session>|ts|body` when present, `dest|from|id|ts|body` when absent) instead of after the body. The old placement let a message without `session` whose body ends in `|X` share a MAC input with a message carrying `session = X` (bodies may contain `|`), so the field could be added or stripped without breaking the MAC; an id is exactly 8 lowercase hex characters and can never contain `:`, so the two forms cannot collide. Reading now refuses (as an unreadable message, quarantined like today) a header whose `id` is not exactly `ID_HEX_LEN` lowercase hex or whose `session` is not 1-64 characters of `[A-Za-z0-9-]`, and writing refuses the same, so a malformed `HAPI_SESSION_ID` is never published and then quarantined. Messages without `session` are unchanged and still verify.
+
 ## [0.3.0] - 2026-10-19
 
 ### Added

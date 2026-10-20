@@ -30,7 +30,8 @@ pub struct Header {
     /// Optional sender session id (the unbound sender's
     /// `HAPI_SESSION_ID`). Absent on every message written before the
     /// identity rule and on every bound sender's message; covered by
-    /// the HMAC like the other header fields when present.
+    /// the HMAC like the other header fields when present (fed to the
+    /// MAC inside the id slot: `dest|from|<id>:<session>|ts|body`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
 }
@@ -44,6 +45,29 @@ pub fn strip_bom(bytes: &[u8]) -> &[u8] {
     }
 }
 
+/// A message id is exactly `ID_HEX_LEN` **lowercase** hex characters.
+/// Anything else in a header is an unreadable message (quarantined by
+/// the receive path), and is never written.
+pub fn valid_msg_id(id: &str) -> bool {
+    id.len() == ID_HEX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The optional `session` header is 1-64 characters of `[A-Za-z0-9-]`.
+/// Anything else in a header is an unreadable message (quarantined by
+/// the receive path), and is never written — a malformed
+/// `HAPI_SESSION_ID` is refused at `send`/`post` time instead of being
+/// published and then quarantined on read.
+pub fn valid_session(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 64
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 fn random_bytes(n: usize) -> Result<Vec<u8>> {
     let mut f = std::fs::File::open("/dev/urandom")?;
     let mut buf = vec![0u8; n];
@@ -51,12 +75,16 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// MAC input is `dest|from|id|ts|body` with the body BOM-stripped.
-/// When the sender wrote a `session` header, its value is fed to the
-/// MAC after the body through the same `|` framing — so the input is
-/// exactly `dest|from|id|ts|body|session` when present, and stays
-/// byte-identical to the old format when absent (every existing
-/// message still verifies).
+/// MAC input is `dest|from|id|ts|body` with the body BOM-stripped, and
+/// the optional `session` value lives **in the id slot**, joined by a
+/// colon: `dest|from|<id>:<session>|ts|body` when present. A message id
+/// is exactly 8 lowercase hex characters and can never contain `:`, so
+/// the absent form (`dest|from|id|ts|body`) is byte-identical to the
+/// old format (every existing message still verifies) while the two
+/// forms can never collide: feeding the session after the body let a
+/// body ending in `|X` impersonate `session = X`, because the body
+/// itself may contain `|`. In the id slot the field cannot be spoofed
+/// from the body.
 fn mac_update(
     mac: &mut HmacSha256,
     dest: &str,
@@ -71,14 +99,14 @@ fn mac_update(
     mac.update(from.as_bytes());
     mac.update(b"|");
     mac.update(id.as_bytes());
+    if let Some(s) = session {
+        mac.update(b":");
+        mac.update(s.as_bytes());
+    }
     mac.update(b"|");
     mac.update(ts.as_bytes());
     mac.update(b"|");
     mac.update(strip_bom(body));
-    if let Some(s) = session {
-        mac.update(b"|");
-        mac.update(s.as_bytes());
-    }
 }
 
 fn token_key(token_hex: &str) -> Result<Vec<u8>> {
@@ -158,9 +186,10 @@ pub fn filename_for(ts: &str, id: &str) -> String {
 }
 
 /// Write a `.msg` file: line 1 JSON header, blank line, raw body.
-/// `session` is the optional sender-session header field (fed to the
-/// MAC after the body); `None` writes none, exactly the old format.
-/// Returns the path and the header that was written.
+/// `session` is the optional sender-session header value, MAC'd inside
+/// the id slot (`<id>:<session>`); `None` writes none, exactly the old
+/// format. A malformed session value is refused here — never
+/// published. Returns the path and the header that was written.
 pub fn write_msg(
     dir: &Path,
     dest: &str,
@@ -169,6 +198,11 @@ pub fn write_msg(
     body: &str,
     session: Option<&str>,
 ) -> Result<(PathBuf, Header)> {
+    if let Some(s) = session.filter(|s| !valid_session(s)) {
+        return Err(SeatError::BadHeader(format!(
+            "session id {s:?} is not 1-64 characters of [A-Za-z0-9-]"
+        )));
+    }
     let ts = now_ts();
     let id = new_id()?;
     let mac = compute_hmac(token_hex, dest, from, &id, &ts, body.as_bytes(), session)?;
@@ -212,7 +246,10 @@ pub fn write_msg(
 }
 
 /// Read a `.msg` file into (header, body). Corrupt headers are a named
-/// error, not a panic.
+/// error, not a panic. A header whose `id` is not exactly
+/// `ID_HEX_LEN` lowercase hex, or whose `session` is not 1-64
+/// characters of `[A-Za-z0-9-]`, is refused the same way: an
+/// unreadable message the receive path quarantines.
 pub fn read_msg(path: &Path) -> Result<(Header, String)> {
     let raw = std::fs::read(path)?;
     let split = raw
@@ -226,6 +263,17 @@ pub fn read_msg(path: &Path) -> Result<(Header, String)> {
         path: path.to_path_buf(),
         source,
     })?;
+    if !valid_msg_id(&header.id) {
+        return Err(SeatError::BadHeader(format!(
+            "message id {:?} is not {} lowercase hex characters",
+            header.id, ID_HEX_LEN
+        )));
+    }
+    if let Some(s) = header.session.as_deref().filter(|s| !valid_session(s)) {
+        return Err(SeatError::BadHeader(format!(
+            "session id {s:?} is not 1-64 characters of [A-Za-z0-9-]"
+        )));
+    }
     let body = String::from_utf8(body.to_vec()).map_err(|_| SeatError::BadBody {
         path: path.to_path_buf(),
     })?;
@@ -234,7 +282,7 @@ pub fn read_msg(path: &Path) -> Result<(Header, String)> {
 
 /// Read a message and verify its MAC with the sender's token. The
 /// header's optional `session` field (absent on old messages) is fed
-/// to the MAC when present.
+/// to the MAC inside the id slot when present.
 pub fn verify_msg(path: &Path, sender_token: &str) -> Result<bool> {
     let (header, body) = read_msg(path)?;
     verify_hmac(
@@ -460,6 +508,100 @@ mod tests {
         // Tampering the session value breaks the MAC.
         std::fs::write(&path, raw.replace("sess-42", "sess-99")).unwrap();
         assert!(!verify_msg(&path, &token).unwrap());
+    }
+
+    /// The session cannot be moved into the body (or back) without
+    /// breaking the MAC: it is MAC'd inside the id slot, and an id can
+    /// never contain `:`. This is the 0.4.0 framing fix — feeding the
+    /// session after the body let a body ending in `|X` collide with
+    /// `session = X`, because a body may contain `|`.
+    #[test]
+    fn session_cannot_be_stripped_into_the_body_or_added_back() {
+        let token = hex::encode([3u8; 16]);
+        let token = token.as_str();
+        let dest = "beta";
+        let from = "alpha";
+        let id = "ab12cd34";
+        let ts = "20261019T000000.000000";
+
+        // Attack, strip direction: a real message with `session = X`
+        // and body `plain`; the attacker rewrites it without a session
+        // header, splicing `|X` onto the body, and keeps the MAC.
+        let mac = compute_hmac(token, dest, from, id, ts, b"plain", Some("sess-9")).unwrap();
+        assert!(
+            !verify_hmac(token, dest, from, id, ts, b"plain|sess-9", None, &mac).unwrap(),
+            "a stripped session must not verify"
+        );
+
+        // Attack, add direction: a message with no session whose body
+        // happens to end in `|X`; the attacker adds `session = X` and
+        // trims the body.
+        let mac2 = compute_hmac(token, dest, from, id, ts, b"plain|sess-9", None).unwrap();
+        assert!(
+            !verify_hmac(token, dest, from, id, ts, b"plain", Some("sess-9"), &mac2).unwrap(),
+            "an added session must not verify"
+        );
+
+        // The honest forms still verify, and differ from each other.
+        assert!(verify_hmac(token, dest, from, id, ts, b"plain", Some("sess-9"), &mac).unwrap());
+        assert!(verify_hmac(token, dest, from, id, ts, b"plain|sess-9", None, &mac2).unwrap());
+        assert_ne!(mac, mac2);
+    }
+
+    /// A header with an id that is not exactly 8 lowercase hex, or a
+    /// session outside `[A-Za-z0-9-]{1,64}`, is unreadable: read_msg
+    /// refuses it with the named error.
+    #[test]
+    fn header_with_bad_id_or_session_is_refused() {
+        let root = temp_root("msg-badheader");
+        let write_raw = |head: &str| {
+            let p = root.join("x.msg");
+            std::fs::write(&p, format!("{head}\n\nbody")).unwrap();
+            p
+        };
+        for bad_id in ["ab12cd3", "ab12cd345", "AB12CD34", "ab12cd3g", "ab:2cd34"] {
+            let p = write_raw(&format!(
+                "{{\"dest\":\"b\",\"from\":\"a\",\"id\":\"{bad_id}\",\"ts\":\"t\",\"hmac\":\"h\"}}"
+            ));
+            assert!(
+                matches!(read_msg(&p), Err(SeatError::BadHeader(_))),
+                "id {bad_id:?} must be refused"
+            );
+        }
+        for bad_session in ["", &"s".repeat(65), "bad_session", "séat"] {
+            let p = write_raw(&format!(
+                "{{\"dest\":\"b\",\"from\":\"a\",\"id\":\"ab12cd34\",\"ts\":\"t\",\"hmac\":\"h\",\"session\":\"{bad_session}\"}}"
+            ));
+            assert!(
+                matches!(read_msg(&p), Err(SeatError::BadHeader(_))),
+                "session {bad_session:?} must be refused"
+            );
+        }
+        // The valid shapes parse.
+        let ok = write_raw(
+            "{\"dest\":\"b\",\"from\":\"a\",\"id\":\"ab12cd34\",\"ts\":\"t\",\"hmac\":\"h\",\"session\":\"Good-Id2\"}",
+        );
+        assert!(read_msg(&ok).is_ok());
+    }
+
+    /// A malformed session value is refused at write time, so a bad
+    /// `HAPI_SESSION_ID` is never published and then quarantined.
+    #[test]
+    fn write_refuses_a_malformed_session() {
+        let root = temp_root("msg-write-session");
+        let token = mint_token(&root.join("token")).unwrap();
+        for bad in ["", &"s".repeat(65), "bad_session"] {
+            assert!(matches!(
+                write_msg(&root, "beta", "alpha", &token, "body", Some(bad)),
+                Err(SeatError::BadHeader(_))
+            ));
+        }
+        // Nothing was published.
+        assert!(list_msg_dir(&root).unwrap().is_empty());
+
+        // A valid one is.
+        let (path, _) = write_msg(&root, "beta", "alpha", &token, "body", Some("ok-1")).unwrap();
+        assert!(verify_msg(&path, &token).unwrap());
     }
 
     #[test]

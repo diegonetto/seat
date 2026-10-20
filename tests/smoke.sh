@@ -3,8 +3,9 @@
 #
 # Execs "$SEAT" as a program against throwaway --root directories.
 # Never the operator's live board. Covers quickstart steps 1 through 7
-# (step 8 is --help, checked by cargo test): fresh drain, second arm,
-# room follow, bad mark, session verbs, status, foreign root.
+# (step 8 is --help, checked by cargo test): fresh drain, room follow,
+# bad mark, session verbs, status, foreign root. 0.4.0 deleted `seat
+# arm`: these checks pin its absence.
 #
 #   SEAT=$PWD/target/debug/seat tests/smoke.sh
 #
@@ -35,12 +36,7 @@ esac
 PASS=0
 FAIL=0
 
-# Background waiter pids: always reaped so a failing check cannot leak
-# an armed waiter past this script.
-BG_PIDS=""
 cleanup() {
-    for p in $BG_PIDS; do kill "$p" 2>/dev/null; done
-    for p in $BG_PIDS; do wait "$p" 2>/dev/null; done
     rm -rf "$ROOT"
     for r in $EXTRA_ROOTS; do rm -rf "$r"; done
 }
@@ -55,62 +51,41 @@ note() {
     fi
 }
 
-# wait_log <file> <substr> <ticks>: 0 once the file contains substr
-# (0.1s per tick; 50 ticks = the 5-second wake budget).
-wait_log() {
-    f=$1; s=$2; i=0; max=$3
-    while [ "$i" -lt "$max" ]; do
-        grep -qF -- "$s" "$f" 2>/dev/null && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    grep -qF -- "$s" "$f" 2>/dev/null
-}
-
 S="$SEAT"
 R="$ROOT"
 
 ## quickstart step 1: fresh drain (SC-002) ----------------------------
 "$S" --root "$R" init >/dev/null 2>&1;               note $? "init"
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
-                                                     note $? "register A (default lifecycle)"
-"$S" --root "$R" register --seat B --harness sb --lifecycle poller >/dev/null 2>&1
-                                                     note $? "register B (poller)"
+                                                      note $? "register A"
+"$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
+                                                      note $? "register B"
 "$S" --root "$R" send --from A B "hello seat" >/dev/null 2>&1
-                                                     note $? "send A -> B"
+                                                      note $? "send A -> B"
 
-# Arm B in the background: it must notice the mail within 5 seconds,
-# naming the seat and the count, without draining it. B is never `up`.
-"$S" --root "$R" arm --seat B >"$R/arm-b.log" 2>&1 &
-ARMB=$!; BG_PIDS="$BG_PIDS $ARMB"
-wait_log "$R/arm-b.log" "1 new message" 50;          note $? "arm B wakes within 5s naming the count"
-grep -qF "seat 'B'" "$R/arm-b.log";                  note $? "the wake notice names seat B"
-grep -qF "hello seat" "$R/arm-b.log" && rc=1 || rc=0
-                                                     note $rc "arm never prints the body"
-[ -s "$R/seats/B/wait.pid" ];                        note $? "the armed waiter holds wait.pid"
+## arm is gone (0.4.0) --------------------------------------------------
+# The verb exits 2 and is told the keep-list (which no longer names it).
+out="$("$S" --root "$R" arm --seat B 2>&1)"; rc=$?
+[ "$rc" -eq 2 ];                                     note $? "arm exits 2 (unknown verb)"
+printf '%s\n' "$out" | grep -qF "unknown verb 'arm'"; note $? "arm is named unknown"
+printf '%s\n' "$out" | grep '^verbs:' | grep -qF "arm" && rc=1 || rc=0
+                                                      note $rc "the keep-list has no arm"
+# register takes no --lifecycle anymore.
+out="$("$S" --root "$R" register --seat D --harness sb --lifecycle poller 2>&1)"; rc=$?
+[ "$rc" -ne 0 ];                                     note $? "register refuses --lifecycle"
 
 out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "hello seat"
-                                                     note $? "drain B returns the body (B never up)"
+                                                      note $? "drain B returns the body"
 printf '%s\n' "$out" | grep -qF "hello seat" && [ "$(printf '%s\n' "$out" | grep -cF 'hello seat')" -eq 1 ]
-                                                     note $? "the body appears exactly once"
+                                                      note $? "the body appears exactly once"
 
-# The default lifecycle (exit-wake) wakes once and exits 0.
+# The reply drains A the same way (A was never `up`).
 "$S" --root "$R" send --from B A "reply seat" >/dev/null 2>&1
-                                                     note $? "send B -> A"
-"$S" --root "$R" arm --seat A >"$R/arm-a.log" 2>&1;  note $? "arm A (exit-wake) exits 0"
-grep -qF "1 new message" "$R/arm-a.log";             note $? "arm A wake notice counts one"
+                                                      note $? "send B -> A"
 out="$("$S" --root "$R" drain --seat A 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "reply seat"
-                                                     note $? "drain A returns the reply"
-
-## quickstart step 2: second arm --------------------------------------
-out="$("$S" --root "$R" arm --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "already has a live waiter"
-                                                     note $? "second arm reports the waiter and exits 0"
-printf '%s\n' "$out" | grep -qF "waiting for mail" && rc=1 || rc=0
-                                                     note $rc "second arm starts no second waiter"
-kill -0 "$ARMB" 2>/dev/null;                         note $? "the first waiter is still the only one"
-[ "$(cat "$R/seats/B/wait.pid")" = "$ARMB" ];        note $? "wait.pid still names the first waiter"
+                                                      note $? "drain A returns the reply"
 
 ## quickstart step 3: rooms (FR-011) ----------------------------------
 "$S" --root "$R" room create ops >/dev/null 2>&1;    note $? "room create ops"
@@ -253,19 +228,13 @@ r2="$(tm5 gallery)"
 [ "$(ls "$R5/seats/parked/inbox" | wc -l)" -eq 1 ]
                                                    note $? "down drained nothing: parked keeps its mail"
 
-# A live wait.pid and no pane is awake. A dead pid is unattended.
-# A pane still wins when that seat also has a live waiter.
-sleep 60 &
-awake_pid=$!
-BG_PIDS="$BG_PIDS $awake_pid"
-printf '%s\n' "$awake_pid" > "$R5/seats/fresh/wait.pid"
-tm5 status | grep -qx "fresh awake mail=0";        note $? "a live waiter with no pane is awake"
-printf '%s\n' "$$" > "$R5/seats/runner/wait.pid"
-tm5 status | grep -qx "runner pane mail=0";        note $? "a pane beats a live waiter"
-kill "$awake_pid" 2>/dev/null
-wait "$awake_pid" 2>/dev/null
-printf '%s\n' "4294967295" > "$R5/seats/fresh/wait.pid"
-tm5 status | grep -qx "fresh unattended mail=0";   note $? "a stale waiter pid is unattended"
+# Interim presence (0.4.0: no waiter, dispatcher not yet here): a
+# pane is pane; every other seat is unattended, mail or not.
+tm5 status | grep -qx "fresh unattended mail=0";     note $? "a seat with no pane is unattended"
+tm5 status | grep -qx "parked unattended mail=1";    note $? "mail does not change presence"
+# A leftover wait.pid (from a 0.3.0 waiter) never affects presence.
+printf '%s\n' "$$" > "$R5/seats/fresh/wait.pid"
+tm5 status | grep -qx "fresh unattended mail=0";     note $? "presence never reads wait.pid"
 
 ## seat-launch quickstart (003) steps 1, 2, 3, 6, 7 ---------------------
 # The session record, read without attaching: tab-separated session,
