@@ -1,6 +1,6 @@
 # Status presence
 
-Date: 2026-10-04. Agreed by codex-main, gemini-main, glm-main, opus-main, gallery grok-main, and eng-grokbot. Revised 2026-10-19 for 0.4.0 (`seat arm` and its waiter-derived `awake` were deleted; the dispatcher lands later and will redefine `awake` from its own delivery state). This file is the contract for `seat status`. It is excluded from the published crate.
+Date: 2026-10-04. Agreed by codex-main, gemini-main, glm-main, opus-main, gallery grok-main, and eng-grokbot. Revised 2026-10-19 for 0.4.0 (`seat arm` and its waiter-derived `awake` were deleted), and 2026-10-20 for 0.5.0 (`awake` returned, derived from the dispatcher's delivery state). This file is the contract for `seat status`. It is excluded from the published crate.
 
 A seat is a name plus an inbox. `seat status` prints one row per registered seat, sorted by name:
 
@@ -10,13 +10,13 @@ A seat is a name plus an inbox. `seat status` prints one row per registered seat
 
 ## Presence
 
-Presence is one of two words until the dispatcher lands. Mail never changes the word.
+Presence is one of three words. Mail never changes the word.
 
 - `pane` — a live pane in tmux session `swarm` is tagged `@seat` with this name.
+- `awake` — no live pane, and the dispatcher's `<seat>/dispatch.json` records a delivery to this seat's currently bound session within the last 10 minutes. Status reads that file and never asks the hub; a delivery to a session the seat is no longer bound to does not count.
 - `unattended` — every other seat.
-- `awake` — reserved, not printed: it returns with the dispatcher, as a delivery to that seat's bound active session within the last 10 minutes. A waiter pidfile no longer exists (`seat arm` was deleted in 0.4.0); presence never reads one.
 
-A background process the board cannot see, because it has no pane, is `unattended`.
+A background process the board cannot see, because it has no pane and no dispatcher delivery, is `unattended`.
 
 ## Mail
 
@@ -24,13 +24,13 @@ A background process the board cannot see, because it has no pane, is `unattende
 
 ## Words that are gone
 
-`seat status` does not print `running`, `stopped-with-unread`, `needs-operator`, `offline-with-unread`, `idle`, or (until the dispatcher lands) `awake`.
+`seat status` does not print `running`, `stopped-with-unread`, `needs-operator`, `offline-with-unread`, or `idle`.
 
 ## What this does not change
 
-- `seat gallery` prints only the pane names, joins those panes into one window, tiles it, then attaches. It does not list unattended seats. It does not move a pane that is not a registered live seat.
+- `seat gallery` prints only the pane names, joins those panes into one window, tiles it, then attaches. It does not list unattended or awake seats. It does not move a pane that is not a registered live seat.
 - The retired Python supervisor keeps its own words, including `offline-with-unread`.
 
 ## Version
 
-0.2.0 defined the line; 0.4.0 deleted the waiter-derived `awake` with `seat arm`. This commit does not publish to crates.io.
+0.2.0 defined the line; 0.4.0 deleted the waiter-derived `awake` with `seat arm`; 0.5.0 returned `awake` from the dispatcher's delivery state. This commit does not publish to crates.io.

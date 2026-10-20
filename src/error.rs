@@ -81,6 +81,9 @@ pub enum SeatError {
     #[error("up: seat {0} did not start: {1}")]
     StartFailed(String, String),
 
+    #[error("hub: {0}")]
+    Hub(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
