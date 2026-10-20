@@ -2,6 +2,44 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.7.1] - 2026-10-20
+
+### Fixed
+
+The three fixes the cutover needs — the required review of c111d09
+(`reviews/2026-10-20-seat-c111d09-cutover-review-opus.md`) found 0.7.0
+safe to install only after these.
+
+- Never archive mail nobody read. A hapi pass that finds the bound
+  session inactive while items are in flight (POSTed, not yet
+  committed) no longer sits on those items waiting to commit on the
+  hub's invoked mark: the hub marks queued messages invoked when a
+  session ends, and a resume can keep the same session id, so that
+  mark was made by the ending session. Every in-flight item now moves
+  to a fresh delivery key (a generation suffix on `seat:<seat>:<file>`
+  — a `localId` the hub has never seen, since it dedupes on
+  `(session, localId)` forever) as Staged and is re-POSTed once the
+  session is active again; only an invocation observed while the
+  session was active commits. Item identity stays the file, so a
+  rotated key still commits and archives its file when the new key is
+  invoked.
+- One dispatcher per board. `seat dispatch` takes an exclusive,
+  non-blocking `flock` on `<root>/dispatch.lock` for its whole life
+  (`--once` included); a second dispatcher exits nonzero at once with
+  one line naming the lock, instead of interleaving two scanners over
+  one board.
+- Kotek's hq delivery receipt, ported unchanged from the doorbell's
+  `report_delivery` (enabled by a marker file `<seat>/webhook.hq-ack`,
+  the same shape as `webhook.payload`, in place of `KOTEK_HQ_ACK=1`):
+  after each successful payload delivery the webhook adapter POSTs
+  `{"seat", "message_id"}` to `https://hq.bll.dev/ingest/seat-delivery`
+  with the Cloudflare Access service-token headers
+  (`CF-Access-Client-Id`/`CF-Access-Client-Secret`) read from
+  `~/.config/bll-ingest/env` (`KEY=VALUE` lines), User-Agent
+  `bll-seat-mail/1 (Slix)`, a 5 s timeout. Best effort: a missing env
+  file or failed receipt is dropped, never resent, and the payload
+  delivery stands; the secret values are never logged.
+
 ## [0.7.0] - 2026-10-20
 
 ### Removed

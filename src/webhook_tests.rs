@@ -50,7 +50,7 @@ fn wait_for(pred: impl Fn() -> bool, what: &str) {
 #[test]
 fn signal_body_and_headers_match_the_fixture() {
     let hook = FakeWebhook::start();
-    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false);
+    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false, None);
     let body = webhook::signal_body("eng-grokbot", TS, NONCE);
     assert_eq!(body, fixture("webhook-signal.body"));
     webhook::post(&cfg, &body, 1, &no_sleep).unwrap();
@@ -107,7 +107,7 @@ fn hq_mail(root: &Path, text: &str, id: &str, sender: &str, tamper: bool) -> Pat
 }
 
 fn payload_cfg(hook_url: &str) -> WebhookConfig {
-    WebhookConfig::mem(hook_url.into(), KEY.into(), None, true)
+    WebhookConfig::mem(hook_url.into(), KEY.into(), None, true, None)
 }
 
 /// The doorbell's cases from `test_grok_doorbell.py`: a verified
@@ -342,4 +342,170 @@ fn a_worker_spawned_with_stop_set_still_completes_its_first_pass() {
     );
     wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
     assert_eq!(hook.hits().len(), 1, "exactly the first pass, then stop");
+}
+
+/// Write the ingest env file (`KEY=VALUE` lines) into the current
+/// (throwaway) HOME.
+fn ingest_env_file() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME set");
+    let dir = home.join(".config").join("bll-ingest");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("env"),
+        "# bll ingest credentials\nACCESS_CLIENT_ID=cf-client-123\nACCESS_CLIENT_SECRET=cf-secret-456\nOTHER=ignored\n",
+    )
+    .unwrap();
+}
+
+fn ack_cfg(hook_url: &str, ack_url: &str) -> WebhookConfig {
+    WebhookConfig::mem(
+        hook_url.into(),
+        KEY.into(),
+        None,
+        true,
+        Some(ack_url.into()),
+    )
+}
+
+/// The hq delivery receipt, the doorbell's `report_delivery` ported
+/// unchanged (the seat marker `webhook.hq-ack` in place of
+/// `KOTEK_HQ_ACK=1`): exactly one receipt POST after each successful
+/// payload delivery — `{"seat", "message_id"}` with the two Access
+/// headers from `~/.config/bll-ingest/env`, User-Agent
+/// `bll-seat-mail/1 (Slix)` — and none without the marker. HOME is a
+/// throwaway so the operator's real env file is never read; the
+/// receipt URL points at the local receiver (the test seam —
+/// production hardcodes the ingest URL). The secrets never reach the
+/// log.
+#[test]
+fn hq_receipt_follows_each_payload_delivery_when_marked() {
+    crate::testutil::with_throwaway_home(
+        hq_receipt_follows_each_payload_delivery_when_marked_isolated,
+    );
+}
+
+fn hq_receipt_follows_each_payload_delivery_when_marked_isolated() {
+    let hook = FakeWebhook::start(); // the payload POSTs
+    let hq = FakeWebhook::start(); // the receipt POSTs
+    let root = kotek_board(&hook.url());
+    ingest_env_file();
+    std::fs::write(kotek_dir(&root).join("webhook.hq-ack"), b"").unwrap();
+    hq_mail(&root, "hello Mariola", "abcdef12", "inbox", false);
+    let cfg = ack_cfg(&hook.url(), &hq.url());
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        true
+    );
+    assert_eq!(hook.hits().len(), 1, "the payload POST");
+    assert_eq!(hq.hits().len(), 1, "exactly one receipt");
+    let (headers, body) = hq.hits()[0].clone();
+    // The doorbell's json.dumps default separators, field for field.
+    assert_eq!(
+        body, "{\"seat\": \"kotek-grokbot\", \"message_id\": \"abcdef12\"}",
+        "the exact receipt body"
+    );
+    assert!(
+        headers.contains("user-agent: bll-seat-mail/1 (Slix)\n"),
+        "{headers}"
+    );
+    assert!(
+        headers.contains("cf-access-client-id: cf-client-123\n"),
+        "{headers}"
+    );
+    assert!(
+        headers.contains("cf-access-client-secret: cf-secret-456\n"),
+        "{headers}"
+    );
+    assert!(
+        headers.contains("content-type: application/json\n"),
+        "{headers}"
+    );
+    // A delivered id never rides twice, and no stray receipt follows.
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        false
+    );
+    assert_eq!(hq.hits().len(), 1);
+    let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap_or_default();
+    assert!(
+        !log.contains("cf-client-123") && !log.contains("cf-secret-456"),
+        "secrets in the log: {log}"
+    );
+
+    // Without the marker there is no receipt at all.
+    std::fs::remove_file(kotek_dir(&root).join("webhook.hq-ack")).unwrap();
+    hq_mail(&root, "second mail", "999999ab", "inbox", false);
+    let plain = payload_cfg(&hook.url());
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &plain, &no_sleep).unwrap(),
+        true
+    );
+    assert_eq!(hook.hits().len(), 2, "the second payload POST");
+    assert_eq!(hq.hits().len(), 1, "no marker: no receipt");
+}
+
+/// The receipt is best effort, exactly as in the doorbell: a refused
+/// (or unsendable) receipt is one attempt, never resent, and the
+/// payload delivery stands — the id is delivered and the ring
+/// succeeded. HOME is a throwaway; the receipt URL is the local
+/// receiver.
+#[test]
+fn a_failed_hq_receipt_is_best_effort_and_never_resent() {
+    crate::testutil::with_throwaway_home(
+        a_failed_hq_receipt_is_best_effort_and_never_resent_isolated,
+    );
+}
+
+fn a_failed_hq_receipt_is_best_effort_and_never_resent_isolated() {
+    let hook = FakeWebhook::start();
+    let hq = FakeWebhook::start();
+    hq.ctl.lock().unwrap().status = 500; // the ingest refuses
+    let root = kotek_board(&hook.url());
+    ingest_env_file();
+    hq_mail(&root, "uncertain receipt", "abcdef12", "inbox", false);
+    let cfg = ack_cfg(&hook.url(), &hq.url());
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        true,
+        "the delivery stands: a failed receipt is not a failed ring"
+    );
+    assert_eq!(
+        webhook::id_list(&kotek_dir(&root).join("webhook-delivered.json")),
+        ["abcdef12".to_string()],
+        "the id is delivered"
+    );
+    assert_eq!(hq.hits().len(), 1, "one receipt attempt");
+    // Never resent: nothing at all is sent for a delivered id.
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        false
+    );
+    assert_eq!(hq.hits().len(), 1, "the failed receipt is not retried");
+    // One failure line, no detail, no secrets.
+    let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap_or_default();
+    assert!(log.contains("hq receipt abcdef12 failed"), "{log}");
+    assert!(
+        !log.contains("cf-secret-456") && !log.contains("cf-client-123"),
+        "{log}"
+    );
+
+    // Missing credentials: the receipt is skipped, the delivery still
+    // stands.
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME set");
+    std::fs::remove_file(home.join(".config").join("bll-ingest").join("env")).unwrap();
+    hq_mail(&root, "no credentials", "87654321", "inbox", false);
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        true
+    );
+    assert!(
+        webhook::id_list(&kotek_dir(&root).join("webhook-delivered.json"))
+            .contains(&"87654321".to_string()),
+        "delivered without a receipt"
+    );
+    assert_eq!(hq.hits().len(), 1, "no receipt without credentials");
 }

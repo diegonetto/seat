@@ -139,6 +139,63 @@ fn invoked_while_inactive_does_not_commit() {
     );
 }
 
+/// The resume case of the same rule: the invoked mark the ending
+/// session left must not commit even once the session is active again
+/// (a resume can keep the same session id) — the item is re-sent under
+/// a new delivery key, and only the new key's invocation archives it.
+#[test]
+fn invoked_while_inactive_rotates_the_key_and_resends_once_active() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+    hub.ctl.lock().unwrap().flip_inactive.insert("s1".into()); // flips when polled
+    send(&root, "opus", "invoked then gone");
+    let key = only_key(&root, "opus");
+    mark(&hub, &key, "invoked"); // the ending session's mark
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(n_files(&root, "opus", "archive"), 0, "nothing archived");
+    assert_eq!(n_files(&root, "opus", "draining"), 1, "still in flight");
+    // The in-flight item rotated to a fresh key, Staged.
+    let fresh = format!("{key}#2");
+    let state = dstate::load_state(&seat::seat_dir(&root, "opus"));
+    assert_eq!(
+        state.items.keys().collect::<Vec<_>>(),
+        vec![&fresh],
+        "the old key is gone from the state"
+    );
+    assert_eq!(
+        state.items.get(&fresh).unwrap().phase,
+        dstate::Phase::Staged
+    );
+    // The session is active again under the same id; the old invoked
+    // mark is never answered, the mail is re-sent under the new key,
+    // and only that invocation commits.
+    {
+        let mut ctl = hub.ctl.lock().unwrap();
+        ctl.flip_inactive.clear();
+        ctl.sessions.insert("s1".into(), true);
+    }
+    mark(&hub, &fresh, "invoked");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    assert_eq!(
+        n_files(&root, "opus", "archive"),
+        1,
+        "archived on the new key"
+    );
+    let journal = hub.journal();
+    assert!(
+        journal.contains(&format!("POST-MSG s1 {key}"))
+            && journal.contains(&format!("POST-MSG s1 {fresh}")),
+        "{journal:?}"
+    );
+    let log = log_text(&root);
+    assert!(log.contains(&format!("key={fresh}")), "{log}");
+}
+
 /// Indeterminate means wait: nothing committed, nothing re-POSTed, and
 /// waiting is not a failure.
 #[test]
@@ -521,7 +578,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     std::fs::write(gdir.join("webhook.url"), format!("{}\n", hook.url())).unwrap();
     std::fs::write(gdir.join("bridge.key"), "k\n").unwrap();
     send(&root, "grok", "ring grok");
-    let cfg = WebhookConfig::mem(hook.url(), "k".into(), None, false);
+    let cfg = WebhookConfig::mem(hook.url(), "k".into(), None, false, None);
     // A 1ns backoff makes every pass's re-ring due at once.
     let waits = RingWaits {
         first: Duration::from_nanos(1),
@@ -682,4 +739,31 @@ fn an_alarm_seat_naming_a_missing_seat_is_a_failed_sink() {
         1,
         "the retry did not re-attempt the sink"
     );
+}
+
+/// One dispatcher per board: `cmd_dispatch` holds an exclusive,
+/// non-blocking lock on `<root>/dispatch.lock` for its whole life
+/// (`--once` included), so a second dispatcher fails at once — never
+/// waits — with one line naming the lock, and succeeds again once the
+/// first lets go.
+#[test]
+fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    let held = seat::DispatchLock::acquire(&root).unwrap();
+    assert!(seat::dispatch_lock_path(&root).is_file());
+    let err = dispatch::cmd_dispatch(&root, true).unwrap_err();
+    let line = err.to_string();
+    assert!(line.lines().count() == 1, "one line: {line}");
+    assert!(
+        line.contains(
+            seat::dispatch_lock_path(&root)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "the lock is named: {line}"
+    );
+    // Released when the first holder drops: the next dispatcher runs.
+    drop(held);
+    dispatch::cmd_dispatch(&root, true).unwrap();
 }

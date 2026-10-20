@@ -148,6 +148,37 @@ pub(crate) fn direct_key(seat: &str, file: &str) -> String {
     format!("seat:{seat}:{file}")
 }
 
+/// Is `suffix` a generation suffix (`#` then digits, from
+/// `next_delivery_key`)? Message file names never contain `#`, so a
+/// key's base is unambiguous.
+fn generation(key: &str) -> Option<&str> {
+    key.rsplit_once('#')
+        .filter(|(_, gen)| !gen.is_empty() && gen.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, gen)| gen)
+}
+
+/// A delivery key's base: the key of the item's file as received, any
+/// generation suffix stripped — also that file's index in `texts`.
+pub(crate) fn key_base(key: &str) -> &str {
+    match key.rsplit_once('#') {
+        Some((base, _)) if generation(key).is_some() => base,
+        _ => key,
+    }
+}
+
+/// The next generation of a delivery key: a fresh `localId` for the
+/// same file. The hub dedupes on `(session, localId)` forever, so this
+/// is how an in-flight item is re-sent — the invoked mark the ending
+/// session left on the old key can never come back on the new one.
+pub(crate) fn next_delivery_key(key: &str) -> String {
+    let base = key_base(key);
+    let next = generation(key)
+        .and_then(|g| g.parse::<u32>().ok())
+        .unwrap_or(1)
+        + 1;
+    format!("{base}#{next}")
+}
+
 /// Exactly the lines `seat drain` prints for the item: header line,
 /// body, blank line.
 pub(crate) fn direct_text(d: &ReceivedDirect) -> String {
