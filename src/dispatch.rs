@@ -9,14 +9,12 @@ use crate::alarm;
 use crate::board;
 use crate::drain::{self, Received};
 use crate::dstate::{
-    direct_key, direct_text, load_state, log_line, room_key, room_text, store_state, DispatchState,
-    LastDelivery, Phase,
+    direct_key, direct_text, load_state, log_line, store_state, DispatchState, LastDelivery, Phase,
 };
 use crate::error::{Result, SeatError};
 use crate::hub::{Hub, HubConfig};
 use crate::identity::Bindings;
 use crate::msg;
-use crate::room;
 use crate::seat::{self, SeatLock};
 use crate::verbs::sorted_seat_names;
 use crate::webhook;
@@ -68,36 +66,11 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
         return Ok(Pass::Blocked);
     };
     // The `undelivered` cause, by message age (hapi has no
-    // payload-delivered record; committed mail is archived away). A
-    // pending followed-room post counts too — only the posts this
-    // seat's `receive` would accept, and never one already delivered
-    // (`Phase::Done`): a younger post still in flight holds the room
-    // cursor behind a delivered one, and a delivered post is not owed
-    // mail. Each is aged by its verified header `ts`, not by its
-    // file-name prefix (nothing requires the two to match): a post
-    // owed for 15 minutes is as undelivered as mail sitting in
-    // `inbox/` or `draining/`, which is all the seat's own files
-    // can see.
+    // payload-delivered record; committed mail is archived away): mail
+    // sitting in `inbox/` or `draining/` — the seat's own files —
+    // older than 15 minutes by its verified header `ts`.
     let mut state = load_state(&dir);
-    let mut owed = webhook::present_files(&dir);
-    for room_name in room::followed_rooms(&dir) {
-        let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
-        for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
-            let Ok(item) = drain::check_room_post(root, &room_name, &post) else {
-                continue;
-            };
-            if state
-                .items
-                .get(&room_key(seat, &room_name, &item.file_name))
-                .is_some_and(|i| i.phase == Phase::Done)
-            {
-                continue;
-            }
-            // A name the age check parses, carrying the verified
-            // header fields: the header `ts` is the post's age.
-            owed.insert(format!("{}-{}.msg", item.header.ts, item.header.id));
-        }
-    }
+    let owed = webhook::present_files(&dir);
     alarm::undelivered(root, seat, &BTreeSet::new(), &owed)?;
     // The lock covers receive only; a manual drain can run between
     // receive and commit.
@@ -117,9 +90,6 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     for d in &received.directs {
         texts.insert(direct_key(seat, &d.file_name), direct_text(d));
     }
-    for r in &received.rooms {
-        texts.insert(room_key(seat, &r.room, &r.file_name), room_text(r));
-    }
     // A key whose file is gone (a manual drain took it) is pruned.
     let before_prune = state.items.len();
     state.items.retain(|k, _| texts.contains_key(k));
@@ -129,16 +99,6 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     if state.items.is_empty() {
         if before_prune > 0 {
             store_state(&dir, &state)?; // persist the prune
-        }
-        // Nothing deliverable: advance cursors past rejected room
-        // posts under the lock, or every scan re-reads them forever.
-        if !received.room_cursors.is_empty() {
-            let _lock = SeatLock::acquire(&dir, seat)?;
-            for (room_name, ts) in &received.room_cursors {
-                if ts > &room::read_cursor(&dir, room_name)? {
-                    room::write_cursor(&dir, room_name, ts)?;
-                }
-            }
         }
         return Ok(Pass::Idle);
     }
@@ -266,10 +226,7 @@ fn poll_round(
 
 /// Commit exactly the invoked items under the seat lock: archive the
 /// invoked directs (a file already taken by a manual drain counts as
-/// done), move no room cursor past a post still in flight and never
-/// backwards — `receive` re-reports posts past the cursor, so a post
-/// committed in an earlier round counts as done (two posts invoking in
-/// different rounds must not wedge the cursor at "0" forever).
+/// done).
 pub(crate) fn commit_invoked(
     root: &Path,
     seat: &str,
@@ -288,20 +245,6 @@ pub(crate) fn commit_invoked(
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(e.into());
             }
-        }
-    }
-    for (room_name, ts) in &received.room_cursors {
-        let still = received.rooms.iter().any(|r| {
-            &r.room == room_name
-                && !invoked.contains(&room_key(seat, &r.room, &r.file_name))
-                && !state
-                    .items
-                    .get(&room_key(seat, &r.room, &r.file_name))
-                    .map(|i| i.phase == Phase::Done)
-                    .unwrap_or(false)
-        });
-        if !still && ts > &room::read_cursor(&dir, room_name)? {
-            room::write_cursor(&dir, room_name, ts)?;
         }
     }
     seat::update_meta(&dir, |meta| meta.last_drained = Some(seat::now_ts()))?;
@@ -417,11 +360,8 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
 }
 
 /// Fresh work a waiting worker must not sit behind its backoff for:
-/// mail in `inbox/`, a binding that moved while items are in flight,
-/// or a new followed-room post whose delivery key this seat's state
-/// does not carry yet. Posts `receive` would refuse never gain a key
-/// and never wake; the cursor does not move past them while items are
-/// in flight, so waking on them would void the backoff on every slice.
+/// mail in `inbox/`, or a binding that moved while items are in
+/// flight.
 fn fresh_work(root: &Path, seat: &str) -> bool {
     let dir = seat::seat_dir(root, seat);
     if !msg::list_msg_dir(&dir.join("inbox"))
@@ -433,19 +373,6 @@ fn fresh_work(root: &Path, seat: &str) -> bool {
     let state = load_state(&dir);
     if Bindings::load(root).session_id(seat).map(str::to_string) != state.session {
         return true;
-    }
-    for room_name in room::followed_rooms(&dir) {
-        let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
-        for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
-            if let Ok(received) = drain::check_room_post(root, &room_name, &post) {
-                if !state
-                    .items
-                    .contains_key(&room_key(seat, &room_name, &received.file_name))
-                {
-                    return true;
-                }
-            }
-        }
     }
     false
 }

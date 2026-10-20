@@ -1,21 +1,23 @@
 //! Alarms (item 6, the frozen contract): one line to
-//! `<root>/dispatch.log` and one post to the room `blacklite-factory`
-//! as seat `sb-watch`, **once per cause** (not per retry). Causes are
-//! latched per seat (`<cause>:<seat>`) — except `hub-auth`, which is
-//! board-wide — and the fired set persists durably at
-//! `<root>/dispatch-alarms.json`, so a retry, a respawned worker and
-//! the next scan stay silent until the condition clears and returns.
-//! No deduplication beyond the listed causes.
+//! `<root>/dispatch.log` and one direct message from seat `sb-watch`
+//! to the seat named in `<root>/alarm-seat`, **once per cause** (not
+//! per retry). When that file is absent or empty the alarm is the log
+//! line only. Causes are latched per seat (`<cause>:<seat>`) — except
+//! `hub-auth`, which is board-wide — and the fired set persists
+//! durably at `<root>/dispatch-alarms.json`, so a retry, a respawned
+//! worker and the next scan stay silent until the condition clears
+//! and returns. No deduplication beyond the listed causes.
 use crate::dstate::{atomic_write_private, log_line};
 use crate::error::Result;
-use crate::room;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-pub(crate) const ROOM: &str = "blacklite-factory";
+/// The seat alarms are sent as (it must be registered, with a token).
 pub(crate) const SEAT: &str = "sb-watch";
+/// `<root>/alarm-seat`: the seat alarms are mailed to (one line).
+const ALARM_SEAT_FILE: &str = "alarm-seat";
 const STATE_FILE: &str = "dispatch-alarms.json";
 /// A message this old still undelivered is the `undelivered` cause.
 pub(crate) const UNDELIVERED_AFTER_MIN: i64 = 15;
@@ -55,11 +57,25 @@ fn store(root: &Path, fired: &Fired) -> Result<()> {
     atomic_write_private(&root.join(STATE_FILE), &json)
 }
 
+/// The seat alarms are mailed to: the first line of
+/// `<root>/alarm-seat`, trimmed. An absent or empty file means the
+/// alarm is the log line only.
+fn alarm_seat(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join(ALARM_SEAT_FILE))
+        .ok()
+        .and_then(|raw| raw.lines().next().map(|l| l.trim().to_string()))
+        .filter(|l| !l.is_empty())
+}
+
 /// Fire once per cause: the first occurrence writes one `alarm` log
-/// line and posts `seat <seat|board>: <cause>: <detail>` to the alarm
-/// room as `sb-watch` (no `HAPI_SESSION_ID` into the identity rule);
-/// later occurrences are silent until `clear`. A failed post is
-/// logged and does not unlatch; a persistence failure is returned.
+/// line and sends `seat <seat|board>: <cause>: <detail>` as one
+/// direct message from `sb-watch` to the seat named in
+/// `<root>/alarm-seat` (the silent library send — no printing, no
+/// `HAPI_SESSION_ID` into the identity rule); an absent or empty file
+/// leaves the log line as the whole alarm. Later occurrences are
+/// silent until `clear`. A failed send (the file names a seat that is
+/// not on the board) is logged and does not unlatch; a persistence
+/// failure is returned.
 pub(crate) fn fire(root: &Path, seat: Option<&str>, cause: &str, detail: &str) -> Result<()> {
     let _guard = LOCK.lock().unwrap();
     let mut fired = load(root);
@@ -69,19 +85,21 @@ pub(crate) fn fire(root: &Path, seat: Option<&str>, cause: &str, detail: &str) -
     store(root, &fired)?;
     let who = seat.unwrap_or("board");
     log_line(root, "alarm", who, &format!("cause={cause} {detail}"));
-    if let Err(e) = room::post(
-        root,
-        ROOM,
-        Some(SEAT),
-        &format!("seat {who}: {cause}: {detail}"),
-        None,
-    ) {
-        log_line(
+    if let Some(to) = alarm_seat(root) {
+        if let Err(e) = crate::verbs::send(
             root,
-            "alarm-post-failed",
-            who,
-            &format!("cause={cause} error={e}"),
-        );
+            Some(SEAT),
+            &to,
+            &format!("seat {who}: {cause}: {detail}"),
+            None,
+        ) {
+            log_line(
+                root,
+                "alarm-post-failed",
+                who,
+                &format!("cause={cause} error={e}"),
+            );
+        }
     }
     Ok(())
 }

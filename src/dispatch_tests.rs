@@ -1,8 +1,7 @@
 //! The dispatcher check cases against the one small fake hub on
 //! 127.0.0.1 (never the live hub): the brief's hapi contract plus the
-//! local-state cases (room cursors, invalid posts, `awake`, the
-//! fresh-work wake) and the 0.6.0 additions (the alarm matrix, the
-//! room-post wake, the reload).
+//! local-state cases (`awake`, the fresh-work wake), the alarm matrix
+//! and the reload.
 use crate::alarm;
 use crate::dispatch::{self, Pass, Waits};
 use crate::error::SeatError;
@@ -10,7 +9,7 @@ use crate::testutil::dispatchkit::{kit, log_text, mark, n_files, n_posts, only_k
 use crate::testutil::fakewebhook::FakeWebhook;
 use crate::testutil::write_bindings;
 use crate::webhook::{self, RingWaits, WebhookConfig};
-use crate::{drain, dstate, msg, room, seat, verbs};
+use crate::{drain, dstate, msg, seat, verbs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -304,92 +303,6 @@ fn posted_text_is_exactly_the_drain_lines() {
     );
 }
 
-/// Room posts deliver under room keys; no cursor advances past a post
-/// still in flight — and posts invoked in different passes still
-/// advance it once the last one lands, so the seat goes Idle.
-#[test]
-fn room_cursor_waits_then_advances() {
-    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-    room::create(&root, "ops").unwrap();
-    room::cmd_post(&root, "ops", Some("opus"), "post one", None).unwrap();
-    room::cmd_post(&root, "ops", Some("opus"), "post two", None).unwrap();
-    room::cmd_follow(&root, "ops", "opus").unwrap();
-    let key = |i: usize| {
-        dstate::room_key(
-            "opus",
-            "ops",
-            room::posts(&root, "ops").unwrap()[i]
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-        )
-    };
-    mark(&hub, &key(0), "invoked"); // post two does not invoke yet
-    let dir = seat::seat_dir(&root, "opus");
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Waiting
-    );
-    assert_eq!(
-        room::read_cursor(&dir, "ops").unwrap(),
-        "0",
-        "post two is still in flight"
-    );
-    assert!(
-        log_text(&root).contains(&key(0)),
-        "room posts log their key"
-    );
-    mark(&hub, &key(1), "invoked");
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Delivered
-    );
-    assert_eq!(
-        room::read_cursor(&dir, "ops").unwrap(),
-        msg::ts_prefix(&room::posts(&root, "ops").unwrap()[1]).unwrap(),
-        "both posts done: the cursor advances past post one too"
-    );
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Idle
-    );
-}
-
-/// A pass whose only followed-room posts are invalid advances the
-/// cursors past them under the lock (as drain's commit does): one
-/// failure line, not one per 2-second scan, and nothing is POSTed.
-#[test]
-fn invalid_room_posts_do_not_repeat_every_scan() {
-    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-    room::create(&root, "ops").unwrap();
-    room::cmd_post(&root, "ops", Some("opus"), "tampered post", None).unwrap();
-    let post = room::posts(&root, "ops").unwrap().remove(0);
-    let raw = std::fs::read_to_string(&post).unwrap();
-    std::fs::write(&post, raw.replace("tampered post", "broken post")).unwrap();
-    room::cmd_follow(&root, "ops", "opus").unwrap();
-    let dir = seat::seat_dir(&root, "opus");
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Idle
-    );
-    assert_eq!(
-        room::read_cursor(&dir, "ops").unwrap(),
-        msg::ts_prefix(&post).unwrap(),
-        "the cursor moved past the rejected post"
-    );
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Idle
-    );
-    assert_eq!(
-        log_text(&root).matches("failure").count(),
-        1,
-        "logged once, not per scan"
-    );
-    assert_eq!(n_posts(&hub.journal()), 0);
-}
-
 /// Status's `awake` reads dispatch.json alone: true after a delivery,
 /// false when older than 10 minutes or the binding moved.
 #[test]
@@ -463,80 +376,31 @@ fn fresh_work_wakes_a_backing_off_worker_at_once() {
     stop.store(true, Ordering::SeqCst);
 }
 
-/// A followed-room post wakes a worker waiting on a queued item; a
-/// post the receive path would refuse (tampered) never wakes it.
-#[test]
-fn a_followed_room_post_wakes_a_backing_off_worker() {
-    let (root, hub, _client) = kit(&[("opus", "s1")], &["s1"]);
-    send(&root, "opus", "stuck queued");
-    let key = only_key(&root, "opus");
-    mark(&hub, &key, "queued");
-    let stop = Arc::new(AtomicBool::new(false));
-    let (r, cfg, s) = (root.clone(), hub.config(), Arc::clone(&stop));
-    std::thread::spawn(move || {
-        dispatch::worker_loop(
-            r,
-            "opus".into(),
-            cfg,
-            s,
-            Waits {
-                first: Duration::from_secs(30),
-                max: Duration::from_secs(30),
-            },
-        )
-    });
-    let posted = |line: &str| hub.journal().iter().any(|l| l.contains(line));
-    wait_for(
-        || posted(&format!("POST-MSG s1 {key}")),
-        "the first POST never happened",
-    );
-    // A good post in a followed room wakes the worker mid-backoff.
-    room::create(&root, "ops").unwrap();
-    room::cmd_post(&root, "ops", Some("opus"), "wake up", None).unwrap();
-    room::cmd_follow(&root, "ops", "opus").unwrap();
-    let room_key = dstate::room_key(
-        "opus",
-        "ops",
-        room::posts(&root, "ops").unwrap()[0]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap(),
-    );
-    wait_for(
-        || posted(&format!("POST-MSG s1 {room_key}")),
-        "the room post waited behind the queued backoff",
-    );
-    std::thread::sleep(Duration::from_millis(200)); // let the pass finish
-                                                    // A tampered post would be refused by receive: it must not wake.
-    let (before, log_before) = (hub.journal().len(), log_text(&root).len());
-    room::cmd_post(&root, "ops", Some("opus"), "do not wake", None).unwrap();
-    let last = room::posts(&root, "ops").unwrap().pop().unwrap();
-    let raw = std::fs::read_to_string(&last).unwrap();
-    std::fs::write(&last, raw.replace("do not wake", "broken post")).unwrap();
-    std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        hub.journal().len(),
-        before,
-        "a refused post woke the worker"
-    );
-    assert!(
-        !log_text(&root)[log_before..].contains("rejected"),
-        "a refused post was received"
-    );
-    stop.store(true, Ordering::SeqCst);
-}
-
-fn alarm_posts(root: &std::path::Path) -> Vec<String> {
-    room::posts(root, alarm::ROOM)
+/// The alarm bodies mailed to the seat named in `<root>/alarm-seat`
+/// (the watcher's unread inbox, oldest first).
+fn alarm_mail(root: &std::path::Path) -> Vec<String> {
+    let to = std::fs::read_to_string(root.join("alarm-seat"))
+        .unwrap()
+        .trim()
+        .to_string();
+    msg::list_msg_dir(&seat::seat_dir(root, &to).join("inbox"))
         .unwrap()
         .iter()
         .filter_map(|p| msg::read_msg(p).ok().map(|(_, b)| b))
         .collect()
 }
 
+/// The alarm sink's board: `sb-watch` registered with a token, plus a
+/// watcher seat named in `<root>/alarm-seat`.
+fn watch_board(root: &std::path::Path, watcher: &str) {
+    verbs::cmd_register(root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    verbs::cmd_register(root, watcher, "sb", None, None, Vec::new()).unwrap();
+    std::fs::write(root.join("alarm-seat"), format!("{watcher}\n")).unwrap();
+}
+
 /// The frozen alarm contract, one matrix: each cause fires once (one
-/// log line, one room post as `sb-watch`), retries stay silent,
+/// log line, one direct message from `sb-watch` to the seat named in
+/// `<root>/alarm-seat`), retries stay silent,
 /// recovery clears — a recovered hub clears even while the session
 /// reads inactive — and a recurrence alarms again. HOME points at a
 /// throwaway directory for the whole matrix, so nothing the test runs
@@ -548,8 +412,7 @@ fn alarm_matrix_once_per_cause_and_recovery() {
 
 fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
-    room::create(&root, alarm::ROOM).unwrap();
-    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    watch_board(&root, "diego");
     hub.ctl.lock().unwrap().sessions.insert("s1".into(), false);
 
     // session-inactive: fires once across retries; failure lines stay.
@@ -569,8 +432,8 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
         1
     );
     assert_eq!(log.matches("failure seat=opus").count(), 2, "{log}");
-    assert_eq!(alarm_posts(&root).len(), 1);
-    assert!(alarm_posts(&root)[0].starts_with("seat opus: session-inactive: session s1"));
+    assert_eq!(alarm_mail(&root).len(), 1);
+    assert!(alarm_mail(&root)[0].starts_with("seat opus: session-inactive: session s1"));
 
     // Recovery clears (the session reads active again)…
     hub.ctl.lock().unwrap().sessions.insert("s1".into(), true);
@@ -582,7 +445,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
         Pass::Blocked
     );
     assert_eq!(log_text(&root).matches("cause=session-inactive").count(), 2);
-    assert_eq!(alarm_posts(&root).len(), 2);
+    assert_eq!(alarm_mail(&root).len(), 2);
 
     // no-answer (per seat) and hub-auth (board-wide): once each,
     // then cleared by any successful hub response — this one reports
@@ -610,7 +473,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
             .count(),
         1
     );
-    assert_eq!(alarm_posts(&root).len(), 4);
+    assert_eq!(alarm_mail(&root).len(), 4);
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
         Pass::Blocked
@@ -623,7 +486,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     dispatch::log_failure(&root, "opus", &SeatError::Hub("auth refused twice".into()));
     assert_eq!(log_text(&root).matches("cause=no-answer").count(), 2);
     assert_eq!(log_text(&root).matches("cause=hub-auth").count(), 2);
-    assert_eq!(alarm_posts(&root).len(), 6);
+    assert_eq!(alarm_mail(&root).len(), 6);
 
     // undelivered: an item older than 15 minutes (the ts in its file
     // name) fires once; receive quarantines it, so the next pass
@@ -642,12 +505,12 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
             .count(),
         1
     );
-    assert_eq!(alarm_posts(&root).len(), 7);
+    assert_eq!(alarm_mail(&root).len(), 7);
     dispatch::pass_seat(&root, "opus", &mut client).unwrap(); // quarantined: clears
     std::fs::write(&old, "stale\n\nstale").unwrap();
     dispatch::pass_seat(&root, "opus", &mut client).unwrap();
     assert_eq!(log_text(&root).matches("cause=undelivered").count(), 2);
-    assert_eq!(alarm_posts(&root).len(), 8);
+    assert_eq!(alarm_mail(&root).len(), 8);
 
     // webhook-failing: strikes 1 and 2 log one failure line each,
     // strike 3 alarms once, further failures stay silent, and a
@@ -680,7 +543,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
             .count(),
         1
     );
-    assert_eq!(alarm_posts(&root).len(), 9);
+    assert_eq!(alarm_mail(&root).len(), 9);
     hook.ctl.lock().unwrap().status = 0;
     send(&root, "grok", "ring again");
     assert!(matches!(
@@ -727,11 +590,10 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
     );
     assert_eq!(dstate::load_state(&dir).session.as_deref(), Some("s1"));
     assert_eq!(dstate::load_state(&dir).items.len(), 1);
-    room::create(&root, alarm::ROOM).unwrap();
-    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    watch_board(&root, "diego");
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
-    assert_eq!(alarm_posts(&root).len(), 1, "latched across the reload");
+    assert_eq!(alarm_mail(&root).len(), 1, "latched across the reload");
     let raw = std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap();
     assert!(raw.contains("session-inactive:alpha"), "{raw}");
     assert_eq!(
@@ -750,207 +612,72 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
         .collect();
     assert!(scratch.is_empty(), "scratch left: {scratch:?}");
 }
-
-/// A pending followed-room post raises `undelivered`: the age check
-/// includes, beside the seat's own `inbox/` and `draining/` files,
-/// the posts this seat's `receive` would accept, aged by their
-/// verified header `ts` — a seat whose only owed item is an old room
-/// post is undelivered too. Delivering the post clears the cause; a
-/// tampered post never counts, exactly as `receive` refuses it.
+/// Without `<root>/alarm-seat` the alarm is the log line only: the
+/// cause still latches, and no message is sent anywhere.
 #[test]
-fn an_old_pending_room_post_raises_undelivered() {
-    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-    room::create(&root, alarm::ROOM).unwrap();
+fn without_alarm_seat_the_log_line_is_the_whole_alarm() {
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
     verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
-    room::create(&root, "ops").unwrap();
-    // Verified posts, backdated by header ts and file prefix alike.
-    let token = verbs::sender_token(&root, "opus").unwrap();
-    let write_post = |ts: &str, id: &str, tamper: bool| {
-        // The MAC is always over the honest body; a tampered post
-        // writes something else, so verification fails exactly as a
-        // forged post would.
-        let mac = msg::compute_hmac(&token, "ops", "opus", id, ts, b"old bulletin", None).unwrap();
-        let head = format!(
-            "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{ts}\",\"hmac\":\"{mac}\"}}"
-        );
-        let body = if tamper { "altered" } else { "old bulletin" };
-        std::fs::write(
-            room::room_dir(&root, "ops").join(format!("{ts}-{id}.msg")),
-            format!("{head}\n\n{body}"),
-        )
-        .unwrap();
-    };
-    let old = "20260101T000000.000000";
-    write_post(old, "deadbeef", false);
-    room::cmd_follow(&root, "ops", "opus").unwrap();
-
-    // The seat owes nothing in inbox/ or draining/ — only the old
-    // room post — and that alone raises the alarm.
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Waiting
-    );
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
     assert_eq!(
         log_text(&root)
-            .matches("alarm seat=opus cause=undelivered")
+            .matches("alarm seat=alpha cause=session-inactive")
             .count(),
-        1
-    );
-    assert!(alarm_posts(&root)[0].contains("undelivered"));
-
-    // Delivered: the cursor advances past the post, the seat owes
-    // nothing old any more, and the cause clears.
-    let key = dstate::room_key("opus", "ops", &format!("{old}-deadbeef.msg"));
-    mark(&hub, &key, "invoked");
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Delivered
-    );
-    dispatch::pass_seat(&root, "opus", &mut client).unwrap(); // the idle pass: the clear
-    assert!(!std::fs::read_to_string(root.join("dispatch-alarms.json"))
-        .unwrap_or_default()
-        .contains("undelivered:opus"));
-
-    // A tampered old post is not owed (receive refuses it): no new
-    // alarm, and the pass advances the cursor past it.
-    write_post("20260101T000001.000000", "feedface", true);
-    assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Idle
-    );
-    assert_eq!(
-        log_text(&root).matches("cause=undelivered").count(),
         1,
-        "a post receive would refuse is not undelivered"
+        "once per cause, and the log line is written"
     );
+    // No seat on this board received anything.
+    for name in ["alpha", alarm::SEAT] {
+        assert!(
+            msg::list_msg_dir(&seat::seat_dir(&root, name).join("inbox"))
+                .unwrap()
+                .is_empty(),
+            "{name} was mailed without an alarm-seat file"
+        );
+    }
+    assert!(std::fs::read_to_string(root.join("dispatch-alarms.json"))
+        .unwrap_or_default()
+        .contains("session-inactive:alpha"));
 }
 
-/// Partial room delivery: an old post delivered in an earlier round
-/// (`Phase::Done`) with a younger post from the same room still in
-/// flight — the cursor lags behind both, but the delivered post is
-/// not owed mail, so once only the young post remains the
-/// `undelivered` cause clears instead of staying latched on the done
-/// key behind the cursor.
+/// A present `<root>/alarm-seat` naming a seat that is not on the
+/// board is a failed sink, not the log-only case: the send fails, one
+/// `alarm-post-failed` line is logged, and the cause stays latched
+/// (a corrected file still receives nothing until the condition
+/// clears and returns).
 #[test]
-fn a_delivered_room_post_behind_the_cursor_is_not_owed() {
-    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-    room::create(&root, alarm::ROOM).unwrap();
+fn an_alarm_seat_naming_a_missing_seat_is_a_failed_sink() {
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
     verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
-    room::create(&root, "ops").unwrap();
-    // Verified posts: an old one and a fresh one, same room.
-    let token = verbs::sender_token(&root, "opus").unwrap();
-    let write_post = |ts: &str, id: &str| {
-        let mac = msg::compute_hmac(&token, "ops", "opus", id, ts, b"bulletin", None).unwrap();
-        std::fs::write(
-            room::room_dir(&root, "ops").join(format!("{ts}-{id}.msg")),
-            format!(
-                "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{ts}\",\"hmac\":\"{mac}\"}}\n\nbulletin"
-            ),
-        )
-        .unwrap();
-    };
-    let old = "20260101T000000.000000";
-    let young = msg::now_ts();
-    write_post(old, "deadbeef");
-    write_post(&young, "feedface");
-    room::cmd_follow(&root, "ops", "opus").unwrap();
-    let old_key = dstate::room_key("opus", "ops", &format!("{old}-deadbeef.msg"));
-    let young_key = dstate::room_key("opus", "ops", &format!("{young}-feedface.msg"));
-
-    // The old post is genuinely undelivered: the alarm fires once.
-    // Delivering it while the young one stays queued leaves the room
-    // cursor behind both (the young post holds it back).
-    mark(&hub, &old_key, "invoked");
-    mark(&hub, &young_key, "queued");
+    std::fs::write(root.join("alarm-seat"), "ghost\n").unwrap();
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
+    let log = log_text(&root);
     assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Waiting
+        log.matches("alarm seat=alpha cause=session-inactive").count(),
+        1
     );
-    assert_eq!(
-        room::read_cursor(&seat::seat_dir(&root, "opus"), "ops").unwrap(),
-        "0"
+    assert!(
+        log.contains("alarm-post-failed"),
+        "the failed sink is logged: {log}"
     );
     assert!(std::fs::read_to_string(root.join("dispatch-alarms.json"))
         .unwrap_or_default()
-        .contains("undelivered:opus"));
-
-    // The next pass owes only the young post: the delivered one is
-    // `Phase::Done` behind the cursor and must not keep the cause
-    // latched, and the young one is not old — so the cause clears.
+        .contains("session-inactive:alpha"));
+    // Latched: a second fire of the same cause stays silent (the
+    // failed-sink line is not another alarm).
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
     assert_eq!(
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
-        Pass::Waiting
+        log_text(&root)
+            .matches("alarm seat=alpha cause=session-inactive")
+            .count(),
+        1
     );
     assert_eq!(
-        log_text(&root).matches("cause=undelivered").count(),
+        log_text(&root).matches("alarm-post-failed").count(),
         1,
-        "the delivered post behind the cursor is not owed"
+        "the retry did not re-attempt the sink"
     );
-    assert!(!std::fs::read_to_string(root.join("dispatch-alarms.json"))
-        .unwrap_or_default()
-        .contains("undelivered:opus"));
-}
-
-/// A pending followed-room post is aged by its verified header `ts`,
-/// never by its file-name prefix: nothing requires the two to match.
-/// An accepted post whose header is old but whose file name is recent
-/// must fire; the reverse — a fresh header under an old file name —
-/// must not.
-#[test]
-fn a_room_post_is_aged_by_its_header_ts_not_its_file_name() {
-    let write = |root: &std::path::Path, token: &str, header_ts: &str, file_ts: &str, id: &str| {
-        let mac =
-            msg::compute_hmac(token, "ops", "opus", id, header_ts, b"bulletin", None).unwrap();
-        std::fs::write(
-            room::room_dir(root, "ops").join(format!("{file_ts}-{id}.msg")),
-            format!(
-                "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{header_ts}\",\"hmac\":\"{mac}\"}}\n\nbulletin"
-            ),
-        )
-        .unwrap();
-    };
-    // Old header, recent file name: owed and old — the alarm fires.
-    {
-        let (root, _hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-        room::create(&root, alarm::ROOM).unwrap();
-        verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
-        room::create(&root, "ops").unwrap();
-        let token = verbs::sender_token(&root, "opus").unwrap();
-        write(
-            &root,
-            &token,
-            "20260101T000000.000000",
-            &msg::now_ts(),
-            "deadbeef",
-        );
-        room::cmd_follow(&root, "ops", "opus").unwrap();
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap();
-        assert!(
-            log_text(&root).contains("alarm seat=opus cause=undelivered"),
-            "an accepted old post is owed however its file is named"
-        );
-        assert!(alarm_posts(&root)[0].contains("undelivered"));
-    }
-    // Fresh header, old file name: not owed-old — no alarm.
-    {
-        let (root, _hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-        room::create(&root, alarm::ROOM).unwrap();
-        verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
-        room::create(&root, "ops").unwrap();
-        let token = verbs::sender_token(&root, "opus").unwrap();
-        write(
-            &root,
-            &token,
-            &msg::now_ts(),
-            "20260101T000000.000000",
-            "deadbeef",
-        );
-        room::cmd_follow(&root, "ops", "opus").unwrap();
-        dispatch::pass_seat(&root, "opus", &mut client).unwrap();
-        assert_eq!(
-            log_text(&root).matches("cause=undelivered").count(),
-            0,
-            "a fresh post under an old file name is not undelivered"
-        );
-    }
 }

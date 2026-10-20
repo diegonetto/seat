@@ -91,14 +91,18 @@ pub fn sender_token(root: &Path, seat_name: &str) -> Result<String> {
 /// rule (`--from` optional; see `crate::identity`): a bound session
 /// sends only as its seat, an unbound caller's omitted `--from` sends
 /// as `inbox` to a factory seat. `env_session` is the caller's
-/// `HAPI_SESSION_ID`, read at the CLI edge.
-pub fn cmd_send(
+/// `HAPI_SESSION_ID`, read at the CLI edge. This is the library half
+/// of the verb: the identity and token checks, the write, the
+/// last-seen touch — and no printing, so service callers (the
+/// dispatcher's alarm) send without touching stdout and pass no
+/// `HAPI_SESSION_ID` into the identity rule.
+pub fn send(
     root: &Path,
     from: Option<&str>,
     to: &str,
     body: &str,
     env_session: Option<&str>,
-) -> Result<()> {
+) -> Result<msg::Header> {
     board::ensure_board(root)?;
     let who = identity::resolve_for_send(root, from, env_session, to)?;
     let from = who.from.as_str();
@@ -118,7 +122,19 @@ pub fn cmd_send(
         who.session.as_deref(),
     )?;
     touch_last_seen(root, from)?;
-    println!("sent {} from {from} to {to}", header.id);
+    Ok(header)
+}
+
+/// The verb: the library send plus the one printed line.
+pub fn cmd_send(
+    root: &Path,
+    from: Option<&str>,
+    to: &str,
+    body: &str,
+    env_session: Option<&str>,
+) -> Result<()> {
+    let header = send(root, from, to, body, env_session)?;
+    println!("sent {} from {} to {to}", header.id, header.from);
     Ok(())
 }
 

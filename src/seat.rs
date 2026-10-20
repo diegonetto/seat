@@ -41,7 +41,10 @@ pub struct Meta {
     pub cmd: Option<Vec<String>>,
 }
 
-pub const SUBDIRS: [&str; 4] = ["inbox", "draining", "archive", "cursors"];
+/// 0.7.0 removed rooms: the room-cursor directory is no longer
+/// created (a leftover `cursors/` from before is never read or
+/// written).
+pub const SUBDIRS: [&str; 3] = ["inbox", "draining", "archive"];
 
 pub fn seat_dir(root: &Path, name: &str) -> PathBuf {
     root.join("seats").join(name)
@@ -197,7 +200,7 @@ pub fn now_ts() -> String {
 }
 
 /// Create the seat layout:
-/// `seats/<name>/{meta.json, token, inbox/, draining/, archive/, cursors/}`.
+/// `seats/<name>/{meta.json, token, inbox/, draining/, archive/}`.
 /// (meta.json and token are created by register; directories here.)
 pub fn create(root: &Path, name: &str) -> Result<PathBuf> {
     let dir = seat_dir(root, name);

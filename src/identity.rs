@@ -1,4 +1,4 @@
-//! The identity rule for `seat send` and `seat room post`.
+//! The identity rule for `seat send`.
 //!
 //! hapi sessions are bound to seats by `<root>/hapi-sessions.json`
 //! (written by `seat-role`, not by this crate):
@@ -20,9 +20,7 @@
 //!   exactly as before. On `send`, an omitted `--from` means Diego:
 //!   the message goes out as `inbox` and may go only to a factory seat
 //!   (a seat present in hapi-sessions.json), because the Grok bots
-//!   trust `from=inbox` as verified hq mail. In rooms there is no
-//!   implicit Diego (followers include the Grok bots): an unbound
-//!   caller must give `--from`.
+//!   trust `from=inbox` as verified hq mail.
 //! - Only an unbound sender that has a session id writes the optional
 //!   `session` header field (covered by the HMAC; a bound session is
 //!   identified by its seat and writes none).
@@ -148,25 +146,6 @@ pub fn resolve_for_send(
     }
 }
 
-/// Resolve the sender for `seat room post`. No implicit Diego in rooms.
-pub fn resolve_for_room(
-    root: &Path,
-    explicit_from: Option<&str>,
-    env_session: Option<&str>,
-) -> Result<Identity> {
-    let bindings = Bindings::load(root);
-    if let Some(bound) = env_session.and_then(|id| bindings.bound_seat(id)) {
-        bound_branch(bound, explicit_from)
-    } else {
-        match explicit_from {
-            Some(from) => Ok(unbound(from, env_session)),
-            None => Err(SeatError::Identity(
-                "no --from given and this session is not bound to a seat; pass --from to post to a room".into(),
-            )),
-        }
-    }
-}
-
 /// A bound session: `--from` must be its own seat (omitted means it).
 fn bound_branch(bound: &str, explicit_from: Option<&str>) -> Result<Identity> {
     match explicit_from {
@@ -261,7 +240,6 @@ mod tests {
     }
 
     // The identity-rule cases themselves (bound as self, bound as
-    // another seat refused, unbound explicit, unbound omitted → inbox,
-    // unbound omitted in rooms refused) are covered end to end by the
-    // `cmd_send` tests in verbs.rs and the `cmd_post` tests in room.rs.
+    // another seat refused, unbound explicit, unbound omitted → inbox)
+    // are covered end to end by the `cmd_send` tests in verbs.rs.
 }

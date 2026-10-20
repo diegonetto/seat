@@ -2,7 +2,7 @@
 //! key, its target session and phase, the last delivery for status's
 //! `awake`), the stable delivery keys, the exact text `drain` prints
 //! for an item, and the one-line log.
-use crate::drain::{ReceivedDirect, ReceivedRoom};
+use crate::drain::ReceivedDirect;
 use crate::error::Result;
 use crate::identity::Bindings;
 use crate::seat;
@@ -148,23 +148,12 @@ pub(crate) fn direct_key(seat: &str, file: &str) -> String {
     format!("seat:{seat}:{file}")
 }
 
-pub(crate) fn room_key(seat: &str, room: &str, file: &str) -> String {
-    format!("room:{room}:{file}:{seat}")
-}
-
 /// Exactly the lines `seat drain` prints for the item: header line,
 /// body, blank line.
 pub(crate) fn direct_text(d: &ReceivedDirect) -> String {
     format!(
         "[direct] id={} from={} dest={} ts={}\n{}\n\n",
         d.header.id, d.header.from, d.header.dest, d.header.ts, d.body
-    )
-}
-
-pub(crate) fn room_text(r: &ReceivedRoom) -> String {
-    format!(
-        "[room:{}] id={} from={} ts={}\n{}\n\n",
-        r.room, r.header.id, r.header.from, r.header.ts, r.body
     )
 }
 

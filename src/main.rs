@@ -11,7 +11,6 @@ mod error;
 mod hub;
 mod identity;
 mod msg;
-mod room;
 mod seat;
 mod session;
 #[cfg(test)]
@@ -25,8 +24,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::path::Path;
 
 /// The whole verb surface (FR-002).
-pub const KEEP_LIST: &str = "init register send drain dispatch room up down gallery status reset";
-const ROOM_VERBS: &str = "create post read follow list";
+pub const KEEP_LIST: &str = "init register send drain dispatch up down gallery status reset";
 
 #[derive(Parser)]
 #[command(
@@ -59,7 +57,7 @@ enum Command {
         to: String,
         body: String,
     },
-    /// Print a seat's unread inbox and followed-room posts
+    /// Print a seat's unread inbox
     Drain {
         #[arg(long)]
         seat: String,
@@ -70,11 +68,6 @@ enum Command {
         /// Run one scan pass and wait for its workers
         #[arg(long)]
         once: bool,
-    },
-    /// Room verbs (shared, MAC'd posts)
-    Room {
-        #[command(subcommand)]
-        action: RoomAction,
     },
     /// Bring registered seats into the one swarm session (second call
     /// does not duplicate)
@@ -91,7 +84,7 @@ enum Command {
     Gallery,
     /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
     Status,
-    /// Remove the board under the root (marker, seats/, rooms/)
+    /// Remove the board under the root (marker, seats/, leftover rooms/)
     Reset,
     /// Any verb outside the keep-list lands here.
     #[command(external_subcommand)]
@@ -115,43 +108,10 @@ struct RegisterArgs {
     cmd: Vec<String>,
 }
 
-#[derive(Subcommand)]
-enum RoomAction {
-    /// Create a room
-    Create { room: String },
-    /// Post a message into a room. `--from` may be omitted only by a
-    /// session bound to the posting seat (the identity rule).
-    Post {
-        room: String,
-        body: String,
-        #[arg(long)]
-        from: Option<String>,
-    },
-    /// Print a room's posts
-    Read { room: String },
-    /// Follow a room from a seat (cursor on the seat)
-    Follow {
-        room: String,
-        #[arg(long)]
-        seat: String,
-    },
-    /// List rooms
-    List,
-    /// Anything outside the room verb list.
-    #[command(external_subcommand)]
-    Unknown(Vec<String>),
-}
-
 /// Unknown-verb refusal (exit 2) with the keep-list.
 fn refuse(verb: &str) -> ! {
     eprintln!("seat: unknown verb '{verb}'");
     eprintln!("verbs: {KEEP_LIST}");
-    std::process::exit(2);
-}
-
-fn refuse_room(verb: &str) -> ! {
-    eprintln!("seat: unknown room verb '{verb}'");
-    eprintln!("room verbs: {ROOM_VERBS}");
     std::process::exit(2);
 }
 
@@ -183,7 +143,6 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             verbs::cmd_drain(root, &seat, &mut out)
         }
         Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
-        Command::Room { action } => dispatch_room(root, action, session),
         Command::Up { names } => session::cmd_up(root, &names),
         Command::Down { names } => session::cmd_down(root, &names),
         Command::Gallery => session::cmd_gallery(root),
@@ -191,25 +150,6 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         Command::Reset => verbs::cmd_reset(root),
         // Unknown verbs are refused in main() before dispatch.
         Command::Unknown(_) => unreachable!("unknown verbs refuse before dispatch"),
-    }
-}
-
-fn dispatch_room(root: &Path, action: RoomAction, session: Option<&str>) -> error::Result<()> {
-    match action {
-        RoomAction::Create { room } => room::cmd_create(root, &room),
-        RoomAction::Post { room, body, from } => {
-            room::cmd_post(root, &room, from.as_deref(), &body, session)
-        }
-        RoomAction::Read { room } => {
-            let mut out = std::io::stdout().lock();
-            room::cmd_read(root, &room, &mut out)
-        }
-        RoomAction::Follow { room, seat } => room::cmd_follow(root, &room, &seat),
-        RoomAction::List => {
-            let mut out = std::io::stdout().lock();
-            room::cmd_list(root, &mut out)
-        }
-        RoomAction::Unknown(_) => unreachable!("unknown room verbs refuse before dispatch"),
     }
 }
 
@@ -227,9 +167,6 @@ fn main() {
         Some(Command::Unknown(words)) => {
             refuse(words.first().map(|w| w.as_str()).unwrap_or_default())
         }
-        Some(Command::Room {
-            action: RoomAction::Unknown(words),
-        }) => refuse_room(words.first().map(|w| w.as_str()).unwrap_or_default()),
         Some(cmd) => {
             let session = env_session_id();
             match dispatch(&root, cmd, session.as_deref()) {

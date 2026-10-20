@@ -465,7 +465,7 @@ fn presence(in_pane: bool, awake: bool) -> &'static str {
 }
 
 /// One row of `status` per registered seat, sorted by name.
-/// `mail` is the inbox file count, not followed rooms.
+/// `mail` is the inbox file count.
 fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
     board::ensure_board(root)?;
     let running = running_seats(prog)?;

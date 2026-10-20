@@ -3,9 +3,9 @@
 #
 # Execs "$SEAT" as a program against throwaway --root directories.
 # Never the operator's live board. Covers quickstart steps 1 through 7
-# (step 8 is --help, checked by cargo test): fresh drain, room follow,
-# bad mark, session verbs, status, foreign root. 0.4.0 deleted `seat
-# arm`: these checks pin its absence.
+# (step 8 is --help, checked by cargo test): fresh drain, bad mark,
+# session verbs, status, foreign root. 0.4.0 deleted `seat arm` and
+# 0.7.0 deleted `seat room`: these checks pin their absence.
 #
 #   SEAT=$PWD/target/debug/seat tests/smoke.sh
 #
@@ -87,25 +87,24 @@ out="$("$S" --root "$R" drain --seat A 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "reply seat"
                                                       note $? "drain A returns the reply"
 
-## quickstart step 3: rooms (FR-011) ----------------------------------
-"$S" --root "$R" room create ops >/dev/null 2>&1;    note $? "room create ops"
-"$S" --root "$R" room post ops "room bulletin" --from A >/dev/null 2>&1
-                                                     note $? "room post from A"
+## rooms are gone (0.7.0) ----------------------------------------------
+# The verb exits 2 and is told the keep-list (which no longer names it).
+out="$("$S" --root "$R" room create ops 2>&1)"; rc=$?
+[ "$rc" -eq 2 ];                                     note $? "room exits 2 (unknown verb)"
+printf '%s\n' "$out" | grep -qF "unknown verb 'room'"; note $? "room is named unknown"
+printf '%s\n' "$out" | grep '^verbs:' | grep -qF "room" && rc=1 || rc=0
+                                                      note $rc "the keep-list has no room"
+# A 0.6.0 board's leftover rooms/ and cursors/ never break a drain,
+# and nothing deletes them.
+mkdir -p "$R/rooms/ops" "$R/seats/B/cursors"
+echo 0 > "$R/seats/B/cursors/ops"
+"$S" --root "$R" send --from A B "over the leftovers" >/dev/null 2>&1
+                                                      note $? "send over leftover room dirs"
 out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && [ -z "$out" ];                    note $? "unfollowed room post is absent from drain"
-"$S" --root "$R" room follow ops --seat B >/dev/null 2>&1
-                                                     note $? "B follows ops"
-out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "room bulletin"
-                                                     note $? "followed room post is drained"
-[ "$(printf '%s\n' "$out" | grep -cF 'room bulletin')" -eq 1 ]
-                                                     note $? "the post appears exactly once"
-out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && [ -z "$out" ];                    note $? "cursor advanced: second drain empty"
-"$S" --root "$R" room read ops 2>/dev/null | grep -qF "room bulletin"
-                                                     note $? "room read shows the post"
-"$S" --root "$R" room list 2>/dev/null | grep -qF "ops"
-                                                     note $? "room list shows ops"
+[ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "over the leftovers"
+                                                      note $? "drain works with leftover room dirs"
+[ -d "$R/rooms/ops" ] && [ -f "$R/seats/B/cursors/ops" ]
+                                                      note $? "leftover rooms/ and cursors/ untouched"
 
 ## quickstart step 4: bad mark (FR-012) -------------------------------
 "$S" --root "$R" send --from A B "tamper target" >/dev/null 2>&1
