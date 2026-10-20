@@ -45,6 +45,19 @@ pub fn cursor_path(seat_dir: &Path, room: &str) -> PathBuf {
     seat_dir.join("cursors").join(room)
 }
 
+/// The rooms this seat follows (its cursor file names).
+pub fn followed_rooms(seat_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(seat_dir.join("cursors"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The seat's last-seen ts for a room. No cursor file yet → "0", i.e.
 /// everything is new. (Follow starts at "0" so the first drain delivers
 /// the room's existing posts; after that the cursor advances.)
@@ -74,14 +87,18 @@ pub fn cmd_create(root: &Path, name: &str) -> Result<()> {
 /// fixed by the identity rule (`--from` optional for bound sessions;
 /// an unbound caller must give it — no implicit Diego in rooms, since
 /// a room's followers include the Grok bots). `env_session` is the
-/// caller's `HAPI_SESSION_ID`, read at the CLI edge.
-pub fn cmd_post(
+/// caller's `HAPI_SESSION_ID`, read at the CLI edge. This is the
+/// library half of the verb: the identity and token checks, the write,
+/// the last-seen touch — and no printing, so service callers (the
+/// dispatcher's alarm) post without touching stdout and pass no
+/// `HAPI_SESSION_ID` into the identity rule.
+pub fn post(
     root: &Path,
     room: &str,
     from: Option<&str>,
     body: &str,
     env_session: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     board::ensure_board(root)?;
     if !exists(root, room) {
         return Err(SeatError::NoSuchRoom(room.to_string()));
@@ -98,7 +115,19 @@ pub fn cmd_post(
         who.session.as_deref(),
     )?;
     touch_last_seen(root, from)?;
-    println!("posted {} to room '{room}'", header.id);
+    Ok(header.id)
+}
+
+/// The verb: the library post plus the one printed line.
+pub fn cmd_post(
+    root: &Path,
+    room: &str,
+    from: Option<&str>,
+    body: &str,
+    env_session: Option<&str>,
+) -> Result<()> {
+    let id = post(root, room, from, body, env_session)?;
+    println!("posted {id} to room '{room}'");
     Ok(())
 }
 

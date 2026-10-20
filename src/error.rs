@@ -84,6 +84,9 @@ pub enum SeatError {
     #[error("hub: {0}")]
     Hub(String),
 
+    #[error("webhook: {0}")]
+    Webhook(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

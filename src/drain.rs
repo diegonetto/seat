@@ -222,6 +222,51 @@ fn check_direct(
     })
 }
 
+/// Why one followed-room post is not receivable.
+pub(crate) enum RoomPostFailure {
+    /// Mark (or envelope) does not verify; the claimed sender.
+    BadMark(String),
+    /// The post did not parse; no claimed sender to name.
+    Unreadable,
+}
+
+/// Verify one followed-room post exactly as `receive` does: it must
+/// parse, belong to the room it sits in, name a valid sender, and
+/// carry that sender's MAC. `Ok` for a post a pass would stage; `Err`
+/// names the failure — such a post is never staged and never gains a
+/// delivery key, so `fresh_work` must not wake a worker for it.
+pub(crate) fn check_room_post(
+    root: &Path,
+    room_name: &str,
+    path: &Path,
+) -> std::result::Result<ReceivedRoom, RoomPostFailure> {
+    let (header, body) = match msg::read_msg(path) {
+        Ok(x) => x,
+        Err(_) => {
+            return Err(match claimed_from(path) {
+                Some(from) => RoomPostFailure::BadMark(from),
+                None => RoomPostFailure::Unreadable,
+            })
+        }
+    };
+    if header.dest != room_name || board::valid_name(&header.from).is_err() {
+        return Err(RoomPostFailure::BadMark(header.from.clone()));
+    }
+    let verified = match crate::verbs::sender_token(root, &header.from) {
+        Ok(token) => msg::verify_msg(path, &token).unwrap_or(false),
+        Err(_) => false,
+    };
+    if !verified {
+        return Err(RoomPostFailure::BadMark(header.from.clone()));
+    }
+    Ok(ReceivedRoom {
+        room: room_name.to_string(),
+        file_name: file_name_of(path),
+        header,
+        body,
+    })
+}
+
 /// Collect new posts from every followed room, verified the same way
 /// as direct mail. A post whose mark does not verify is skipped and
 /// its claimed sender recorded; the cursor still advances past it
@@ -242,36 +287,11 @@ fn receive_rooms(root: &Path, seat_dir: &Path, received: &mut Received) -> Resul
                     _ => ts,
                 });
             }
-            let (header, body) = match msg::read_msg(&p) {
-                Ok(x) => x,
-                Err(_) => {
-                    match claimed_from(&p) {
-                        Some(from) => received.bad_marks.push(from),
-                        None => received.unreadable = true,
-                    }
-                    continue;
-                }
-            };
-            // A post must belong to the room it sits in, and its from
-            // must be a valid name before it becomes a token path.
-            if header.dest != room_name || board::valid_name(&header.from).is_err() {
-                received.bad_marks.push(header.from.clone());
-                continue;
+            match check_room_post(root, &room_name, &p) {
+                Ok(item) => received.rooms.push(item),
+                Err(RoomPostFailure::BadMark(from)) => received.bad_marks.push(from),
+                Err(RoomPostFailure::Unreadable) => received.unreadable = true,
             }
-            let verified = match crate::verbs::sender_token(root, &header.from) {
-                Ok(token) => msg::verify_msg(&p, &token).unwrap_or(false),
-                Err(_) => false,
-            };
-            if !verified {
-                received.bad_marks.push(header.from.clone());
-                continue;
-            }
-            received.rooms.push(ReceivedRoom {
-                room: room_name.clone(),
-                file_name: file_name_of(&p),
-                header,
-                body,
-            });
         }
         if let Some(ts) = max_ts {
             received.room_cursors.push((room_name, ts));

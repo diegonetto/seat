@@ -75,6 +75,11 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// `n` random bytes as 2n lowercase hex chars (ids, webhook nonces).
+pub fn rand_hex(n: usize) -> Result<String> {
+    Ok(hex::encode(random_bytes(n)?))
+}
+
 /// MAC input is `dest|from|id|ts|body` with the body BOM-stripped, and
 /// the optional `session` value lives **in the id slot**, joined by a
 /// colon: `dest|from|<id>:<session>|ts|body` when present. A message id
