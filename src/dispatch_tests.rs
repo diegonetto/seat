@@ -196,6 +196,85 @@ fn invoked_while_inactive_rotates_the_key_and_resends_once_active() {
     assert!(log.contains(&format!("key={fresh}")), "{log}");
 }
 
+/// The partial-POST-failure case of the same rule: the POST loop
+/// persists only after it succeeds, so a loop whose second POST fails
+/// leaves the first message accepted by the hub but recorded Staged
+/// on disk. The ending session marks that key invoked anyway, so the
+/// inactive pass must rotate every in-flight item — Staged on disk
+/// included — and a resume that keeps the session id must not commit
+/// on the old mark; only the fresh keys' invocation archives.
+#[test]
+fn a_partly_failed_post_loop_still_rotates_the_accepted_item() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+    send(&root, "opus", "accepted by the hub");
+    send(&root, "opus", "never accepted");
+    let keys: Vec<String> = msg::list_msg_dir(&seat::seat_dir(&root, "opus").join("inbox"))
+        .unwrap()
+        .iter()
+        .map(|p| dstate::direct_key("opus", p.file_name().unwrap().to_str().unwrap()))
+        .collect();
+    // The loop POSTs in key order; the second POST fails, so the
+    // first item is accepted while dispatch.json still says Staged.
+    hub.ctl.lock().unwrap().fail_keys.insert(keys[1].clone());
+    assert!(dispatch::pass_seat(&root, "opus", &mut client).is_err());
+    let state = dstate::load_state(&seat::seat_dir(&root, "opus"));
+    assert!(
+        state
+            .items
+            .values()
+            .all(|i| i.phase == dstate::Phase::Staged),
+        "the store after the loop never ran: {state:?}"
+    );
+    // The session ends — the hub marks the accepted key invoked — and
+    // the next pass finds it inactive.
+    mark(&hub, &keys[0], "invoked");
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), false);
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    let state = dstate::load_state(&seat::seat_dir(&root, "opus"));
+    let fresh: Vec<String> = state.items.keys().cloned().collect();
+    assert_eq!(
+        fresh,
+        vec![format!("{}#2", keys[0]), format!("{}#2", keys[1])],
+        "every in-flight item rotated, Staged on disk included"
+    );
+    // The resume keeps the session id: the old invoked mark must not
+    // commit — accepted-but-unread mail is not archived.
+    {
+        let mut ctl = hub.ctl.lock().unwrap();
+        ctl.fail_keys.clear();
+        ctl.sessions.insert("s1".into(), true);
+    }
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        n_files(&root, "opus", "archive"),
+        0,
+        "unread mail is never archived on the old mark"
+    );
+    assert_eq!(
+        hub.journal()
+            .iter()
+            .filter(|l| **l == format!("POST-MSG s1 {}", keys[0]))
+            .count(),
+        1,
+        "the rotated key is never re-POSTed"
+    );
+    // Only the fresh keys' invocation commits.
+    for key in &fresh {
+        mark(&hub, key, "invoked");
+    }
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    assert_eq!(n_files(&root, "opus", "archive"), 2);
+}
+
 /// Indeterminate means wait: nothing committed, nothing re-POSTed, and
 /// waiting is not a failure.
 #[test]

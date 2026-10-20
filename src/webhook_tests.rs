@@ -374,11 +374,15 @@ fn ack_cfg(hook_url: &str, ack_url: &str) -> WebhookConfig {
 /// `KOTEK_HQ_ACK=1`): exactly one receipt POST after each successful
 /// payload delivery — `{"seat", "message_id"}` with the two Access
 /// headers from `~/.config/bll-ingest/env`, User-Agent
-/// `bll-seat-mail/1 (Slix)` — and none without the marker. HOME is a
-/// throwaway so the operator's real env file is never read; the
-/// receipt URL points at the local receiver (the test seam —
-/// production hardcodes the ingest URL). The secrets never reach the
-/// log.
+/// `bll-seat-mail/1 (Slix)` — and none without the marker. The
+/// marker-to-URL wiring goes through `WebhookConfig::load` itself:
+/// HOME is a throwaway so the operator's real env file is never read,
+/// and since the local receivers cannot speak https (load refuses a
+/// `webhook.url` that does not start `https://`), the url stages a
+/// placeholder and both POST targets are pointed at the receivers
+/// after the load — load's on-disk decisions (payload marker,
+/// hq-ack marker) are the production ones. The secrets never reach
+/// the log.
 #[test]
 fn hq_receipt_follows_each_payload_delivery_when_marked() {
     crate::testutil::with_throwaway_home(
@@ -392,8 +396,21 @@ fn hq_receipt_follows_each_payload_delivery_when_marked_isolated() {
     let root = kotek_board(&hook.url());
     ingest_env_file();
     std::fs::write(kotek_dir(&root).join("webhook.hq-ack"), b"").unwrap();
+    std::fs::write(
+        kotek_dir(&root).join("webhook.url"),
+        "https://panel.invalid/\n",
+    )
+    .unwrap();
     hq_mail(&root, "hello Mariola", "abcdef12", "inbox", false);
-    let cfg = ack_cfg(&hook.url(), &hq.url());
+    let mut cfg = WebhookConfig::load(&kotek_dir(&root)).unwrap();
+    assert!(cfg.payload_mode, "the payload marker loaded");
+    assert_eq!(
+        cfg.hq_ack_url.as_deref(),
+        Some("https://hq.bll.dev/ingest/seat-delivery"),
+        "the hq-ack marker stages the ingest URL"
+    );
+    cfg.url = hook.url();
+    cfg.hq_ack_url = Some(hq.url()); // the receiver stands in for the ingest
     assert_eq!(
         webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
         true
@@ -434,10 +451,13 @@ fn hq_receipt_follows_each_payload_delivery_when_marked_isolated() {
         "secrets in the log: {log}"
     );
 
-    // Without the marker there is no receipt at all.
+    // Without the marker load stages no receipt URL at all, and the
+    // delivery sends none.
     std::fs::remove_file(kotek_dir(&root).join("webhook.hq-ack")).unwrap();
     hq_mail(&root, "second mail", "999999ab", "inbox", false);
-    let plain = payload_cfg(&hook.url());
+    let mut plain = WebhookConfig::load(&kotek_dir(&root)).unwrap();
+    assert!(plain.hq_ack_url.is_none(), "no marker: no receipt URL");
+    plain.url = hook.url();
     assert_eq!(
         webhook::ring_once(&root, "kotek-grokbot", &plain, &no_sleep).unwrap(),
         true

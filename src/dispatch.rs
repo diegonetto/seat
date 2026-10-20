@@ -135,9 +135,11 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
             alarm::SESSION_INACTIVE,
             &format!("session {session} is not active"),
         )?;
-        // Items already in flight must not commit on an invoked mark
-        // the ending session made (see `rotate_posted`).
-        if rotate_posted(&mut state) {
+        // Items in flight must not commit on an invoked mark the
+        // ending session made (see `rotate_in_flight`); one recorded
+        // Staged may be mail the hub accepted before a POST loop
+        // failed or crashed partway, so every in-flight item rotates.
+        if rotate_in_flight(&mut state) {
             store_state(&dir, &state)?;
         }
         log_line(
@@ -159,19 +161,24 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     poll_round(root, seat, hub, &session, &mut state, &received, &texts)
 }
 
-/// A pass found the bound session inactive while items were POSTed and
-/// not yet committed: move every Posted item to a fresh delivery key
-/// (`next_delivery_key` — a `localId` the hub has never seen) as
-/// Staged, so it is re-POSTed once the session is active again. The
-/// invoked mark the ending session left on the old key is thereby
-/// withheld: the hub dedupes on `(session, localId)` forever, so the
-/// old mark can never commit, and only an invocation observed while
-/// the session was active ever does. Returns whether anything moved.
-fn rotate_posted(state: &mut DispatchState) -> bool {
+/// A pass found the bound session inactive while items were in
+/// flight: move every in-flight item — any phase but Done, Posted
+/// included — to a fresh delivery key (`next_delivery_key` — a
+/// `localId` the hub has never seen) as Staged, so it is re-POSTed
+/// once the session is active again. Posted is not the whole story:
+/// the POST loop persists only after it succeeds, so a loop that
+/// failed partway (or a crash between POST and store) leaves mail the
+/// hub accepted recorded Staged — its key must move too, or the
+/// invoked mark the ending session left on it would archive unread
+/// mail after a resume. The hub dedupes on `(session, localId)`
+/// forever, so the old mark can never commit the new key, and only an
+/// invocation observed while the session was active ever does.
+/// Returns whether anything moved.
+fn rotate_in_flight(state: &mut DispatchState) -> bool {
     let mut moved = false;
     let old = std::mem::take(&mut state.items);
     for (key, item) in old {
-        if item.phase == Phase::Posted {
+        if item.phase != Phase::Done {
             state
                 .items
                 .insert(next_delivery_key(&key), ItemState::default());
@@ -224,7 +231,7 @@ fn poll_round(
     // again; only an invocation observed while the session was active
     // commits.
     if !keys.is_empty() && !hub.session_active(session)? {
-        if rotate_posted(state) {
+        if rotate_in_flight(state) {
             store_state(&dir, state)?;
         }
         log_line(

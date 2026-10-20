@@ -93,8 +93,8 @@ pub mod fakehub {
     /// The scripted behavior: sessions (id → active, absent = 404),
     /// marks (localId → "queued"|"indeterminate"|"invoked"; no entry =
     /// the hub lost it), hung sessions, banned JWTs, sessions to flip
-    /// inactive when queued-state is first asked, each POSTed localId
-    /// → text.
+    /// inactive when queued-state is first asked, localIds whose
+    /// message POST answers 500, each POSTed localId → text.
     #[derive(Default)]
     pub struct HubCtl {
         pub sessions: BTreeMap<String, bool>,
@@ -102,6 +102,7 @@ pub mod fakehub {
         pub hang: BTreeSet<String>,
         pub banned_jwts: BTreeSet<String>,
         pub flip_inactive: BTreeSet<String>,
+        pub fail_keys: BTreeSet<String>,
         pub texts: BTreeMap<String, String>,
         auths: usize,
         journal: Vec<String>,
@@ -222,11 +223,13 @@ pub mod fakehub {
             },
             ("POST", "messages") => {
                 let key = json["localId"].as_str().unwrap_or_default().to_string();
-                ctl.texts.insert(
-                    key.clone(),
-                    json["text"].as_str().unwrap_or_default().to_string(),
-                );
                 ctl.journal.push(format!("POST-MSG {session} {key}"));
+                if ctl.fail_keys.contains(&key) {
+                    respond(&mut writer, 500, "{}");
+                    return;
+                }
+                ctl.texts
+                    .insert(key, json["text"].as_str().unwrap_or_default().to_string());
                 respond(&mut writer, 200, "{}");
             }
             ("POST", "messages/queued-state") => {
