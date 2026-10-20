@@ -753,11 +753,10 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
 
 /// A pending followed-room post raises `undelivered`: the age check
 /// includes, beside the seat's own `inbox/` and `draining/` files,
-/// the posts this seat's `receive` would accept, aged by their header
-/// `ts` (the file-name prefix) — a seat whose only owed item is an
-/// old room post is undelivered too. Delivering the post clears the
-/// cause; a tampered post never counts, exactly as `receive` refuses
-/// it.
+/// the posts this seat's `receive` would accept, aged by their
+/// verified header `ts` — a seat whose only owed item is an old room
+/// post is undelivered too. Delivering the post clears the cause; a
+/// tampered post never counts, exactly as `receive` refuses it.
 #[test]
 fn an_old_pending_room_post_raises_undelivered() {
     let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
@@ -824,4 +823,134 @@ fn an_old_pending_room_post_raises_undelivered() {
         1,
         "a post receive would refuse is not undelivered"
     );
+}
+
+/// Partial room delivery: an old post delivered in an earlier round
+/// (`Phase::Done`) with a younger post from the same room still in
+/// flight — the cursor lags behind both, but the delivered post is
+/// not owed mail, so once only the young post remains the
+/// `undelivered` cause clears instead of staying latched on the done
+/// key behind the cursor.
+#[test]
+fn a_delivered_room_post_behind_the_cursor_is_not_owed() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+    room::create(&root, alarm::ROOM).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    room::create(&root, "ops").unwrap();
+    // Verified posts: an old one and a fresh one, same room.
+    let token = verbs::sender_token(&root, "opus").unwrap();
+    let write_post = |ts: &str, id: &str| {
+        let mac = msg::compute_hmac(&token, "ops", "opus", id, ts, b"bulletin", None).unwrap();
+        std::fs::write(
+            room::room_dir(&root, "ops").join(format!("{ts}-{id}.msg")),
+            format!(
+                "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{ts}\",\"hmac\":\"{mac}\"}}\n\nbulletin"
+            ),
+        )
+        .unwrap();
+    };
+    let old = "20260101T000000.000000";
+    let young = msg::now_ts();
+    write_post(old, "deadbeef");
+    write_post(&young, "feedface");
+    room::cmd_follow(&root, "ops", "opus").unwrap();
+    let old_key = dstate::room_key("opus", "ops", &format!("{old}-deadbeef.msg"));
+    let young_key = dstate::room_key("opus", "ops", &format!("{young}-feedface.msg"));
+
+    // The old post is genuinely undelivered: the alarm fires once.
+    // Delivering it while the young one stays queued leaves the room
+    // cursor behind both (the young post holds it back).
+    mark(&hub, &old_key, "invoked");
+    mark(&hub, &young_key, "queued");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        room::read_cursor(&seat::seat_dir(&root, "opus"), "ops").unwrap(),
+        "0"
+    );
+    assert!(std::fs::read_to_string(root.join("dispatch-alarms.json"))
+        .unwrap_or_default()
+        .contains("undelivered:opus"));
+
+    // The next pass owes only the young post: the delivered one is
+    // `Phase::Done` behind the cursor and must not keep the cause
+    // latched, and the young one is not old — so the cause clears.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        log_text(&root).matches("cause=undelivered").count(),
+        1,
+        "the delivered post behind the cursor is not owed"
+    );
+    assert!(!std::fs::read_to_string(root.join("dispatch-alarms.json"))
+        .unwrap_or_default()
+        .contains("undelivered:opus"));
+}
+
+/// A pending followed-room post is aged by its verified header `ts`,
+/// never by its file-name prefix: nothing requires the two to match.
+/// An accepted post whose header is old but whose file name is recent
+/// must fire; the reverse — a fresh header under an old file name —
+/// must not.
+#[test]
+fn a_room_post_is_aged_by_its_header_ts_not_its_file_name() {
+    let write = |root: &std::path::Path, token: &str, header_ts: &str, file_ts: &str, id: &str| {
+        let mac =
+            msg::compute_hmac(token, "ops", "opus", id, header_ts, b"bulletin", None).unwrap();
+        std::fs::write(
+            room::room_dir(root, "ops").join(format!("{file_ts}-{id}.msg")),
+            format!(
+                "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{header_ts}\",\"hmac\":\"{mac}\"}}\n\nbulletin"
+            ),
+        )
+        .unwrap();
+    };
+    // Old header, recent file name: owed and old — the alarm fires.
+    {
+        let (root, _hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+        room::create(&root, alarm::ROOM).unwrap();
+        verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+        room::create(&root, "ops").unwrap();
+        let token = verbs::sender_token(&root, "opus").unwrap();
+        write(
+            &root,
+            &token,
+            "20260101T000000.000000",
+            &msg::now_ts(),
+            "deadbeef",
+        );
+        room::cmd_follow(&root, "ops", "opus").unwrap();
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap();
+        assert!(
+            log_text(&root).contains("alarm seat=opus cause=undelivered"),
+            "an accepted old post is owed however its file is named"
+        );
+        assert!(alarm_posts(&root)[0].contains("undelivered"));
+    }
+    // Fresh header, old file name: not owed-old — no alarm.
+    {
+        let (root, _hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+        room::create(&root, alarm::ROOM).unwrap();
+        verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+        room::create(&root, "ops").unwrap();
+        let token = verbs::sender_token(&root, "opus").unwrap();
+        write(
+            &root,
+            &token,
+            &msg::now_ts(),
+            "20260101T000000.000000",
+            "deadbeef",
+        );
+        room::cmd_follow(&root, "ops", "opus").unwrap();
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap();
+        assert_eq!(
+            log_text(&root).matches("cause=undelivered").count(),
+            0,
+            "a fresh post under an old file name is not undelivered"
+        );
+    }
 }

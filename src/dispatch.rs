@@ -70,23 +70,35 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // The `undelivered` cause, by message age (hapi has no
     // payload-delivered record; committed mail is archived away). A
     // pending followed-room post counts too — only the posts this
-    // seat's `receive` would accept, aged by their header `ts` (the
-    // file-name prefix): a post owed for 15 minutes is as undelivered
-    // as mail sitting in `inbox/` or `draining/`, which is all the
-    // seat's own files can see.
+    // seat's `receive` would accept, and never one already delivered
+    // (`Phase::Done`): a younger post still in flight holds the room
+    // cursor behind a delivered one, and a delivered post is not owed
+    // mail. Each is aged by its verified header `ts`, not by its
+    // file-name prefix (nothing requires the two to match): a post
+    // owed for 15 minutes is as undelivered as mail sitting in
+    // `inbox/` or `draining/`, which is all the seat's own files
+    // can see.
+    let mut state = load_state(&dir);
     let mut owed = webhook::present_files(&dir);
     for room_name in room::followed_rooms(&dir) {
         let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
         for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
-            if drain::check_room_post(root, &room_name, &post).is_ok() {
-                if let Some(name) = post.file_name().and_then(|n| n.to_str()) {
-                    owed.insert(name.to_string());
-                }
+            let Ok(item) = drain::check_room_post(root, &room_name, &post) else {
+                continue;
+            };
+            if state
+                .items
+                .get(&room_key(seat, &room_name, &item.file_name))
+                .is_some_and(|i| i.phase == Phase::Done)
+            {
+                continue;
             }
+            // A name the age check parses, carrying the verified
+            // header fields: the header `ts` is the post's age.
+            owed.insert(format!("{}-{}.msg", item.header.ts, item.header.id));
         }
     }
     alarm::undelivered(root, seat, &BTreeSet::new(), &owed)?;
-    let mut state = load_state(&dir);
     // The lock covers receive only; a manual drain can run between
     // receive and commit.
     let received = {
