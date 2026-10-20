@@ -7,18 +7,16 @@ mod identity;
 mod msg;
 mod room;
 mod seat;
-mod serve;
 mod session;
 #[cfg(test)]
 mod testutil;
 mod verbs;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use seat::Lifecycle;
 use std::path::Path;
 
 /// The whole verb surface (FR-002).
-pub const KEEP_LIST: &str = "init register send arm drain room up down gallery status reset";
+pub const KEEP_LIST: &str = "init register send drain room up down gallery status reset";
 const ROOM_VERBS: &str = "create post read follow list";
 
 #[derive(Parser)]
@@ -57,22 +55,6 @@ enum Command {
         #[arg(long)]
         seat: String,
     },
-    /// The only waiter: emits a wake notice when mail arrives. Never
-    /// drains. exit-wake wakes once and exits 0; poller stays up until
-    /// SIGTERM. Needs no tmux pane.
-    Arm {
-        #[arg(long)]
-        seat: String,
-        /// Ephemeral lifecycle override (exit-wake | poller); meta.lifecycle stays the authority
-        #[arg(long)]
-        lifecycle: Option<Lifecycle>,
-        /// Run CMD on each wake in addition to the notice
-        #[arg(long)]
-        exec: Option<String>,
-        /// Replace a live waiter for this seat (SIGTERM + wait)
-        #[arg(long)]
-        takeover: bool,
-    },
     /// Room verbs (shared, MAC'd posts)
     Room {
         #[command(subcommand)]
@@ -91,7 +73,8 @@ enum Command {
     },
     /// Print the running seats, tile them into one window, then attach
     Gallery,
-    /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
+    /// One row per registered seat: `<name> pane|unattended mail=<N>`
+    /// (`awake` returns with the dispatcher)
     Status,
     /// Remove the board under the root (marker, seats/, rooms/)
     Reset,
@@ -108,9 +91,6 @@ struct RegisterArgs {
     harness: String,
     #[arg(long)]
     model: Option<String>,
-    /// exit-wake | poller — the durable authority for arm
-    #[arg(long)]
-    lifecycle: Option<Lifecycle>,
     /// Absolute working directory the seat's command runs in
     #[arg(long)]
     cwd: Option<String>,
@@ -177,7 +157,6 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             &args.seat,
             &args.harness,
             args.model,
-            args.lifecycle,
             args.cwd,
             args.cmd,
         ),
@@ -194,15 +173,6 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         Command::Gallery => session::cmd_gallery(root),
         Command::Status => session::cmd_status(root),
         Command::Reset => verbs::cmd_reset(root),
-        Command::Arm {
-            seat,
-            lifecycle,
-            exec,
-            takeover,
-        } => {
-            let mut out = std::io::stdout().lock();
-            serve::cmd_arm(root, &seat, lifecycle, exec.as_deref(), takeover, &mut out)
-        }
         // Unknown verbs are refused in main() before dispatch.
         Command::Unknown(_) => unreachable!("unknown verbs refuse before dispatch"),
     }

@@ -60,11 +60,8 @@ pub enum SeatError {
     #[error("{0}")]
     Identity(String),
 
-    #[error("arm: seat {0} already has a live waiter (pid {1}); pass --takeover to replace it")]
-    WaiterBusy(String, u32),
-
-    #[error("arm: {0}")]
-    Arm(String),
+    #[error("bad message header: {0}")]
+    BadHeader(String),
 
     #[error("tmux: {0}")]
     Tmux(String),

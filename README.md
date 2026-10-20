@@ -1,9 +1,9 @@
 # seat
 
 One command for a local board of named seats. Each seat has an inbox of
-HMAC-signed messages. `arm` waits until mail arrives and does not read it.
-`drain` prints the inbox and empties it. `up` starts the command stored on
-a seat inside one tmux session named `swarm`.
+HMAC-signed messages. `drain` prints the inbox and empties it. `up`
+starts the command stored on a seat inside one tmux session named
+`swarm`.
 
 ```sh
 cargo install seat
@@ -44,14 +44,13 @@ the inbox.
 
 ## Verbs
 
-`init`, `register`, `send`, `arm`, `drain`, `room`, `up`, `down`,
+`init`, `register`, `send`, `drain`, `room`, `up`, `down`,
 `gallery`, `status`, `reset`. An unknown verb exits 2 and prints this list.
 
 ```
 seat init
-seat register --seat <name> --harness <h> [--model M] [--lifecycle exit-wake|poller] [--cwd ABS] [-- CMD...]
+seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [-- CMD...]
 seat send [--from <from>] <to> <body>
-seat arm --seat <name>
 seat drain --seat <name>
 seat room create|post|read|follow|list
 seat up [name...]
@@ -61,14 +60,11 @@ seat status
 seat reset
 ```
 
-`arm` is the only waiter. The default lifecycle is `exit-wake`: one wake
-and the process exits. `poller` stays up until SIGTERM. A second `arm`
-sees the live waiter and exits 0. `gallery` prints the names that have a
-live pane in `swarm`, joins those panes into one window named `gallery`,
-tiles it, and attaches. Each tile's border shows that pane's `@seat`
-name. Mouse is on. A zoomed pane stays full screen
-across a resize. It does not list a seat that is only awake, and it does
-not move any other pane.
+`gallery` prints the names that have a live pane in `swarm`, joins those
+panes into one window named `gallery`, tiles it, and attaches. Each
+tile's border shows that pane's `@seat` name. Mouse is on. A zoomed pane
+stays full screen across a resize. It does not list a seat that is not
+running, and it does not move any other pane.
 
 `drain` takes a per-seat lock (`<seat>/lock`) for its whole run: a
 second drain of the same seat waits, and gives up after 30 seconds with
@@ -92,7 +88,14 @@ from is decided like this:
   an unbound caller must give `--from`.
 - An unbound sender that has a `HAPI_SESSION_ID` writes it as an
   optional `session` field in the message header, covered by the
-  message HMAC like the other header fields. Messages written before
+  message HMAC like the other header fields: the MAC input is
+  `dest|from|<id>:<session>|ts|body` when the field is present and
+  `dest|from|id|ts|body` when absent (a message id is exactly 8
+  lowercase hex characters and can never contain `:`, so the two forms
+  cannot collide, and the session cannot be moved into or out of the
+  body without breaking the MAC). A header whose `id` is not exactly 8
+  lowercase hex characters, or whose `session` is not 1-64 characters
+  of `[A-Za-z0-9-]`, is refused as unreadable. Messages written before
   this field existed still verify.
 
 This rule prevents mistakes on one Unix user, not a deliberate forgery.
@@ -103,11 +106,12 @@ This rule prevents mistakes on one Unix user, not a deliberate forgery.
 <name> <presence> mail=<N>
 ```
 
-Presence is `pane`, `awake`, or `unattended`. `pane` is a live pane in
-`swarm` tagged `@seat`. `awake` is no pane and a live waiter in `wait.pid`,
-including a waiter whose parent is pid 1. `unattended` is no pane and no
-live waiter. `mail=<N>` is the number of files in that seat's inbox. It is
-printed on every row. Mail does not change presence.
+Presence is `pane` or `unattended`. (0.4.0 deleted `seat arm` and with
+it the waiter-derived `awake`; the word returns once the dispatcher
+lands, derived from its own delivery state.) `pane` is a live pane in
+`swarm` tagged `@seat`. `unattended` is everything else. `mail=<N>` is
+the number of files in that seat's inbox. It is printed on every row.
+Mail does not change presence.
 
 `seat reset` removes the marker, `seats/`, and `rooms/`. It removes the
 root directory only when that leaves the directory empty.
