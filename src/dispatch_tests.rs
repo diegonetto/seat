@@ -612,6 +612,7 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
         .collect();
     assert!(scratch.is_empty(), "scratch left: {scratch:?}");
 }
+
 /// Without `<root>/alarm-seat` the alarm is the log line only: the
 /// cause still latches, and no message is sent anywhere.
 #[test]
@@ -656,7 +657,8 @@ fn an_alarm_seat_naming_a_missing_seat_is_a_failed_sink() {
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
     let log = log_text(&root);
     assert_eq!(
-        log.matches("alarm seat=alpha cause=session-inactive").count(),
+        log.matches("alarm seat=alpha cause=session-inactive")
+            .count(),
         1
     );
     assert!(

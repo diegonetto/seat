@@ -261,7 +261,9 @@ mod tests {
         let root = setup();
         std::fs::create_dir_all(root.join("rooms").join("ops")).unwrap();
         std::fs::write(
-            root.join("rooms").join("ops").join("20260101T000000.000000-deadbeef.msg"),
+            root.join("rooms")
+                .join("ops")
+                .join("20260101T000000.000000-deadbeef.msg"),
             "old post",
         )
         .unwrap();
@@ -273,7 +275,10 @@ mod tests {
         let (r, text) = drain_str(&root, "beta");
         r.unwrap();
         assert!(text.contains("plain mail"));
-        assert!(!text.contains("[room"), "no room lines on a 0.7.0 board: {text}");
+        assert!(
+            !text.contains("[room"),
+            "no room lines on a 0.7.0 board: {text}"
+        );
 
         // Untouched on disk.
         assert_eq!(
@@ -427,7 +432,11 @@ mod tests {
         }
         bodies.sort();
         bodies.dedup();
-        assert_eq!(bodies.len(), N, "each message delivered exactly once: {bodies:?}");
+        assert_eq!(
+            bodies.len(),
+            N,
+            "each message delivered exactly once: {bodies:?}"
+        );
         // Nothing stranded mid-flight, everything archived exactly once.
         let dir = seat::seat_dir(&root, "beta");
         assert!(msg::list_msg_dir(&dir.join("inbox")).unwrap().is_empty());
