@@ -44,7 +44,7 @@ the inbox.
 
 ## Verbs
 
-`init`, `register`, `send`, `drain`, `room`, `up`, `down`,
+`init`, `register`, `send`, `drain`, `dispatch`, `room`, `up`, `down`,
 `gallery`, `status`, `reset`. An unknown verb exits 2 and prints this list.
 
 ```
@@ -52,6 +52,7 @@ seat init
 seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [-- CMD...]
 seat send [--from <from>] <to> <body>
 seat drain --seat <name>
+seat dispatch [--once]
 seat room create|post|read|follow|list
 seat up [name...]
 seat down [name...]
@@ -69,6 +70,21 @@ running, and it does not move any other pane.
 `drain` takes a per-seat lock (`<seat>/lock`) for its whole run: a
 second drain of the same seat waits, and gives up after 30 seconds with
 an error naming the seat. Drains of other seats never wait.
+
+## Deliver to a hub session
+
+`dispatch` is the one service that delivers the board's mail to hapi
+sessions. Run it long-running; `--once` runs a single scan pass.
+Every 2 s it scans the seats and hands each seat bound in
+`<root>/hapi-sessions.json` to its own worker thread (every other
+seat is pull — no push and no receive). A slow hub delays only its
+own seat, every HTTP request is bounded at 10 s, and SIGTERM exits
+cleanly. Each item is tracked by a stable key recorded in
+`<seat>/dispatch.json` atomically before anything is POSTed, so a
+crash resumes and a retry re-POSTs the same key. An item commits
+only when the hub reports it invoked while its session is still
+active; one line per delivery and one per failure land in
+`<root>/dispatch.log`.
 
 ### The identity rule on `--from`
 
@@ -106,12 +122,13 @@ This rule prevents mistakes on one Unix user, not a deliberate forgery.
 <name> <presence> mail=<N>
 ```
 
-Presence is `pane` or `unattended`. (0.4.0 deleted `seat arm` and with
-it the waiter-derived `awake`; the word returns once the dispatcher
-lands, derived from its own delivery state.) `pane` is a live pane in
-`swarm` tagged `@seat`. `unattended` is everything else. `mail=<N>` is
-the number of files in that seat's inbox. It is printed on every row.
-Mail does not change presence.
+Presence is `pane`, `awake`, or `unattended`. `pane` is a live pane in
+`swarm` tagged `@seat`. `awake` is no pane and a delivery the
+dispatcher recorded for this seat's bound session within the last 10
+minutes (read from `<seat>/dispatch.json`; status never asks the hub).
+`unattended` is everything else. `mail=<N>` is the number of files in
+that seat's inbox. It is printed on every row. Mail does not change
+presence.
 
 `seat reset` removes the marker, `seats/`, and `rooms/`. It removes the
 root directory only when that leaves the directory empty.

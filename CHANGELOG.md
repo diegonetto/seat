@@ -2,6 +2,13 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.5.0] - 2026-10-20
+
+### Added
+
+- `seat dispatch [--once]`, the one service that delivers a hapi-bound seat's mail to its hub session. Every 2 s it scans the board (polling; no inotify) and gives each seat with work its own worker thread, so a slow hub delays only its own seat; a seat already in flight is never handed a second worker. Every HTTP request is bounded at 10 s (new dependency `ureq` 3; no async runtime, no handwritten HTTP/TLS). Routing is by configuration alone: a seat in `hapi-sessions.json` goes to the hapi adapter; anything else is pull — no push and no `receive`, that seat drains when it chooses (the webhook adapter lands with 2c). The hapi adapter authenticates (`POST /api/auth`, re-exchanging the 4 h JWT near expiry or on any 401; hub address and token from `~/.hapi/settings.json`, `HAPI_API_URL`/`CLI_API_TOKEN` overriding), runs the same `receive` path `drain` uses under the seat lock (released before any HTTP), tracks each item by a delivery key (`seat:<seat>:<file>` for direct mail, `room:<room>:<file>:<seat>` for a room post — never the 4-byte id alone), records each in-flight key, its target session and its phase in `<seat>/dispatch.json` atomically before the first POST (a restart resumes; a binding that changed re-POSTs the same keys to the new session), never POSTs to a session that is not `active` (the mail stays staged and is recovered by the next pass; the dispatcher never calls `/resume`), POSTs one message per item with the key as `localId` and exactly the lines `drain` prints, then polls `queued-state` with backoff from 5 s doubling to 5 min and commits only items the hub reports invoked while the session is still `active` — exactly those items: no room cursor moves past a post still in flight, and a file a manual drain already took counts as done. One line per delivery (seat, key, accepted-at, invoked-at) and one per failure land in `<root>/dispatch.log` (the once-per-cause room alarm lands with 2c). SIGTERM exits cleanly; `--once` runs one scan pass for tests.
+- `status` prints `awake` again, derived from the dispatcher's own state: a seat with no pane whose `dispatch.json` records a delivery to its currently bound session within the last 10 minutes (a local read; status never asks the hub). `pane` still wins over `awake`; `specs/status-presence.md` is updated.
+
 ## [0.4.0] - 2026-10-19
 
 ### Removed

@@ -96,6 +96,12 @@ impl Bindings {
         self.seats.contains_key(seat)
     }
 
+    /// The hapi session id a seat is bound to, if any (the adapter's
+    /// `GET/POST /api/sessions/<id>` target).
+    pub fn session_id(&self, seat: &str) -> Option<&str> {
+        self.seats.get(seat).map(|s| s.as_str())
+    }
+
     /// The seat a session id is bound to, if any.
     pub fn bound_seat(&self, session_id: &str) -> Option<&str> {
         self.seats
@@ -250,6 +256,8 @@ mod tests {
         assert_eq!(b.bound_seat("no-such-session"), None);
         assert!(b.contains("opus-main"));
         assert!(!b.contains("alpha"));
+        assert_eq!(b.session_id("opus-main"), Some(OPUS));
+        assert_eq!(b.session_id("alpha"), None);
     }
 
     // The identity-rule cases themselves (bound as self, bound as

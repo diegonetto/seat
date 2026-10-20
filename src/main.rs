@@ -1,8 +1,13 @@
 // Verb dispatch (FR-002). The keep-list is the whole surface; anything
 // else exits 2 and is told the list.
 mod board;
+mod dispatch;
+#[cfg(test)]
+mod dispatch_tests;
 mod drain;
+mod dstate;
 mod error;
+mod hub;
 mod identity;
 mod msg;
 mod room;
@@ -16,7 +21,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::path::Path;
 
 /// The whole verb surface (FR-002).
-pub const KEEP_LIST: &str = "init register send drain room up down gallery status reset";
+pub const KEEP_LIST: &str = "init register send drain dispatch room up down gallery status reset";
 const ROOM_VERBS: &str = "create post read follow list";
 
 #[derive(Parser)]
@@ -55,6 +60,13 @@ enum Command {
         #[arg(long)]
         seat: String,
     },
+    /// Deliver every hapi-bound seat's mail to its hub session
+    /// (`--once` runs one scan pass; unbound seats are pull)
+    Dispatch {
+        /// Run one scan pass and wait for its workers
+        #[arg(long)]
+        once: bool,
+    },
     /// Room verbs (shared, MAC'd posts)
     Room {
         #[command(subcommand)]
@@ -73,8 +85,7 @@ enum Command {
     },
     /// Print the running seats, tile them into one window, then attach
     Gallery,
-    /// One row per registered seat: `<name> pane|unattended mail=<N>`
-    /// (`awake` returns with the dispatcher)
+    /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
     Status,
     /// Remove the board under the root (marker, seats/, rooms/)
     Reset,
@@ -167,6 +178,7 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             let mut out = std::io::stdout().lock();
             verbs::cmd_drain(root, &seat, &mut out)
         }
+        Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
         Command::Room { action } => dispatch_room(root, action, session),
         Command::Up { names } => session::cmd_up(root, &names),
         Command::Down { names } => session::cmd_down(root, &names),

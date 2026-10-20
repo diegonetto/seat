@@ -410,7 +410,14 @@ fn tile_seats(prog: &str, seats: &BTreeSet<String>) -> Result<()> {
     // and the border shows that. Programs rewrite pane titles.
     tmux_ok(
         prog,
-        &["set-option", "-w", "-t", &target, "pane-border-status", "top"],
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            &target,
+            "pane-border-status",
+            "top",
+        ],
     )?;
     tmux_ok(
         prog,
@@ -443,13 +450,15 @@ struct StatusRow {
     mail: usize,
 }
 
-/// Presence, separate from the mail count. Interim rule (0.4.0, with
-/// `seat arm` deleted): a live swarm pane is `pane`; every other seat
-/// is `unattended`. `awake` is unused until the dispatcher lands and
-/// derives it from its own delivery state. Mail never changes the word.
-fn presence(in_pane: bool) -> &'static str {
+/// Presence, separate from the mail count: `pane` (a live swarm
+/// pane), `awake` (no pane, a dispatcher delivery to the bound
+/// session within 10 minutes), else `unattended`
+/// (specs/status-presence.md). Mail never changes the word.
+fn presence(in_pane: bool, awake: bool) -> &'static str {
     if in_pane {
         "pane"
+    } else if awake {
+        "awake"
     } else {
         "unattended"
     }
@@ -465,9 +474,10 @@ fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
         let dir = seat::seat_dir(root, &name);
         let mail = msg::list_msg_dir(&dir.join("inbox"))?.len();
         let in_pane = running.contains(&name);
+        let awake = crate::dstate::awake(root, &name); // a local read
         rows.push(StatusRow {
             name,
-            presence: presence(in_pane),
+            presence: presence(in_pane, awake),
             mail,
         });
     }
@@ -502,9 +512,11 @@ mod tests {
     }
 
     #[test]
-    fn presence_is_pane_or_unattended_until_the_dispatcher_lands() {
-        assert_eq!(presence(true), "pane");
-        assert_eq!(presence(false), "unattended");
+    fn presence_is_pane_awake_or_unattended() {
+        assert_eq!(presence(true, true), "pane");
+        assert_eq!(presence(true, false), "pane");
+        assert_eq!(presence(false, true), "awake");
+        assert_eq!(presence(false, false), "unattended");
     }
 
     /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE:
@@ -512,10 +524,10 @@ mod tests {
     /// one such test runs at a time.
     static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Interim presence (0.4.0, arm deleted, dispatcher not yet here):
-    /// a live pane is `pane`, everything else — mail or not — is
-    /// `unattended`. Mail is the inbox file count and does not change
-    /// presence.
+    /// Presence and the mail count are separate: a live pane is
+    /// `pane`, everything else — mail or not — is `unattended` (this
+    /// board has no bindings, so no seat is awake). Mail is the inbox
+    /// file count and does not change presence.
     #[test]
     fn status_presence_and_mail_are_separate() {
         let _guard = FAKE_LOCK.lock().unwrap();

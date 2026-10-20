@@ -228,13 +228,25 @@ r2="$(tm5 gallery)"
 [ "$(ls "$R5/seats/parked/inbox" | wc -l)" -eq 1 ]
                                                    note $? "down drained nothing: parked keeps its mail"
 
-# Interim presence (0.4.0: no waiter, dispatcher not yet here): a
-# pane is pane; every other seat is unattended, mail or not.
+# Presence: a pane is pane; every other seat is unattended, mail or
+# not (no bindings on this board, so nothing is awake).
 tm5 status | grep -qx "fresh unattended mail=0";     note $? "a seat with no pane is unattended"
 tm5 status | grep -qx "parked unattended mail=1";    note $? "mail does not change presence"
 # A leftover wait.pid (from a 0.3.0 waiter) never affects presence.
 printf '%s\n' "$$" > "$R5/seats/fresh/wait.pid"
 tm5 status | grep -qx "fresh unattended mail=0";     note $? "presence never reads wait.pid"
+
+## dispatch (0.5.0): --once on a board with no bindings is pull ------
+# No seat here is hapi-bound, so one dispatch pass pushes nothing and
+# never runs receive: parked's unread mail waits for the seat itself.
+before="$(ls "$R5/seats/parked/inbox" | wc -l)"
+out="$("$S" --root "$R5" dispatch --once 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && [ "$(ls "$R5/seats/parked/inbox" | wc -l)" -eq "$before" ] \
+  && [ ! -e "$R5/dispatch.log" ]
+                                                note $? "pull: --once is quiet, untouched, unlogged"
+[ -z "$(ls "$R5/seats/parked/draining")" ];    note $? "pull: nothing staged (no receive)"
+"$S" --root "$R5" no-such-verb 2>&1 | grep '^verbs:' | grep -qF dispatch
+                                                note $? "the keep-list names dispatch"
 
 ## seat-launch quickstart (003) steps 1, 2, 3, 6, 7 ---------------------
 # The session record, read without attaching: tab-separated session,
