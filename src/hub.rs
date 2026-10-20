@@ -5,7 +5,7 @@
 //! bounded at 10 s (ureq 3; no async runtime, no handwritten HTTP).
 use crate::error::{Result, SeatError};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,35 +37,55 @@ pub fn base_url(host: &str, port: u16) -> String {
 }
 
 impl HubConfig {
-    fn from_settings(path: &Path) -> Option<HubConfig> {
-        let s: SettingsFile = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-        Some(HubConfig {
-            base: base_url(s.listen_host.as_deref().unwrap_or(""), s.listen_port?),
-            token: s.cli_api_token?,
-        })
+    fn settings(path: &Path) -> Option<SettingsFile> {
+        Some(serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?)
     }
 
-    /// Env overrides first, then `~/.hapi/settings.json`.
-    pub fn discover() -> Result<HubConfig> {
-        let file = std::env::var_os("HOME")
-            .map(|h| Path::new(&h).join(".hapi").join("settings.json"))
-            .and_then(|p| Self::from_settings(&p));
-        let pick = |env: &str, from_file: Option<String>| {
-            std::env::var(env)
-                .ok()
-                .filter(|s| !s.is_empty())
+    /// Each value comes from its own override or its own field,
+    /// independently: a settings file holding only `cliApiToken`
+    /// never discards the address, and one holding only the port
+    /// never discards the token.
+    pub fn discover_with(
+        home: &Path,
+        env_base: Option<&str>,
+        env_token: Option<&str>,
+    ) -> Result<HubConfig> {
+        let file = Self::settings(&home.join(".hapi").join("settings.json"));
+        let pick = |env: Option<&str>, from_file: Option<String>| {
+            env.filter(|s| !s.is_empty())
+                .map(str::to_string)
                 .or(from_file)
         };
-        match (
-            pick("HAPI_API_URL", file.as_ref().map(|c| c.base.clone())),
-            pick("CLI_API_TOKEN", file.as_ref().map(|c| c.token.clone())),
-        ) {
-            (Some(base), Some(token)) => Ok(HubConfig { base, token }),
-            _ => Err(SeatError::Hub(
-                "no hub configured: set HAPI_API_URL and CLI_API_TOKEN or write ~/.hapi/settings.json"
+        let file_base = file.as_ref().and_then(|s| {
+            s.listen_port
+                .map(|p| base_url(s.listen_host.as_deref().unwrap_or(""), p))
+        });
+        let base = pick(env_base, file_base).ok_or_else(|| {
+            SeatError::Hub(
+                "no hub address: set HAPI_API_URL or write listenPort in ~/.hapi/settings.json"
                     .into(),
-            )),
-        }
+            )
+        })?;
+        let token = pick(env_token, file.and_then(|s| s.cli_api_token)).ok_or_else(|| {
+            SeatError::Hub(
+                "no hub token: set CLI_API_TOKEN or write cliApiToken in ~/.hapi/settings.json"
+                    .into(),
+            )
+        })?;
+        Ok(HubConfig { base, token })
+    }
+
+    /// Env overrides first, then `~/.hapi/settings.json` (each value
+    /// independently — see `discover_with`).
+    pub fn discover() -> Result<HubConfig> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::discover_with(
+            &home,
+            std::env::var("HAPI_API_URL").ok().as_deref(),
+            std::env::var("CLI_API_TOKEN").ok().as_deref(),
+        )
     }
 }
 
@@ -256,5 +276,38 @@ impl Hub {
             indeterminate: Self::list(&raw, "indeterminateLocalIds"),
             invoked: Self::list(&raw, "invokedLocalMessages"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home_with_settings(json: &str) -> PathBuf {
+        let home = crate::testutil::temp_root("hub-settings");
+        std::fs::create_dir_all(home.join(".hapi")).unwrap();
+        std::fs::write(home.join(".hapi").join("settings.json"), json).unwrap();
+        home
+    }
+
+    /// Finding 3c: address and token each come from their own override
+    /// or field, independently — a file holding only one half never
+    /// discards the other.
+    #[test]
+    fn each_half_comes_from_its_own_source() {
+        // File address + CLI_API_TOKEN: the file has no token to give.
+        let home = home_with_settings(r#"{"listenPort":4242,"cliApiToken":"file-token"}"#);
+        let cfg = HubConfig::discover_with(&home, None, Some("env-token")).unwrap();
+        assert_eq!(
+            (cfg.base.as_str(), cfg.token.as_str()),
+            ("http://127.0.0.1:4242", "env-token")
+        );
+        // HAPI_API_URL + file token: the file has no port to give.
+        let home = home_with_settings(r#"{"cliApiToken":"file-token"}"#);
+        let cfg = HubConfig::discover_with(&home, Some("http://127.0.0.1:9999"), None).unwrap();
+        assert_eq!(
+            (cfg.base.as_str(), cfg.token.as_str()),
+            ("http://127.0.0.1:9999", "file-token")
+        );
     }
 }

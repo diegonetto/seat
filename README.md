@@ -73,18 +73,58 @@ an error naming the seat. Drains of other seats never wait.
 
 ## Deliver to a hub session
 
-`dispatch` is the one service that delivers the board's mail to hapi
-sessions. Run it long-running; `--once` runs a single scan pass.
-Every 2 s it scans the seats and hands each seat bound in
-`<root>/hapi-sessions.json` to its own worker thread (every other
-seat is pull — no push and no receive). A slow hub delays only its
-own seat, every HTTP request is bounded at 10 s, and SIGTERM exits
-cleanly. Each item is tracked by a stable key recorded in
-`<seat>/dispatch.json` atomically before anything is POSTed, so a
-crash resumes and a retry re-POSTs the same key. An item commits
-only when the hub reports it invoked while its session is still
-active; one line per delivery and one per failure land in
+`dispatch` is the one service that delivers the board's mail. Run it
+long-running; `--once` runs a single scan pass. Every 2 s it scans the
+seats and routes each one by configuration alone: a seat bound in
+`<root>/hapi-sessions.json` is `hapi` (even if it also holds webhook
+files), else a seat directory holding `webhook.url` is `webhook`, else
+pull — no push and no receive, that seat drains when it chooses. A
+slow hub delays only its own seat, every HTTP request is bounded at
+10 s, and SIGTERM exits cleanly. Each hapi item is tracked by a stable
+key recorded in `<seat>/dispatch.json` atomically before anything is
+POSTed, so a crash resumes and a retry re-POSTs the same key. An item
+commits only when the hub reports it invoked while its session is
+still active; one line per delivery and one per failure land in
 `<root>/dispatch.log`.
+
+### The webhook adapter
+
+The Grok bots drain the board themselves, so the webhook adapter never
+runs `receive` and never archives — it rings, and re-rings until every
+rung message has left `inbox/` and `draining/` (backoff from 1 min
+doubling to 1 h). A webhook worker rechecks its route before each pass
+and during its waits, and steps aside when its seat becomes
+hapi-bound. Two modes, byte for byte against the scripts they replace:
+
+- **signal** (`wake-grokbot`): `webhook.url` (must start `https://`),
+  `bridge.key`, optional `webhook.auth` (one line; an `Authorization:`
+  prefix is stripped). The POST body is exactly
+  `{"schema_version":1,"seat":<seat>,"ts":<UTC ts>,"nonce":<32 hex>}`
+  with `X-Memo-Signature: sha256=<HMAC-SHA256 of the body with
+  bridge.key>` — never a message body.
+- **payload** (`grok-doorbell.py`, kotek-grokbot; enabled by a marker
+  file `<seat>/webhook.payload`): verified direct mail from the
+  `inbox` seat rides in the body at most once per message id, with its
+  attempted/delivered records kept in the seat directory as
+  `<seat>/webhook-attempted.json` and `<seat>/webhook-delivered.json`
+  (moved from the doorbell's `--runtime` directory; moving kotek's
+  config files on Slix is the cutover, not this code). Everything
+  else — other senders, rooms, mail over 8 KiB, mail whose MAC does
+  not verify — gets the signal, and while an attempted hq message is
+  still unread nothing at all is sent.
+
+### Alarms
+
+Five causes, each latched once (one line in `<root>/dispatch.log` and
+one post to the room `blacklite-factory` as seat `sb-watch`) until the
+condition clears and returns: `undelivered` (an item of that seat
+older than 15 minutes still undelivered), `session-inactive` (the
+bound session is 404 or not active), `no-answer` (the hub does not
+answer for that seat's session), `hub-auth` (the hub refuses auth —
+board-wide), and `webhook-failing` (3 failed rings in a row). The
+fired set persists in `<root>/dispatch-alarms.json`; a successful hub
+response clears `no-answer` and `hub-auth` even when it reports the
+session inactive.
 
 ### The identity rule on `--from`
 
@@ -139,6 +179,9 @@ root directory only when that leaves the directory empty.
 <root>/marker                 the literal seat
 <root>/seats/<name>/          meta.json, token, inbox/, archive/
 <root>/rooms/<name>/          posted messages
+<root>/dispatch.log           one line per delivery, failure, alarm
+<root>/dispatch-alarms.json   the latched alarm causes
+<root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
 ```
 
 A command other than `init` refuses a directory it does not recognize

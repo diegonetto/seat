@@ -2,6 +2,19 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.6.0] - 2026-10-20
+
+### Added
+
+- The `webhook` adapter in `seat dispatch`, byte for byte against the scripts it replaces. Routing is by configuration alone: a seat in `hapi-sessions.json` is hapi (even with `webhook.url` staged), else a seat directory holding `webhook.url` is webhook (no hub configured anywhere), else pull. **signal** mode (eng-grokbot, sales-grokbot; source `wake-grokbot`) POSTs exactly `{"schema_version":1,"seat":..,"ts":..,"nonce":..}` HMAC'd with `bridge.key`, headers `Content-Type: application/json` and `X-Memo-Signature: sha256=<hex>`, an optional `webhook.auth` value (an `Authorization:` prefix stripped), retried 3x with the script's backoff — never a message body. **payload** mode (kotek-grokbot; source `grok-doorbell.py`; enabled by a marker file `<seat>/webhook.payload`) carries verified direct mail from the `inbox` seat in the body at most once per message id, with attempt-before-send, a payload POST attempted exactly once, suppression (no signal while an attempted hq message is still unread) and its `webhook-attempted.json`/`webhook-delivered.json` records moved into the seat directory; everything else gets the signal. The adapter never runs `receive` and never archives; it rings once per burst of new mail and re-rings (backoff 1 min doubling to 1 h) until every rung message has left `inbox/` and `draining/`. A webhook worker rechecks its route — the full rule: hapi binding, else `webhook.url`, else pull — before each pass and during its waits and exits when the route is no longer webhook (the seat became hapi-bound, so it gets the hapi worker, or `webhook.url` was removed, so it is pull). `seat dispatch --once` returns only after every spawned worker has completed its first pass, so one `--once` scan always rings the seats it spawned workers for.
+- Alarms, once per cause (not per retry): one line in `<root>/dispatch.log` and one post to the room `blacklite-factory` as seat `sb-watch` for each of the five causes — `undelivered` (an item of that seat older than 15 minutes; the message header `ts`; only seats the dispatcher delivers), `session-inactive` (the bound session is 404 or not `active`), `no-answer` (the hub does not answer for that seat's session), `hub-auth` (the hub refuses auth; board-wide), and `webhook-failing` (3 failed rings in a row). The fired set persists durably in `<root>/dispatch-alarms.json` (temp, fsync, rename, directory fsync; errors returned and logged). A successful hub response clears `no-answer` and `hub-auth` even when it reports the session inactive; `session-inactive` clears when the session reads `active`; `undelivered` clears when the seat has no item older than 15 minutes; `webhook-failing` clears on a successful ring. The standing per-pass failure log lines are unchanged.
+
+### Fixed
+
+- A followed-room post wakes a hapi worker waiting out its queued-state backoff (`fresh_work`), skipping posts the receive path would refuse (bad mark, unreadable, dest/from refuse), so a rejected post can no longer spam the wake check while items are in flight.
+- `dispatch.json` is written with the board's standard durable shape (`seat.rs` `write_meta`): temp file created fresh with mode 0600, fsync, rename, then a directory fsync — and the doorbell's id records and the alarm state use the same write.
+- Hub settings discovery takes the address and the token each from its own override or field, independently: a settings file holding only `listenPort` no longer discards a file `cliApiToken` (and the reverse), so `HAPI_API_URL` with a file token, or `CLI_API_TOKEN` with a file address, now works.
+
 ## [0.5.0] - 2026-10-20
 
 ### Added

@@ -35,6 +35,33 @@ pub fn assert_throwaway(root: &std::path::Path) {
     );
 }
 
+/// Point `HOME` at a throwaway directory for the duration of `body`,
+/// so nothing the test runs can read the operator's
+/// `~/.hapi/settings.json` — the frozen alarm contract's requirement:
+/// even a path that discovers hub settings mid-test finds the
+/// throwaway, never the operator's. Tests run on parallel threads in
+/// one process and HOME is process-global, so the swap takes one
+/// process-wide lock, and the previous value is always restored, even
+/// on panic.
+pub fn with_throwaway_home<T>(body: impl FnOnce() -> T) -> T {
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = HOME_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home = temp_root("home");
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    match prev {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    match out {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// Write a throwaway `<root>/hapi-sessions.json` binding each seat to
 /// a session id (the id becomes the url's last path segment), the same
 /// shape seat-role writes.
@@ -241,6 +268,103 @@ pub mod fakehub {
             }
             _ => respond(&mut writer, 404, "{}"),
         }
+    }
+}
+
+/// A tiny webhook receiver on 127.0.0.1 (ephemeral port, a thread per
+/// connection): it records every request's header block and body
+/// exactly as sent, and answers with the scripted status (0 = 200).
+/// Tests point the webhook config straight at it; the live panel is
+/// never touched.
+pub mod fakewebhook {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    pub struct WebCtl {
+        /// Answer every request with this status (0 means 200).
+        pub status: u16,
+        /// (header block, body) per request, in order.
+        pub hits: Vec<(String, String)>,
+    }
+
+    pub struct FakeWebhook {
+        pub ctl: Arc<Mutex<WebCtl>>,
+        addr: std::net::SocketAddr,
+    }
+
+    impl FakeWebhook {
+        /// Serve on 127.0.0.1:0 until the process exits.
+        pub fn start() -> FakeWebhook {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake webhook");
+            let addr = listener.local_addr().expect("fake webhook addr");
+            let ctl = Arc::new(Mutex::new(WebCtl::default()));
+            let accept = Arc::clone(&ctl);
+            std::thread::spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    let ctl = Arc::clone(&accept);
+                    std::thread::spawn(move || handle(conn, ctl));
+                }
+            });
+            FakeWebhook { ctl, addr }
+        }
+
+        pub fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        pub fn hits(&self) -> Vec<(String, String)> {
+            self.ctl.lock().unwrap().hits.clone()
+        }
+    }
+
+    fn handle(stream: TcpStream, ctl: Arc<Mutex<WebCtl>>) {
+        let mut writer = stream.try_clone().expect("clone fake webhook stream");
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        if reader.read_line(&mut request).is_err() {
+            return;
+        }
+        let (mut headers, mut len) = (String::new(), 0usize);
+        for line in reader.by_ref().lines() {
+            let line = line.unwrap_or_default();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap_or(0);
+            }
+            // Header names normalize to lowercase (senders differ);
+            // values stay byte for byte.
+            match line.split_once(':') {
+                Some((name, value)) => {
+                    headers.push_str(&format!("{}:{value}\n", name.to_ascii_lowercase()))
+                }
+                None => headers.push_str(&line),
+            }
+        }
+        let mut body = vec![0u8; len];
+        if len > 0 && reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let status = {
+            let mut c = ctl.lock().unwrap();
+            c.hits
+                .push((headers, String::from_utf8_lossy(&body).into_owned()));
+            if c.status == 0 {
+                200
+            } else {
+                c.status
+            }
+        };
+        let ok = (200..300).contains(&status);
+        let _ = write!(
+            writer,
+            "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            if ok { "OK" } else { "Fail" }
+        );
+        let _ = writer.flush();
     }
 }
 

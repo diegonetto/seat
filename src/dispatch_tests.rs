@@ -1,10 +1,15 @@
 //! The dispatcher check cases against the one small fake hub on
 //! 127.0.0.1 (never the live hub): the brief's hapi contract plus the
 //! local-state cases (room cursors, invalid posts, `awake`, the
-//! fresh-work wake).
+//! fresh-work wake) and the 0.6.0 additions (the alarm matrix, the
+//! room-post wake, the reload).
+use crate::alarm;
 use crate::dispatch::{self, Pass, Waits};
+use crate::error::SeatError;
 use crate::testutil::dispatchkit::{kit, log_text, mark, n_files, n_posts, only_key, send};
+use crate::testutil::fakewebhook::FakeWebhook;
 use crate::testutil::write_bindings;
+use crate::webhook::{self, RingWaits, WebhookConfig};
 use crate::{drain, dstate, msg, room, seat, verbs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -456,4 +461,367 @@ fn fresh_work_wakes_a_backing_off_worker_at_once() {
         "new mail waited behind the queued backoff",
     );
     stop.store(true, Ordering::SeqCst);
+}
+
+/// A followed-room post wakes a worker waiting on a queued item; a
+/// post the receive path would refuse (tampered) never wakes it.
+#[test]
+fn a_followed_room_post_wakes_a_backing_off_worker() {
+    let (root, hub, _client) = kit(&[("opus", "s1")], &["s1"]);
+    send(&root, "opus", "stuck queued");
+    let key = only_key(&root, "opus");
+    mark(&hub, &key, "queued");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, cfg, s) = (root.clone(), hub.config(), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        dispatch::worker_loop(
+            r,
+            "opus".into(),
+            cfg,
+            s,
+            Waits {
+                first: Duration::from_secs(30),
+                max: Duration::from_secs(30),
+            },
+        )
+    });
+    let posted = |line: &str| hub.journal().iter().any(|l| l.contains(line));
+    wait_for(
+        || posted(&format!("POST-MSG s1 {key}")),
+        "the first POST never happened",
+    );
+    // A good post in a followed room wakes the worker mid-backoff.
+    room::create(&root, "ops").unwrap();
+    room::cmd_post(&root, "ops", Some("opus"), "wake up", None).unwrap();
+    room::cmd_follow(&root, "ops", "opus").unwrap();
+    let room_key = dstate::room_key(
+        "opus",
+        "ops",
+        room::posts(&root, "ops").unwrap()[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    );
+    wait_for(
+        || posted(&format!("POST-MSG s1 {room_key}")),
+        "the room post waited behind the queued backoff",
+    );
+    std::thread::sleep(Duration::from_millis(200)); // let the pass finish
+                                                    // A tampered post would be refused by receive: it must not wake.
+    let (before, log_before) = (hub.journal().len(), log_text(&root).len());
+    room::cmd_post(&root, "ops", Some("opus"), "do not wake", None).unwrap();
+    let last = room::posts(&root, "ops").unwrap().pop().unwrap();
+    let raw = std::fs::read_to_string(&last).unwrap();
+    std::fs::write(&last, raw.replace("do not wake", "broken post")).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        hub.journal().len(),
+        before,
+        "a refused post woke the worker"
+    );
+    assert!(
+        !log_text(&root)[log_before..].contains("rejected"),
+        "a refused post was received"
+    );
+    stop.store(true, Ordering::SeqCst);
+}
+
+fn alarm_posts(root: &std::path::Path) -> Vec<String> {
+    room::posts(root, alarm::ROOM)
+        .unwrap()
+        .iter()
+        .filter_map(|p| msg::read_msg(p).ok().map(|(_, b)| b))
+        .collect()
+}
+
+/// The frozen alarm contract, one matrix: each cause fires once (one
+/// log line, one room post as `sb-watch`), retries stay silent,
+/// recovery clears — a recovered hub clears even while the session
+/// reads inactive — and a recurrence alarms again. HOME points at a
+/// throwaway directory for the whole matrix, so nothing the test runs
+/// can read the operator's `~/.hapi/settings.json`.
+#[test]
+fn alarm_matrix_once_per_cause_and_recovery() {
+    crate::testutil::with_throwaway_home(alarm_matrix_once_per_cause_and_recovery_isolated);
+}
+
+fn alarm_matrix_once_per_cause_and_recovery_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    room::create(&root, alarm::ROOM).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), false);
+
+    // session-inactive: fires once across retries; failure lines stay.
+    send(&root, "opus", "held for opus");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=session-inactive")
+            .count(),
+        1
+    );
+    assert_eq!(log.matches("failure seat=opus").count(), 2, "{log}");
+    assert_eq!(alarm_posts(&root).len(), 1);
+    assert!(alarm_posts(&root)[0].starts_with("seat opus: session-inactive: session s1"));
+
+    // Recovery clears (the session reads active again)…
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), true);
+    dispatch::pass_seat(&root, "opus", &mut client).unwrap();
+    // …so a recurrence alarms again.
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), false);
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(log_text(&root).matches("cause=session-inactive").count(), 2);
+    assert_eq!(alarm_posts(&root).len(), 2);
+
+    // no-answer (per seat) and hub-auth (board-wide): once each,
+    // then cleared by any successful hub response — this one reports
+    // the session inactive, and the clear still holds.
+    dispatch::log_failure(
+        &root,
+        "opus",
+        &SeatError::Hub("GET session s1: timed out".into()),
+    );
+    dispatch::log_failure(
+        &root,
+        "opus",
+        &SeatError::Hub("GET session s1: timed out".into()),
+    );
+    dispatch::log_failure(&root, "opus", &SeatError::Hub("auth refused twice".into()));
+    assert_eq!(
+        log_text(&root)
+            .matches("alarm seat=opus cause=no-answer")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log_text(&root)
+            .matches("alarm seat=board cause=hub-auth")
+            .count(),
+        1
+    );
+    assert_eq!(alarm_posts(&root).len(), 4);
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    ); // the hub answered (active:false): the causes cleared…
+    dispatch::log_failure(
+        &root,
+        "opus",
+        &SeatError::Hub("GET session s1: timed out".into()),
+    );
+    dispatch::log_failure(&root, "opus", &SeatError::Hub("auth refused twice".into()));
+    assert_eq!(log_text(&root).matches("cause=no-answer").count(), 2);
+    assert_eq!(log_text(&root).matches("cause=hub-auth").count(), 2);
+    assert_eq!(alarm_posts(&root).len(), 6);
+
+    // undelivered: an item older than 15 minutes (the ts in its file
+    // name) fires once; receive quarantines it, so the next pass
+    // clears; a recurrence alarms again.
+    let old = seat::seat_dir(&root, "opus")
+        .join("inbox")
+        .join("20260101T000000.000000-deadbeef.msg");
+    std::fs::write(&old, "stale\n\nstale").unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(
+        log_text(&root)
+            .matches("alarm seat=opus cause=undelivered")
+            .count(),
+        1
+    );
+    assert_eq!(alarm_posts(&root).len(), 7);
+    dispatch::pass_seat(&root, "opus", &mut client).unwrap(); // quarantined: clears
+    std::fs::write(&old, "stale\n\nstale").unwrap();
+    dispatch::pass_seat(&root, "opus", &mut client).unwrap();
+    assert_eq!(log_text(&root).matches("cause=undelivered").count(), 2);
+    assert_eq!(alarm_posts(&root).len(), 8);
+
+    // webhook-failing: strikes 1 and 2 log one failure line each,
+    // strike 3 alarms once, further failures stay silent, and a
+    // successful ring clears.
+    let hook = FakeWebhook::start();
+    verbs::cmd_register(&root, "grok", "sb", None, None, Vec::new()).unwrap();
+    let gdir = seat::seat_dir(&root, "grok");
+    std::fs::write(gdir.join("webhook.url"), format!("{}\n", hook.url())).unwrap();
+    std::fs::write(gdir.join("bridge.key"), "k\n").unwrap();
+    send(&root, "grok", "ring grok");
+    let cfg = WebhookConfig::mem(hook.url(), "k".into(), None, false);
+    // A 1ns backoff makes every pass's re-ring due at once.
+    let waits = RingWaits {
+        first: Duration::from_nanos(1),
+        max: Duration::from_nanos(1),
+    };
+    hook.ctl.lock().unwrap().status = 500;
+    for i in 1..=4u32 {
+        webhook::ring_pass(&root, "grok", &cfg, waits, &|_| {}).unwrap();
+        assert_eq!(
+            log_text(&root)
+                .matches(&format!("ring attempt {i} failed"))
+                .count(),
+            usize::from(i <= 2)
+        );
+    }
+    assert_eq!(
+        log_text(&root)
+            .matches("alarm seat=grok cause=webhook-failing")
+            .count(),
+        1
+    );
+    assert_eq!(alarm_posts(&root).len(), 9);
+    hook.ctl.lock().unwrap().status = 0;
+    send(&root, "grok", "ring again");
+    assert!(matches!(
+        webhook::ring_pass(&root, "grok", &cfg, waits, &|_| {}).unwrap(),
+        webhook::RingOutcome::Rang
+    ));
+    send(&root, "grok", "and again");
+    webhook::ring_pass(&root, "grok", &cfg, waits, &|_| {}).unwrap();
+    assert_eq!(
+        log_text(&root).matches("cause=webhook-failing").count(),
+        1,
+        "cleared by the successful ring"
+    );
+}
+
+/// dispatch.json and the alarm state survive a reload: both are
+/// written with the board's durable shape (0600, no scratch left) and
+/// reload equal; a re-fired cause stays latched across the reload.
+/// HOME points at a throwaway directory, so nothing the test runs can
+/// read the operator's `~/.hapi/settings.json`.
+#[test]
+fn dispatch_state_and_alarms_survive_a_reload() {
+    crate::testutil::with_throwaway_home(dispatch_state_and_alarms_survive_a_reload_isolated);
+}
+
+fn dispatch_state_and_alarms_survive_a_reload_isolated() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
+    let dir = seat::seat_dir(&root, "alpha");
+    let mut state = dstate::DispatchState::default();
+    state.session = Some("s1".into());
+    state
+        .items
+        .insert("seat:alpha:x.msg".into(), Default::default());
+    dstate::store_state(&dir, &state).unwrap();
+    assert_eq!(
+        std::fs::metadata(dir.join("dispatch.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(dstate::load_state(&dir).session.as_deref(), Some("s1"));
+    assert_eq!(dstate::load_state(&dir).items.len(), 1);
+    room::create(&root, alarm::ROOM).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
+    assert_eq!(alarm_posts(&root).len(), 1, "latched across the reload");
+    let raw = std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap();
+    assert!(raw.contains("session-inactive:alpha"), "{raw}");
+    assert_eq!(
+        std::fs::metadata(root.join("dispatch-alarms.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let scratch: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".dispatch.json"))
+        .collect();
+    assert!(scratch.is_empty(), "scratch left: {scratch:?}");
+}
+
+/// A pending followed-room post raises `undelivered`: the age check
+/// includes, beside the seat's own `inbox/` and `draining/` files,
+/// the posts this seat's `receive` would accept, aged by their header
+/// `ts` (the file-name prefix) — a seat whose only owed item is an
+/// old room post is undelivered too. Delivering the post clears the
+/// cause; a tampered post never counts, exactly as `receive` refuses
+/// it.
+#[test]
+fn an_old_pending_room_post_raises_undelivered() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
+    room::create(&root, alarm::ROOM).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new()).unwrap();
+    room::create(&root, "ops").unwrap();
+    // Verified posts, backdated by header ts and file prefix alike.
+    let token = verbs::sender_token(&root, "opus").unwrap();
+    let write_post = |ts: &str, id: &str, tamper: bool| {
+        // The MAC is always over the honest body; a tampered post
+        // writes something else, so verification fails exactly as a
+        // forged post would.
+        let mac = msg::compute_hmac(&token, "ops", "opus", id, ts, b"old bulletin", None).unwrap();
+        let head = format!(
+            "{{\"dest\":\"ops\",\"from\":\"opus\",\"id\":\"{id}\",\"ts\":\"{ts}\",\"hmac\":\"{mac}\"}}"
+        );
+        let body = if tamper { "altered" } else { "old bulletin" };
+        std::fs::write(
+            room::room_dir(&root, "ops").join(format!("{ts}-{id}.msg")),
+            format!("{head}\n\n{body}"),
+        )
+        .unwrap();
+    };
+    let old = "20260101T000000.000000";
+    write_post(old, "deadbeef", false);
+    room::cmd_follow(&root, "ops", "opus").unwrap();
+
+    // The seat owes nothing in inbox/ or draining/ — only the old
+    // room post — and that alone raises the alarm.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        log_text(&root)
+            .matches("alarm seat=opus cause=undelivered")
+            .count(),
+        1
+    );
+    assert!(alarm_posts(&root)[0].contains("undelivered"));
+
+    // Delivered: the cursor advances past the post, the seat owes
+    // nothing old any more, and the cause clears.
+    let key = dstate::room_key("opus", "ops", &format!("{old}-deadbeef.msg"));
+    mark(&hub, &key, "invoked");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    dispatch::pass_seat(&root, "opus", &mut client).unwrap(); // the idle pass: the clear
+    assert!(!std::fs::read_to_string(root.join("dispatch-alarms.json"))
+        .unwrap_or_default()
+        .contains("undelivered:opus"));
+
+    // A tampered old post is not owed (receive refuses it): no new
+    // alarm, and the pass advances the cursor past it.
+    write_post("20260101T000001.000000", "feedface", true);
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Idle
+    );
+    assert_eq!(
+        log_text(&root).matches("cause=undelivered").count(),
+        1,
+        "a post receive would refuse is not undelivered"
+    );
 }

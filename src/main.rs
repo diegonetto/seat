@@ -1,5 +1,6 @@
 // Verb dispatch (FR-002). The keep-list is the whole surface; anything
 // else exits 2 and is told the list.
+mod alarm;
 mod board;
 mod dispatch;
 #[cfg(test)]
@@ -16,6 +17,9 @@ mod session;
 #[cfg(test)]
 mod testutil;
 mod verbs;
+mod webhook;
+#[cfg(test)]
+mod webhook_tests;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::Path;
@@ -60,8 +64,8 @@ enum Command {
         #[arg(long)]
         seat: String,
     },
-    /// Deliver every hapi-bound seat's mail to its hub session
-    /// (`--once` runs one scan pass; unbound seats are pull)
+    /// Deliver every routed seat's mail (hapi session or webhook;
+    /// `--once` runs one scan pass; unrouted seats are pull)
     Dispatch {
         /// Run one scan pass and wait for its workers
         #[arg(long)]

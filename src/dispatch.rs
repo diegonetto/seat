@@ -1,21 +1,25 @@
-//! `seat dispatch`: the one service delivering a hapi-bound seat's
-//! mail to its hub session (state in dstate, client in hub). Routing
-//! is by configuration alone: hapi if the seat is in
-//! hapi-sessions.json, otherwise pull — no push, no `receive` (2c
-//! adds webhook at the route seam in `run`).
+//! `seat dispatch`: the one service delivering the board's mail.
+//! Routing is by configuration alone, at the seam in `run`: a seat in
+//! `hapi-sessions.json` is `hapi` (its pass body below, client in
+//! `hub`), else a seat directory holding `webhook.url` is `webhook`
+//! (`webhook` — no hub needed), else pull — no push, the seat drains
+//! when it chooses. The alarm hooks (item 6) live in the hapi pass
+//! where it is.
+use crate::alarm;
 use crate::board;
 use crate::drain::{self, Received};
 use crate::dstate::{
     direct_key, direct_text, load_state, log_line, room_key, room_text, store_state, DispatchState,
     LastDelivery, Phase,
 };
-use crate::error::Result;
+use crate::error::{Result, SeatError};
 use crate::hub::{Hub, HubConfig};
 use crate::identity::Bindings;
 use crate::msg;
 use crate::room;
 use crate::seat::{self, SeatLock};
 use crate::verbs::sorted_seat_names;
+use crate::webhook;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +67,25 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
         );
         return Ok(Pass::Blocked);
     };
+    // The `undelivered` cause, by message age (hapi has no
+    // payload-delivered record; committed mail is archived away). A
+    // pending followed-room post counts too — only the posts this
+    // seat's `receive` would accept, aged by their header `ts` (the
+    // file-name prefix): a post owed for 15 minutes is as undelivered
+    // as mail sitting in `inbox/` or `draining/`, which is all the
+    // seat's own files can see.
+    let mut owed = webhook::present_files(&dir);
+    for room_name in room::followed_rooms(&dir) {
+        let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
+        for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
+            if drain::check_room_post(root, &room_name, &post).is_ok() {
+                if let Some(name) = post.file_name().and_then(|n| n.to_str()) {
+                    owed.insert(name.to_string());
+                }
+            }
+        }
+    }
+    alarm::undelivered(root, seat, &BTreeSet::new(), &owed)?;
     let mut state = load_state(&dir);
     // The lock covers receive only; a manual drain can run between
     // receive and commit.
@@ -118,8 +141,21 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     }
     store_state(&dir, &state)?; // before any POST
                                 // An inactive or missing session is never POSTed; the mail stays
-                                // staged, recovered by the next pass.
-    if !hub.session_active(&session)? {
+                                // staged, recovered by the next pass. Any successful hub
+                                // response — this one, active or not — clears the transport
+                                // causes (`no-answer`, `hub-auth`).
+    let active = hub.session_active(&session)?;
+    alarm::clear(root, Some(seat), alarm::NO_ANSWER)?;
+    alarm::clear(root, None, alarm::HUB_AUTH)?;
+    if active {
+        alarm::clear(root, Some(seat), alarm::SESSION_INACTIVE)?;
+    } else {
+        alarm::fire(
+            root,
+            Some(seat),
+            alarm::SESSION_INACTIVE,
+            &format!("session {session} is not active"),
+        )?;
         log_line(
             root,
             "failure",
@@ -265,6 +301,26 @@ pub(crate) fn commit_invoked(
     Ok(())
 }
 
+/// Where each seat's mail goes, by configuration alone: a seat in
+/// `hapi-sessions.json` is hapi (even with `webhook.url`), else a seat
+/// directory holding `webhook.url` is webhook, else pull.
+pub(crate) fn route_seats(
+    root: &Path,
+    bindings: &Bindings,
+    names: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut hapi = Vec::new();
+    let mut hook = Vec::new();
+    for seat in names {
+        if bindings.contains(seat) {
+            hapi.push(seat.clone());
+        } else if seat::seat_dir(root, seat).join("webhook.url").is_file() {
+            hook.push(seat.clone());
+        }
+    }
+    (hapi, hook)
+}
+
 static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 extern "C" fn on_term(_sig: libc::c_int) {
@@ -273,10 +329,10 @@ extern "C" fn on_term(_sig: libc::c_int) {
     }
 }
 
-/// `seat dispatch [--once]`: scan every 2 s, one worker per hapi-bound
-/// seat; `--once` runs one scan and waits for its workers. SIGTERM
-/// (long-running mode only) sets the stop flag the workers observe
-/// after every pass and inside every sleep.
+/// `seat dispatch [--once]`: scan every 2 s, one worker per routed
+/// seat with work; `--once` runs one scan and waits for its workers.
+/// SIGTERM (long-running mode only) sets the stop flag the workers
+/// observe after every pass and inside every sleep.
 pub fn cmd_dispatch(root: &Path, once: bool) -> Result<()> {
     board::ensure_board(root)?;
     let stop = SHUTDOWN
@@ -295,16 +351,15 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
         // Reap finished workers; a seat whose worker still runs is
         // never spawned twice (the worker itself stays responsive).
         live.lock().unwrap().retain(|_, h| !h.is_finished());
-        let bindings = Bindings::load(root);
-        let routed: Vec<String> = sorted_seat_names(root)?
-            .into_iter()
-            .filter(|s| bindings.contains(s))
-            .collect();
-        if !routed.is_empty() {
+        let (hapi_seats, webhook_seats) =
+            route_seats(root, &Bindings::load(root), &sorted_seat_names(root)?);
+        // The hub is a hapi concern only: webhook seats spawn with no
+        // hub configured at all.
+        if !hapi_seats.is_empty() {
             match HubConfig::discover() {
                 Ok(cfg) => {
                     let mut live = live.lock().unwrap();
-                    for seat in routed {
+                    for seat in hapi_seats {
                         if !live.contains_key(&seat) {
                             let (r, name, s) = (root.to_path_buf(), seat.clone(), Arc::clone(stop));
                             let c = cfg.clone();
@@ -314,10 +369,19 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
                     }
                 }
                 Err(e) => {
-                    for seat in routed {
+                    for seat in hapi_seats {
                         log_line(root, "failure", &seat, &e.to_string());
                     }
                 }
+            }
+        }
+        for seat in webhook_seats {
+            if !live.lock().unwrap().contains_key(&seat) && webhook::has_work(root, &seat) {
+                let (r, name, s) = (root.to_path_buf(), seat.clone(), Arc::clone(stop));
+                let h = std::thread::spawn(move || {
+                    webhook::worker_loop(r, name, s, webhook::PROD_RING_WAITS, None)
+                });
+                live.lock().unwrap().insert(seat, h);
             }
         }
         if once {
@@ -341,20 +405,45 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
 }
 
 /// Fresh work a waiting worker must not sit behind its backoff for:
-/// mail in inbox/ or a binding that moved while items are in flight.
+/// mail in `inbox/`, a binding that moved while items are in flight,
+/// or a new followed-room post whose delivery key this seat's state
+/// does not carry yet. Posts `receive` would refuse never gain a key
+/// and never wake; the cursor does not move past them while items are
+/// in flight, so waking on them would void the backoff on every slice.
 fn fresh_work(root: &Path, seat: &str) -> bool {
     let dir = seat::seat_dir(root, seat);
-    !msg::list_msg_dir(&dir.join("inbox"))
+    if !msg::list_msg_dir(&dir.join("inbox"))
         .unwrap_or_default()
         .is_empty()
-        || Bindings::load(root).session_id(seat).map(str::to_string) != load_state(&dir).session
+    {
+        return true;
+    }
+    let state = load_state(&dir);
+    if Bindings::load(root).session_id(seat).map(str::to_string) != state.session {
+        return true;
+    }
+    for room_name in room::followed_rooms(&dir) {
+        let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
+        for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
+            if let Ok(received) = drain::check_room_post(root, &room_name, &post) {
+                if !state
+                    .items
+                    .contains_key(&room_key(seat, &room_name, &received.file_name))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The worker body: pass after pass until idle, blocked, or stopped.
 /// A Waiting pass backs off (doubling to waits.max) but is woken by
 /// fresh work, so new mail and binding changes are received and
 /// POSTed at once — the 2-second scan's promise, held mid-backoff. A
-/// failure is logged and ends the worker; the scan retries in 2 s.
+/// failure is logged, classified into the no-answer / hub-auth alarms
+/// (once per cause), and ends the worker; the scan retries in 2 s.
 pub(crate) fn worker_loop(
     root: PathBuf,
     seat: String,
@@ -370,7 +459,7 @@ pub(crate) fn worker_loop(
             Ok(Pass::Waiting) => (true, true),    // back off, then refresh
             Ok(_) => (false, false),
             Err(e) => {
-                log_line(&root, "failure", &seat, &e.to_string());
+                log_failure(&root, &seat, &e);
                 (false, false)
             }
         };
@@ -391,5 +480,28 @@ pub(crate) fn worker_loop(
         } else {
             backoff = waits.first;
         }
+    }
+}
+
+/// One failure line plus its alarm classification: a hub refusing auth
+/// is one board-wide cause; any other hub error means that seat's
+/// session got no answer. Both once per cause (alarm.rs).
+pub(crate) fn log_failure(root: &Path, seat: &str, e: &SeatError) {
+    let detail = e.to_string();
+    log_line(root, "failure", seat, &detail);
+    let fired = match e {
+        SeatError::Hub(msg) if msg.contains("auth") => {
+            alarm::fire(root, None, alarm::HUB_AUTH, &detail)
+        }
+        SeatError::Hub(_) => alarm::fire(
+            root,
+            Some(seat),
+            alarm::NO_ANSWER,
+            &format!("the hub does not answer for this seat's session: {detail}"),
+        ),
+        _ => Ok(()),
+    };
+    if let Err(pe) = fired {
+        log_line(root, "failure", seat, &format!("alarm not persisted: {pe}"));
     }
 }

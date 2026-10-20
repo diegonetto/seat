@@ -40,6 +40,22 @@ pub struct LastDelivery {
     pub invoked_at: String,
 }
 
+/// The webhook adapter's ring state (inside `dispatch.json`): the
+/// burst still open — files rung, waiting for the bot's own drain —
+/// the doubling re-ring backoff (0 = no burst) and the failed-ring
+/// count behind the `webhook-failing` alarm.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RingState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) rung: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_at: Option<String>,
+    #[serde(default)]
+    pub(crate) backoff_ms: u64,
+    #[serde(default)]
+    pub(crate) failures: u32,
+}
+
 /// Per-seat dispatcher state (`<seat>/dispatch.json`), written
 /// atomically before any POST so a restart resumes exactly.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -50,6 +66,8 @@ pub struct DispatchState {
     pub last_delivery: Option<LastDelivery>,
     #[serde(default)]
     pub(crate) items: BTreeMap<String, ItemState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ring: Option<RingState>,
 }
 
 pub fn load_state(dir: &Path) -> DispatchState {
@@ -61,16 +79,28 @@ pub fn load_state(dir: &Path) -> DispatchState {
 
 static STATE_TMP: AtomicU64 = AtomicU64::new(0);
 
-/// Atomic state write: temp file, fsync, rename.
-pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
+/// Atomic private write, the board's standard shape (`seat.rs`
+/// `write_meta`): a fresh temp file (mode 0600, O_CREAT|O_EXCL) in the
+/// same directory, fsync, rename over the target, then fsync the
+/// directory so the rename itself is durable. Errors are returned,
+/// never ignored, and no scratch file is left behind.
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let mut json = serde_json::to_string_pretty(state)?.into_bytes();
-    json.push(b'\n');
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().unwrap_or(Path::new("."));
     let n = STATE_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".dispatch.json.{}-{n}.tmp", std::process::id()));
+    let tmp = dir.join(format!(
+        ".{}.{}-{n}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
     let write = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&json)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
     })();
@@ -78,7 +108,19 @@ pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(std::fs::rename(&tmp, dir.join(STATE_FILE))?)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    std::fs::File::open(dir)?.sync_all()?; // make the rename durable
+    Ok(())
+}
+
+/// Atomic state write (see `atomic_write_private`).
+pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
+    let mut json = serde_json::to_string_pretty(state)?.into_bytes();
+    json.push(b'\n');
+    atomic_write_private(&dir.join(STATE_FILE), &json)
 }
 
 /// Status's `awake`: dispatch.json records a delivery to this seat's
