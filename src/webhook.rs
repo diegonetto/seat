@@ -1,7 +1,9 @@
 //! The `webhook` adapter (item 4): the Grok bots drain the board
 //! themselves, so it never runs `receive` and never archives — it
 //! rings, and re-rings (1 min doubling to 1 h) until every rung
-//! message has left `inbox/` and `draining/`. Two modes, byte for
+//! message — a file in `inbox/`/`draining/` or a pending
+//! followed-room post — has been taken by the bot's drain. Two
+//! modes, byte for
 //! byte against today's scripts: **signal** (eng-grokbot,
 //! sales-grokbot; `wake-grokbot`) POSTs `{"schema_version":1,
 //! "seat":..,"ts":..,"nonce":..}` HMAC'd with `bridge.key`, never a
@@ -11,10 +13,12 @@
 //! with its attempted/delivered records; everything else gets the
 //! signal.
 use crate::alarm;
+use crate::drain;
 use crate::dstate::{atomic_write_private, load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
 use crate::identity::Bindings;
 use crate::msg;
+use crate::room;
 use crate::seat;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -174,9 +178,33 @@ pub(crate) fn present_files(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Would the scan give this seat a worker: any mail still present.
+/// What this seat still owes: the mail present in `inbox/` and
+/// `draining/`, plus the pending followed-room posts this seat's
+/// `receive` would accept — the bot's own drain takes those too, so a
+/// seat owing only a room post still has work. Each post rides as a
+/// name the age check parses, carrying its verified header fields:
+/// the header `ts` is the post's age (nothing requires it to match
+/// the file-name prefix). A post `receive` would refuse is not owed.
+pub(crate) fn owed_files(root: &Path, seat_name: &str) -> BTreeSet<String> {
+    let dir = seat::seat_dir(root, seat_name);
+    let mut owed = present_files(&dir);
+    for room_name in room::followed_rooms(&dir) {
+        let at = room::read_cursor(&dir, &room_name).unwrap_or_else(|_| "0".into());
+        for post in room::posts_since(root, &room_name, &at).unwrap_or_default() {
+            if let Ok(item) = drain::check_room_post(root, &room_name, &post) {
+                // A name the age check parses, carrying the verified
+                // header fields: the header `ts` is the post's age.
+                owed.insert(format!("{}-{}.msg", item.header.ts, item.header.id));
+            }
+        }
+    }
+    owed
+}
+
+/// Would the scan give this seat a worker: anything still owed —
+/// present mail, or a followed-room post `receive` would accept.
 pub(crate) fn has_work(root: &Path, seat_name: &str) -> bool {
-    !present_files(&seat::seat_dir(root, seat_name)).is_empty()
+    !owed_files(root, seat_name).is_empty()
 }
 
 /// Is this seat still webhook-routed? The full routing rule, not just
@@ -375,10 +403,11 @@ fn due_at(ring: &RingState, now: chrono::DateTime<chrono::Utc>) -> bool {
 }
 
 /// One pass for one webhook seat: ring on a burst of new mail, re-ring
-/// with the doubling backoff until every rung message has left
-/// `inbox/` and `draining/`. Three failed rings in a row are the
-/// `webhook-failing` alarm; mail older than 15 minutes is
-/// `undelivered` (both once per cause).
+/// with the doubling backoff until every rung message — a file in
+/// `inbox/`/`draining/` or a pending followed-room post — has been
+/// taken by the bot's drain. Three failed rings in a row are the
+/// `webhook-failing` alarm; owed mail older than 15 minutes by its
+/// header `ts` is `undelivered` (both once per cause).
 pub(crate) fn ring_pass(
     root: &Path,
     seat: &str,
@@ -390,7 +419,7 @@ pub(crate) fn ring_pass(
     let mut state = load_state(&dir);
     let mut ring = state.ring.clone().unwrap_or_default();
     let now = chrono::Utc::now();
-    let present = present_files(&dir);
+    let present = owed_files(root, seat);
     let delivered: BTreeSet<String> = if cfg.payload_mode {
         id_list(&dir.join("webhook-delivered.json"))
             .into_iter()
@@ -514,7 +543,7 @@ pub(crate) fn worker_loop(
                 .as_ref()
                 .map(|r| r.rung.iter().collect())
                 .unwrap_or_default();
-            let present = present_files(&dir);
+            let present = owed_files(&root, &seat);
             if present.is_empty()
                 || present.iter().any(|f| !rung.contains(f))
                 || deadline.is_some_and(|d| chrono::Utc::now() >= d.with_timezone(&chrono::Utc))
