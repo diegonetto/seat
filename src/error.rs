@@ -51,6 +51,9 @@ pub enum SeatError {
     #[error("seat '{0}' is busy: another drain holds its lock (gave up after 30s)")]
     SeatBusy(String),
 
+    #[error("another dispatcher holds the lock {0} (one dispatcher per board)")]
+    DispatchBusy(PathBuf),
+
     #[error("{0}")]
     Identity(String),
 

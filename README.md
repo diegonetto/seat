@@ -73,7 +73,10 @@ an error naming the seat. Drains of other seats never wait.
 ## Deliver to a hub session
 
 `dispatch` is the one service that delivers the board's mail. Run it
-long-running; `--once` runs a single scan pass. Every 2 s it scans the
+long-running; `--once` runs a single scan pass. It takes an exclusive,
+non-blocking lock on `<root>/dispatch.lock` for its whole life (`--once`
+included): one dispatcher per board, and a second dispatcher exits
+nonzero at once with one line naming the lock. Every 2 s it scans the
 seats and routes each one by configuration alone: a seat bound in
 `<root>/hapi-sessions.json` is `hapi` (even if it also holds webhook
 files), else a seat directory holding `webhook.url` is `webhook`, else
@@ -83,8 +86,12 @@ slow hub delays only its own seat, every HTTP request is bounded at
 key recorded in `<seat>/dispatch.json` atomically before anything is
 POSTed, so a crash resumes and a retry re-POSTs the same key. An item
 commits only when the hub reports it invoked while its session is
-still active; one line per delivery and one per failure land in
-`<root>/dispatch.log`.
+still active; a pass that finds the session inactive with items in
+flight moves them to fresh delivery keys and re-sends them once the
+session is active again (the hub marks queued messages invoked at
+session end, and a resume can keep the same session id — mail nobody
+read is never archived). One line per delivery and one per failure
+land in `<root>/dispatch.log`.
 
 ### The webhook adapter
 
@@ -110,7 +117,15 @@ hapi-bound. Two modes, byte for byte against the scripts they replace:
   config files on Slix is the cutover, not this code). Everything
   else — other senders, mail over 8 KiB, mail whose MAC does
   not verify — gets the signal, and while an attempted hq message is
-  still unread nothing at all is sent.
+  still unread nothing at all is sent. When the seat directory also
+  holds a marker file `<seat>/webhook.hq-ack`, each successful
+  payload delivery is followed by one best-effort receipt POST to hq:
+  `{"seat", "message_id"}` to `https://hq.bll.dev/ingest/seat-delivery`
+  with the Cloudflare Access headers (`CF-Access-Client-Id` /
+  `CF-Access-Client-Secret`) read from `~/.config/bll-ingest/env`,
+  User-Agent `bll-seat-mail/1 (Slix)`, 5 s timeout. A missing env
+  file or failed receipt is dropped — never resent — and the payload
+  delivery stands; the secret values are never logged.
 
 ### Alarms
 
@@ -181,6 +196,7 @@ the directory empty.
 <root>/seats/<name>/          meta.json, token, inbox/, archive/
 <root>/alarm-seat             the seat alarms are mailed to (one line;
                               absent or empty: the log line only)
+<root>/dispatch.lock          one dispatcher per board (non-blocking)
 <root>/dispatch.log           one line per delivery, failure, alarm
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)

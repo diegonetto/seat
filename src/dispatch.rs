@@ -9,7 +9,8 @@ use crate::alarm;
 use crate::board;
 use crate::drain::{self, Received};
 use crate::dstate::{
-    direct_key, direct_text, load_state, log_line, store_state, DispatchState, LastDelivery, Phase,
+    direct_key, direct_text, key_base, load_state, log_line, next_delivery_key, store_state,
+    DispatchState, ItemState, LastDelivery, Phase,
 };
 use crate::error::{Result, SeatError};
 use crate::hub::{Hub, HubConfig};
@@ -90,11 +91,17 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     for d in &received.directs {
         texts.insert(direct_key(seat, &d.file_name), direct_text(d));
     }
-    // A key whose file is gone (a manual drain took it) is pruned.
+    // A key whose file is gone (a manual drain took it) is pruned; a
+    // rotated key (a generation suffix) is its file's key too, so
+    // exactly one key per present file stays in flight. Item identity
+    // is the file; the delivery key is the hub `localId` and may be
+    // rotated (`next_delivery_key`).
     let before_prune = state.items.len();
-    state.items.retain(|k, _| texts.contains_key(k));
-    for k in texts.keys() {
-        state.items.entry(k.clone()).or_default();
+    state.items.retain(|k, _| texts.contains_key(key_base(k)));
+    for t in texts.keys() {
+        if !state.items.keys().any(|k| key_base(k) == t.as_str()) {
+            state.items.insert(t.clone(), ItemState::default());
+        }
     }
     if state.items.is_empty() {
         if before_prune > 0 {
@@ -128,6 +135,13 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
             alarm::SESSION_INACTIVE,
             &format!("session {session} is not active"),
         )?;
+        // Items in flight must not commit on an invoked mark the
+        // ending session made (see `rotate_in_flight`); one recorded
+        // Staged may be mail the hub accepted before a POST loop
+        // failed or crashed partway, so every in-flight item rotates.
+        if rotate_in_flight(&mut state) {
+            store_state(&dir, &state)?;
+        }
         log_line(
             root,
             "failure",
@@ -138,13 +152,42 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     }
     for (key, item) in state.items.iter_mut() {
         if item.phase == Phase::Staged {
-            hub.post_message(&session, key, &texts[key])?;
+            hub.post_message(&session, key, &texts[key_base(key)])?;
             item.phase = Phase::Posted;
             item.accepted_at = Some(seat::now_ts());
         }
     }
     store_state(&dir, &state)?;
     poll_round(root, seat, hub, &session, &mut state, &received, &texts)
+}
+
+/// A pass found the bound session inactive while items were in
+/// flight: move every in-flight item — any phase but Done, Posted
+/// included — to a fresh delivery key (`next_delivery_key` — a
+/// `localId` the hub has never seen) as Staged, so it is re-POSTed
+/// once the session is active again. Posted is not the whole story:
+/// the POST loop persists only after it succeeds, so a loop that
+/// failed partway (or a crash between POST and store) leaves mail the
+/// hub accepted recorded Staged — its key must move too, or the
+/// invoked mark the ending session left on it would archive unread
+/// mail after a resume. The hub dedupes on `(session, localId)`
+/// forever, so the old mark can never commit the new key, and only an
+/// invocation observed while the session was active ever does.
+/// Returns whether anything moved.
+fn rotate_in_flight(state: &mut DispatchState) -> bool {
+    let mut moved = false;
+    let old = std::mem::take(&mut state.items);
+    for (key, item) in old {
+        if item.phase != Phase::Done {
+            state
+                .items
+                .insert(next_delivery_key(&key), ItemState::default());
+            moved = true;
+        } else {
+            state.items.insert(key, item);
+        }
+    }
+    moved
 }
 
 /// One queued-state round: re-POST ids the hub lost, commit exactly
@@ -178,17 +221,31 @@ fn poll_round(
             }
         }
     }
-    if (!absent.is_empty() || !invoked.is_empty()) && !hub.session_active(session)? {
+    // The never-archive-unread rule: the session is gone while items
+    // are in flight. The hub marks queued messages invoked when a
+    // session ends, and a resume can keep the same session id, so an
+    // invoked mark observed around an inactive session was made by the
+    // ending session — nobody read that mail. Nothing commits on it
+    // and nothing re-POSTs on the old keys: every in-flight item gets
+    // a fresh delivery key and is re-sent once the session is active
+    // again; only an invocation observed while the session was active
+    // commits.
+    if !keys.is_empty() && !hub.session_active(session)? {
+        if rotate_in_flight(state) {
+            store_state(&dir, state)?;
+        }
         log_line(
             root,
             "failure",
             seat,
-            &format!("session {session} is no longer active; nothing committed or re-POSTed"),
+            &format!(
+                "session {session} is no longer active; in-flight mail moves to a fresh delivery key"
+            ),
         );
         return Ok(Pass::Blocked);
     }
     for key in &absent {
-        hub.post_message(session, key, &texts[key])?;
+        hub.post_message(session, key, &texts[key_base(key)])?;
         if let Some(item) = state.items.get_mut(key) {
             item.accepted_at = Some(seat::now_ts());
         }
@@ -226,7 +283,7 @@ fn poll_round(
 
 /// Commit exactly the invoked items under the seat lock: archive the
 /// invoked directs (a file already taken by a manual drain counts as
-/// done).
+/// done). A rotated key (a generation suffix) is its file's key.
 pub(crate) fn commit_invoked(
     root: &Path,
     seat: &str,
@@ -237,7 +294,8 @@ pub(crate) fn commit_invoked(
     let dir = seat::seat_dir(root, seat);
     let _lock = SeatLock::acquire(&dir, seat)?;
     for d in &received.directs {
-        if !invoked.contains(&direct_key(seat, &d.file_name)) {
+        let base = direct_key(seat, &d.file_name);
+        if !invoked.iter().any(|k| key_base(k) == base) {
             continue;
         }
         let to = dir.join("archive").join(&d.file_name);
@@ -287,9 +345,13 @@ extern "C" fn on_term(_sig: libc::c_int) {
 /// `seat dispatch [--once]`: scan every 2 s, one worker per routed
 /// seat with work; `--once` runs one scan and waits for its workers.
 /// SIGTERM (long-running mode only) sets the stop flag the workers
-/// observe after every pass and inside every sleep.
+/// observe after every pass and inside every sleep. The whole life of
+/// the command — `--once` included — holds an exclusive, non-blocking
+/// lock on `<root>/dispatch.lock`: one dispatcher per board, a second
+/// exits nonzero with the lock named.
 pub fn cmd_dispatch(root: &Path, once: bool) -> Result<()> {
     board::ensure_board(root)?;
+    let _guard = seat::DispatchLock::acquire(root)?;
     let stop = SHUTDOWN
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
         .clone();

@@ -158,6 +158,57 @@ impl Drop for SeatLock {
     }
 }
 
+/// The dispatcher's board lock file: `<root>/dispatch.lock`. One
+/// dispatcher per board, held for the whole life of `seat dispatch`
+/// (`--once` included), so two scanners never interleave over one
+/// board. Unlike the seat lock this one never waits.
+pub fn dispatch_lock_path(root: &Path) -> PathBuf {
+    root.join("dispatch.lock")
+}
+
+/// An exclusive, non-blocking `flock` on `<root>/dispatch.lock`, held
+/// for the guard's lifetime. A second dispatcher fails at once with
+/// the lock named; the lock is released when the guard drops (or the
+/// process dies).
+#[derive(Debug)]
+pub struct DispatchLock {
+    file: File,
+}
+
+impl DispatchLock {
+    /// Acquire without waiting: any other holder means another
+    /// dispatcher is running this board.
+    pub fn acquire(root: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dispatch_lock_path(root))?;
+        loop {
+            match flock_exclusive_nb(file.as_raw_fd()) {
+                Ok(()) => return Ok(DispatchLock { file }),
+                Err(e) => match e.raw_os_error() {
+                    // On Linux EWOULDBLOCK == EAGAIN; EINTR retries.
+                    Some(libc::EWOULDBLOCK) => {
+                        return Err(SeatError::DispatchBusy(dispatch_lock_path(root)))
+                    }
+                    Some(libc::EINTR) => {}
+                    _ => return Err(SeatError::Io(e)),
+                },
+            }
+        }
+    }
+}
+
+impl Drop for DispatchLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 /// The short metadata lock (a blocking `flock` on `<seat>/meta.lock`;
 /// holders only ever hold it for one read-modify-write).
 struct MetaLock {

@@ -10,7 +10,9 @@
 //! enabled by `<seat>/webhook.payload`) carries verified direct mail
 //! from the `inbox` seat in the body at most once per message id,
 //! with its attempted/delivered records; everything else gets the
-//! signal.
+//! signal. After each successful payload delivery, a marker file
+//! `<seat>/webhook.hq-ack` turns on the doorbell's hq receipt
+//! (`report_delivery`, ported unchanged; see `hq_receipt`).
 use crate::alarm;
 use crate::dstate::{atomic_write_private, load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
@@ -19,7 +21,7 @@ use crate::msg;
 use crate::seat;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +31,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const SLICE: Duration = Duration::from_millis(100);
 const MAX_BODY: usize = 8192; // the doorbell's cap on a message it carries
 const SUPPRESSED: &str = "no POST sent: an attempted hq message is still unread";
+/// The doorbell's `report_delivery`: where the hq receipt goes, and
+/// how long it may take.
+const HQ_INGEST_URL: &str = "https://hq.bll.dev/ingest/seat-delivery";
+const HQ_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Re-ring backoff (1 min doubling to 1 h; tests pass something tiny).
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +60,12 @@ pub(crate) struct WebhookConfig {
     pub(crate) key: String,
     pub(crate) authorization: Option<String>,
     pub(crate) payload_mode: bool,
+    /// Where the hq delivery receipt goes after a payload delivery:
+    /// the ingest URL when the seat directory holds the marker file
+    /// `webhook.hq-ack` (the same shape as `webhook.payload`), else
+    /// None — no receipts. `load` only ever stages the hardcoded
+    /// production URL; tests point it at the local receiver.
+    pub(crate) hq_ack_url: Option<String>,
 }
 
 /// The first line of a config file, trimmed (None when absent/empty).
@@ -92,6 +104,10 @@ impl WebhookConfig {
             key,
             authorization,
             payload_mode: dir.join("webhook.payload").exists(),
+            hq_ack_url: dir
+                .join("webhook.hq-ack")
+                .exists()
+                .then_some(HQ_INGEST_URL.to_string()),
         })
     }
 
@@ -102,12 +118,14 @@ impl WebhookConfig {
         key: String,
         authorization: Option<String>,
         payload_mode: bool,
+        hq_ack_url: Option<String>,
     ) -> WebhookConfig {
         WebhookConfig {
             url,
             key,
             authorization,
             payload_mode,
+            hq_ack_url,
         }
     }
 }
@@ -163,6 +181,74 @@ pub(crate) fn post(
     Err(format!(
         "webhook failed after {attempts} attempt(s) ({last})"
     ))
+}
+
+/// The Cloudflare Access service-token pair from
+/// `~/.config/bll-ingest/env`, exactly the doorbell's parse:
+/// `KEY=VALUE` lines (split at the first `=`), comment and other lines
+/// skipped. Missing values are an error that names nothing secret.
+fn ingest_env() -> std::result::Result<(String, String), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = home.join(".config").join("bll-ingest").join("env");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("no readable {}: {e}", path.display()))?;
+    let mut values = HashMap::new();
+    for line in raw.lines() {
+        if let Some((name, value)) = line.split_once('=') {
+            if !line.starts_with('#') {
+                values.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    match (
+        values.get("ACCESS_CLIENT_ID"),
+        values.get("ACCESS_CLIENT_SECRET"),
+    ) {
+        (Some(id), Some(secret)) => Ok((id.clone(), secret.clone())),
+        _ => Err("ACCESS_CLIENT_ID/ACCESS_CLIENT_SECRET missing from the ingest env".into()),
+    }
+}
+
+/// The doorbell's `report_delivery`, ported unchanged (enabled by the
+/// seat marker `webhook.hq-ack` instead of `KOTEK_HQ_ACK=1`): POST
+/// `{"seat", "message_id"}` to the hq ingest URL with the Access
+/// service-token headers from `~/.config/bll-ingest/env`, User-Agent
+/// `bll-seat-mail/1 (Slix)`, 5 s timeout. Best effort — the caller
+/// drops a failure (never resends it; the payload delivery stands) —
+/// and the secret values never reach a log.
+pub(crate) fn hq_receipt(
+    url: &str,
+    seat: &str,
+    message_id: &str,
+) -> std::result::Result<(), String> {
+    let (client_id, client_secret) = ingest_env()?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(HQ_RECEIPT_TIMEOUT))
+            .build(),
+    );
+    // The doorbell's `json.dumps` default separators: a space after
+    // each colon.
+    let body = format!(
+        "{{\"seat\": {}, \"message_id\": {}}}",
+        serde_json::to_string(seat).unwrap_or_default(),
+        serde_json::to_string(message_id).unwrap_or_default()
+    );
+    let resp = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "bll-seat-mail/1 (Slix)")
+        .header("CF-Access-Client-Id", client_id.as_str())
+        .header("CF-Access-Client-Secret", client_secret.as_str())
+        .send(&body);
+    match resp {
+        Ok(r) if (200..300).contains(&r.status().as_u16()) => Ok(()),
+        Ok(r) => Err(format!("HTTP {}", r.status().as_u16())),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// File names in `inbox/` and `draining/`: work the bot's own drain
@@ -341,6 +427,15 @@ pub(crate) fn ring_once(
                 save_id_list(&delivered_path, &delivered)
                     .map_err(|e| format!("recording the delivery failed: {e}"))?;
                 log_line(root, "delivered", seat, &format!("id={id} mode=payload"));
+                // The hq receipt (`webhook.hq-ack`), best effort: a
+                // failed receipt is dropped — never resent — and the
+                // delivery stands. No detail is logged, so no secret
+                // can leak.
+                if let Some(url) = &cfg.hq_ack_url {
+                    if hq_receipt(url, seat, &id).is_err() {
+                        log_line(root, "failure", seat, &format!("hq receipt {id} failed"));
+                    }
+                }
             }
             Err(e) => failures.push(format!("{id}: {e}")),
         }
