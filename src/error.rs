@@ -42,12 +42,6 @@ pub enum SeatError {
     #[error("seat {0} is not registered on this board")]
     UnknownSeat(String),
 
-    #[error("room {0} already exists on this board")]
-    RoomExists(String),
-
-    #[error("room {0} does not exist on this board (create it: seat room create {0})")]
-    NoSuchRoom(String),
-
     #[error("bad name {0:?}: letters, digits, '-', '_', '.' only; no leading dot; max 64 chars")]
     BadName(String),
 

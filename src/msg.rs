@@ -323,13 +323,6 @@ pub fn list_msg_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(names)
 }
 
-/// The sortable timestamp prefix of a `.msg` filename
-/// (`20260923T071412.123456-ab12cd34.msg` → `20260923T071412.123456`).
-pub fn ts_prefix(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    stem.split_once('-').map(|(ts, _)| ts.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

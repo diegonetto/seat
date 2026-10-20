@@ -20,7 +20,7 @@ A background process the board cannot see, because it has no pane and no dispatc
 
 ## Mail
 
-`mail=<N>` is the number of files in `seats/<name>/inbox`. It is printed on every row, including `pane`. It is not the roster's unread count (that count adds followed rooms). Mail does not change presence.
+`mail=<N>` is the number of files in `seats/<name>/inbox`. It is printed on every row, including `pane`. Mail does not change presence.
 
 ## Words that are gone
 

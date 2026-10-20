@@ -1,24 +1,9 @@
 use crate::board::{self};
 use crate::error::{Result, SeatError};
 use crate::msg;
-use crate::room;
 use crate::seat;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// What one drain delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Outcome {
-    pub direct: usize,
-    pub room: usize,
-}
-
-impl Outcome {
-    #[cfg_attr(not(test), allow(dead_code))] // kept for callers and tests
-    pub fn total(&self) -> usize {
-        self.direct + self.room
-    }
-}
 
 /// One verified direct message, staged in `draining/` and awaiting
 /// commit. `file_name` (timestamp plus id) is the delivery key the
@@ -30,45 +15,29 @@ pub struct ReceivedDirect {
     pub body: String,
 }
 
-/// One verified post from a followed room, past the seat's cursor.
-#[derive(Debug, Clone)]
-pub struct ReceivedRoom {
-    pub room: String,
-    /// The post's file name (timestamp plus id): the delivery key the
-    /// dispatcher will use (read by the next change, not this one).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub file_name: String,
-    pub header: msg::Header,
-    pub body: String,
-}
-
-/// What one `receive` found: the verified mail worth delivering, the
-/// failures it recorded instead, and the cursors to advance at commit.
+/// What one `receive` found: the verified mail worth delivering and
+/// the failures it recorded instead.
 ///
-/// `receive` never archives and never moves a cursor: a receive with
-/// no commit leaves every message recoverable by the next drain (good
-/// direct mail stays in `draining/`, room posts stay past the cursor).
+/// `receive` never archives: a receive with no commit leaves every
+/// message recoverable by the next drain (good direct mail stays in
+/// `draining/`).
 #[derive(Debug, Clone, Default)]
 pub struct Received {
     pub directs: Vec<ReceivedDirect>,
-    pub rooms: Vec<ReceivedRoom>,
     /// Failed verifications, in the order they were met (the first is
     /// the named error; the rest are printed on stderr).
     pub bad_marks: Vec<String>,
     /// Something unreadable was quarantined (no claimed sender to name).
     pub unreadable: bool,
-    /// room name → the newest post ts seen, to advance the cursor to at
-    /// commit (past skipped posts too, so they cannot wedge a seat).
-    pub room_cursors: Vec<(String, String)>,
 }
 
 /// The digest verb. Lock, receive, print, commit, unlock. Output, exit
 /// codes, quarantine behaviour and stderr wording are unchanged: good
-/// mail is archived, cursors advance and `last_drained` is stamped
-/// exactly as before even when `receive` recorded failures — then the
-/// command exits nonzero, so a bad message never wedges the next drain
-/// (T012, T013, FR-012).
-pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<Outcome> {
+/// mail is archived and `last_drained` is stamped exactly as before
+/// even when `receive` recorded failures — then the command exits
+/// nonzero, so a bad message never wedges the next drain (T012, T013,
+/// FR-012).
+pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
     seat::read_meta(&dir)?; // unknown/corrupt seat is a named error
@@ -79,7 +48,6 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<Outcom
 
     let received = receive(root, seat_name)?;
 
-    let mut outcome = Outcome::default();
     for d in &received.directs {
         writeln!(
             out,
@@ -88,17 +56,6 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<Outcom
         )?;
         writeln!(out, "{}", d.body)?;
         writeln!(out)?;
-        outcome.direct += 1;
-    }
-    for r in &received.rooms {
-        writeln!(
-            out,
-            "[room:{}] id={} from={} ts={}",
-            r.room, r.header.id, r.header.from, r.header.ts
-        )?;
-        writeln!(out, "{}", r.body)?;
-        writeln!(out)?;
-        outcome.room += 1;
     }
 
     commit(root, seat_name, &received)?;
@@ -114,7 +71,7 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<Outcom
     if received.unreadable {
         return Err(SeatError::Unreadable);
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Stage and verify everything the seat owes one delivery pass. The
@@ -122,9 +79,9 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<Outcom
 /// itself). Inbox mail moves to `draining/` first (leftovers from a
 /// crashed drain ride along), then each staged message is checked
 /// exactly as `drain` always has: the sender name, the sender's token,
-/// the HMAC, the destination. What fails is quarantined (direct mail)
-/// or recorded (room posts) — never delivered. Followed-room posts
-/// past the seat's cursors are verified the same way.
+/// the HMAC, the destination. What fails is quarantined — never
+/// delivered. Directories left over from before 0.7.0 (`<root>/rooms`,
+/// `<seat>/cursors`) are neither read nor written.
 pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -153,22 +110,18 @@ pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
         }
     }
 
-    receive_rooms(root, &dir, &mut received)?;
     Ok(received)
 }
 
-/// Archive the delivered direct messages, advance the room cursors,
-/// stamp `last_drained`. The caller holds the seat's drain lock. Runs
-/// even when `receive` recorded failures, so good mail is archived and
-/// the cursors move exactly as they always did.
+/// Archive the delivered direct messages, stamp `last_drained`. The
+/// caller holds the seat's drain lock. Runs even when `receive`
+/// recorded failures, so good mail is archived exactly as it always
+/// did.
 pub fn commit(root: &Path, seat_name: &str, received: &Received) -> Result<()> {
     let dir = seat::seat_dir(root, seat_name);
     for d in &received.directs {
         let archive = dir.join("archive").join(&d.file_name);
         std::fs::rename(dir.join("draining").join(&d.file_name), archive)?;
-    }
-    for (room_name, ts) in &received.room_cursors {
-        room::write_cursor(&dir, room_name, ts)?;
     }
     seat::update_meta(&dir, |meta| {
         meta.last_drained = Some(seat::now_ts());
@@ -222,103 +175,11 @@ fn check_direct(
     })
 }
 
-/// Why one followed-room post is not receivable.
-pub(crate) enum RoomPostFailure {
-    /// Mark (or envelope) does not verify; the claimed sender.
-    BadMark(String),
-    /// The post did not parse; no claimed sender to name.
-    Unreadable,
-}
-
-/// Verify one followed-room post exactly as `receive` does: it must
-/// parse, belong to the room it sits in, name a valid sender, and
-/// carry that sender's MAC. `Ok` for a post a pass would stage; `Err`
-/// names the failure — such a post is never staged and never gains a
-/// delivery key, so `fresh_work` must not wake a worker for it.
-pub(crate) fn check_room_post(
-    root: &Path,
-    room_name: &str,
-    path: &Path,
-) -> std::result::Result<ReceivedRoom, RoomPostFailure> {
-    let (header, body) = match msg::read_msg(path) {
-        Ok(x) => x,
-        Err(_) => {
-            return Err(match claimed_from(path) {
-                Some(from) => RoomPostFailure::BadMark(from),
-                None => RoomPostFailure::Unreadable,
-            })
-        }
-    };
-    if header.dest != room_name || board::valid_name(&header.from).is_err() {
-        return Err(RoomPostFailure::BadMark(header.from.clone()));
-    }
-    let verified = match crate::verbs::sender_token(root, &header.from) {
-        Ok(token) => msg::verify_msg(path, &token).unwrap_or(false),
-        Err(_) => false,
-    };
-    if !verified {
-        return Err(RoomPostFailure::BadMark(header.from.clone()));
-    }
-    Ok(ReceivedRoom {
-        room: room_name.to_string(),
-        file_name: file_name_of(path),
-        header,
-        body,
-    })
-}
-
-/// Collect new posts from every followed room, verified the same way
-/// as direct mail. A post whose mark does not verify is skipped and
-/// its claimed sender recorded; the cursor still advances past it
-/// (a bad post must not wedge a seat on every drain).
-fn receive_rooms(root: &Path, seat_dir: &Path, received: &mut Received) -> Result<()> {
-    for cursor_file in sorted_cursor_files(seat_dir)? {
-        let room_name = match cursor_file.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let cursor = room::read_cursor(seat_dir, &room_name)?;
-        let posts = room::posts_since(root, &room_name, &cursor)?;
-        let mut max_ts: Option<String> = None;
-        for p in posts {
-            if let Some(ts) = msg::ts_prefix(&p) {
-                max_ts = Some(match max_ts.take() {
-                    Some(prev) if prev >= ts => prev,
-                    _ => ts,
-                });
-            }
-            match check_room_post(root, &room_name, &p) {
-                Ok(item) => received.rooms.push(item),
-                Err(RoomPostFailure::BadMark(from)) => received.bad_marks.push(from),
-                Err(RoomPostFailure::Unreadable) => received.unreadable = true,
-            }
-        }
-        if let Some(ts) = max_ts {
-            received.room_cursors.push((room_name, ts));
-        }
-    }
-    Ok(())
-}
-
 fn file_name_of(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_string()
-}
-
-fn sorted_cursor_files(seat_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(seat_dir.join("cursors")) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(SeatError::Io(e)),
-    };
-    files.sort();
-    Ok(files)
 }
 
 /// `from` when the header parsed, including when the body is not UTF-8.
@@ -357,7 +218,7 @@ mod tests {
         root
     }
 
-    fn drain_str(root: &std::path::Path, seat: &str) -> (Result<Outcome>, String) {
+    fn drain_str(root: &std::path::Path, seat: &str) -> (Result<()>, String) {
         let mut buf = Vec::new();
         let r = drain(root, seat, &mut buf);
         (r, String::from_utf8(buf).unwrap())
@@ -372,7 +233,7 @@ mod tests {
         assert_eq!(msg::list_msg_dir(&inbox).unwrap().len(), 1);
 
         let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap(), Outcome { direct: 1, room: 0 });
+        r.unwrap();
         assert!(text.contains("hello board"));
         assert!(text.contains("[direct]"));
         assert!(msg::list_msg_dir(&inbox).unwrap().is_empty());
@@ -385,46 +246,50 @@ mod tests {
 
         // T012: a second, empty drain prints NOTHING and exits 0.
         let (r2, text2) = drain_str(&root, "beta");
-        assert!(r2.unwrap().total() == 0);
+        r2.unwrap();
         assert_eq!(text2, "", "empty drain prints nothing");
         let meta = seat::read_meta(&seat::seat_dir(&root, "beta")).unwrap();
         assert!(meta.last_drained.is_some());
     }
 
+    /// A board still carrying `rooms/` and `seats/*/cursors/` from
+    /// before 0.7.0 drains direct mail exactly as a fresh one: the
+    /// leftovers are neither read nor written, and their presence is
+    /// never an error.
     #[test]
-    fn room_posts_delivered_and_cursor_advances() {
+    fn leftover_room_directories_never_touch_a_drain() {
         let root = setup();
-        room::create(&root, "ops").unwrap();
-        room::cmd_post(&root, "ops", Some("alpha"), "room bulletin", None).unwrap();
-        room::cmd_follow(&root, "ops", "beta").unwrap();
+        std::fs::create_dir_all(root.join("rooms").join("ops")).unwrap();
+        std::fs::write(
+            root.join("rooms")
+                .join("ops")
+                .join("20260101T000000.000000-deadbeef.msg"),
+            "old post",
+        )
+        .unwrap();
+        let cursors = seat::seat_dir(&root, "beta").join("cursors");
+        std::fs::create_dir_all(&cursors).unwrap();
+        std::fs::write(cursors.join("ops"), "0").unwrap();
 
+        verbs::cmd_send(&root, Some("alpha"), "beta", "plain mail", None).unwrap();
         let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap(), Outcome { direct: 0, room: 1 });
-        assert!(text.contains("room bulletin"));
+        r.unwrap();
+        assert!(text.contains("plain mail"));
+        assert!(
+            !text.contains("[room"),
+            "no room lines on a 0.7.0 board: {text}"
+        );
 
-        // Cursor advanced past the post: second drain sees nothing.
+        // Untouched on disk.
+        assert_eq!(
+            std::fs::read_to_string(cursors.join("ops")).unwrap(),
+            "0",
+            "the leftover cursor was not written"
+        );
+        assert!(root.join("rooms/ops").is_dir());
         let (r2, text2) = drain_str(&root, "beta");
-        assert_eq!(r2.unwrap().total(), 0);
+        r2.unwrap();
         assert_eq!(text2, "");
-
-        // New posts arrive, old ones do not repeat.
-        room::cmd_post(&root, "ops", Some("alpha"), "second bulletin", None).unwrap();
-        let (r3, text3) = drain_str(&root, "beta");
-        assert_eq!(r3.unwrap().room, 1);
-        assert!(text3.contains("second bulletin"));
-        assert!(!text3.contains("room bulletin"));
-    }
-
-    #[test]
-    fn followed_room_post_prints_even_when_inbox_is_empty() {
-        let root = setup();
-        room::create(&root, "ops").unwrap();
-        room::cmd_post(&root, "ops", Some("alpha"), "empty inbox bulletin", None).unwrap();
-        room::cmd_follow(&root, "ops", "beta").unwrap();
-
-        let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap(), Outcome { direct: 0, room: 1 });
-        assert!(text.contains("empty inbox bulletin"));
     }
 
     #[test]
@@ -494,7 +359,7 @@ mod tests {
         std::fs::write(&tmp, "half-\n\nwritten").unwrap();
 
         let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap(), Outcome { direct: 1, room: 0 });
+        r.unwrap();
         assert!(text.contains("real mail"));
         assert!(!text.contains("half-"));
         // Not delivered, not quarantined, not touched: the writer owns it.
@@ -520,59 +385,6 @@ mod tests {
         let err = r.unwrap_err();
         assert!(matches!(err, SeatError::BadMark(_)), "{err}");
         assert!(!text.contains("forged body"));
-    }
-
-    #[test]
-    fn room_post_with_wrong_dest_is_a_bad_mark() {
-        let root = setup();
-        room::create(&root, "ops").unwrap();
-        let token = verbs::sender_token(&root, "alpha").unwrap();
-        // Valid MAC from a real seat, but dest is not the room it sits in.
-        msg::write_msg(
-            &room::room_dir(&root, "ops"),
-            "not-ops",
-            "alpha",
-            &token,
-            "misfiled",
-            None,
-        )
-        .unwrap();
-        room::cmd_follow(&root, "ops", "beta").unwrap();
-
-        let (r, text) = drain_str(&root, "beta");
-        let err = r.unwrap_err();
-        assert!(
-            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
-            "{err}"
-        );
-        assert!(!text.contains("misfiled"));
-        // Cursor advanced past it: a bad post does not wedge the seat.
-        let (r2, text2) = drain_str(&root, "beta");
-        assert!(r2.is_ok());
-        assert_eq!(text2, "");
-    }
-
-    #[test]
-    fn tampered_room_post_names_from_and_exits_nonzero() {
-        let root = setup();
-        room::create(&root, "ops").unwrap();
-        room::cmd_post(&root, "ops", Some("alpha"), "room original", None).unwrap();
-        room::cmd_follow(&root, "ops", "beta").unwrap();
-        let p = room::posts(&root, "ops")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let raw = std::fs::read_to_string(&p).unwrap();
-        std::fs::write(&p, raw.replace("room original", "room tampered")).unwrap();
-
-        let (r, text) = drain_str(&root, "beta");
-        let err = r.unwrap_err();
-        assert!(
-            matches!(err, SeatError::BadMark(ref f) if f == "alpha"),
-            "{err}"
-        );
-        assert!(!text.contains("room tampered"), "{text}");
     }
 
     #[test]
@@ -605,25 +417,26 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 let r = drain(&root2, "beta", &mut buf);
-                (r, String::from_utf8(buf).unwrap(), t)
+                (r.is_ok(), String::from_utf8(buf).unwrap(), t)
             }));
         }
-        let mut delivered = 0usize;
         let mut bodies: Vec<String> = Vec::new();
         for h in handles {
-            let (r, text, _t) = h.join().unwrap();
-            let outcome = r.unwrap();
-            delivered += outcome.direct;
+            let (ok, text, _t) = h.join().unwrap();
+            assert!(ok, "a concurrent drain failed");
             for line in text.lines() {
                 if !line.starts_with('[') && !line.is_empty() && line.starts_with("mail ") {
                     bodies.push(line.to_string());
                 }
             }
         }
-        assert_eq!(delivered, N, "each message delivered exactly once");
         bodies.sort();
         bodies.dedup();
-        assert_eq!(bodies.len(), N, "bodies: {bodies:?}");
+        assert_eq!(
+            bodies.len(),
+            N,
+            "each message delivered exactly once: {bodies:?}"
+        );
         // Nothing stranded mid-flight, everything archived exactly once.
         let dir = seat::seat_dir(&root, "beta");
         assert!(msg::list_msg_dir(&dir.join("inbox")).unwrap().is_empty());
@@ -639,7 +452,7 @@ mod tests {
         verbs::cmd_send(&root, Some("alpha"), "beta", "held seat", None).unwrap();
         let dir = seat::seat_dir(&root, "beta");
         let held = seat::SeatLock::acquire(&dir, "beta").unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<(Result<Outcome>, String)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(Result<()>, String)>();
         let root2 = root.clone();
         let waiter = std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -652,33 +465,24 @@ mod tests {
         drop(held);
         let (r, text) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         waiter.join().unwrap();
-        assert_eq!(r.unwrap().direct, 1);
+        r.unwrap();
         assert!(text.contains("held seat"));
     }
 
     /// receive with no commit leaves every message recoverable by the
-    /// next drain: good direct mail stays in draining/, room posts stay
-    /// past the (unadvanced) cursor, and last_drained is not stamped.
+    /// next drain: good direct mail stays in draining/, and
+    /// last_drained is not stamped.
     #[test]
     fn receive_without_commit_is_recoverable() {
         let root = setup();
-        room::create(&root, "ops").unwrap();
-        room::cmd_post(&root, "ops", Some("alpha"), "room recover", None).unwrap();
-        room::cmd_follow(&root, "ops", "beta").unwrap();
         verbs::cmd_send(&root, Some("alpha"), "beta", "direct recover", None).unwrap();
 
         let received = receive(&root, "beta").unwrap();
         assert_eq!(received.directs.len(), 1);
-        assert_eq!(received.rooms.len(), 1);
         assert!(received.bad_marks.is_empty() && !received.unreadable);
 
-        // Every delivered item carries its file name: timestamp plus id.
-        for name in received
-            .directs
-            .iter()
-            .map(|d| d.file_name.as_str())
-            .chain(received.rooms.iter().map(|r| r.file_name.as_str()))
-        {
+        // The delivered item carries its file name: timestamp plus id.
+        for name in received.directs.iter().map(|d| d.file_name.as_str()) {
             assert!(
                 name.ends_with(".msg")
                     && name.split_once('-').is_some_and(|(ts, _)| {
@@ -692,25 +496,23 @@ mod tests {
             );
         }
 
-        // Nothing archived, no cursor written, no last_drained stamped.
+        // Nothing archived, no last_drained stamped.
         let dir = seat::seat_dir(&root, "beta");
         assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
-        assert_eq!(room::read_cursor(&dir, "ops").unwrap(), "0");
         let meta = seat::read_meta(&dir).unwrap();
         assert!(meta.last_drained.is_none());
 
         // The next drain recovers everything exactly once.
         let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap(), Outcome { direct: 1, room: 1 });
+        r.unwrap();
         assert!(text.contains("direct recover"));
-        assert!(text.contains("room recover"));
         assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 0);
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
     }
 
-    /// One quarantined message does not stop the good mail: commit runs,
-    /// the good messages are archived, the cursor advances, and drain
-    /// still exits nonzero with today's stderr.
+    /// One quarantined message does not stop the good mail: commit
+    /// runs, the good messages are archived, and drain still exits
+    /// nonzero with today's stderr.
     #[test]
     fn quarantined_message_still_archives_the_good_ones() {
         let root = setup();
@@ -758,7 +560,7 @@ mod tests {
             seat::SeatLock::acquire(&seat::seat_dir(&root, "gamma"), "gamma").unwrap();
         let started = std::time::Instant::now();
         let (r, text) = drain_str(&root, "beta");
-        assert_eq!(r.unwrap().direct, 1);
+        r.unwrap();
         assert!(text.contains("other seat"));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),

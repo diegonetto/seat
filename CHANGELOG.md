@@ -2,6 +2,16 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.7.0] - 2026-10-20
+
+### Removed
+
+- Seat rooms (BLL-110): the `seat room` verbs (`create`, `post`, `read`, `follow`, `list`) and every room path behind them — `drain`'s room receive and cursor handling, the dispatcher's room-post delivery (`fresh_work`, the room-cursor commit), and the webhook adapter's room-post owed mail. The data said so: 4 rooms held 188 posts, all between 2026-10-08 and 2026-10-15 and none since, while direct mail ran 15 to 877 messages a day and no skill, switchboard code or hq read path used rooms; the instruction files that sent seats to rooms changed already. Old data stays on disk untouched: `<root>/rooms/` and `seats/*/cursors/` are no longer read or written (`init` no longer creates them), nothing in normal operation (`drain`, `dispatch`, `send`) deletes them, and `seat drain` never errors because they exist; `seat reset` still removes them with the rest of the board — a leftover `rooms/` and the cursors inside `seats/`, as the burn switch always did.
+
+### Changed
+
+- The alarm sink: the five causes, once-per-cause latching and `dispatch.log` line are unchanged, but instead of posting to the room `blacklite-factory` each alarm now sends one direct message from seat `sb-watch` to the seat named in `<root>/alarm-seat` (one line; same body). When that file is absent or empty the alarm is the log line only; a file naming a seat that is not on the board is a failed sink — one `alarm-post-failed` line, the cause stays latched. 0.6.0 was never deployed, so the room-based sink never goes live.
+
 ## [0.6.0] - 2026-10-20
 
 ### Added

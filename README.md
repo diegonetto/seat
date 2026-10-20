@@ -44,7 +44,7 @@ the inbox.
 
 ## Verbs
 
-`init`, `register`, `send`, `drain`, `dispatch`, `room`, `up`, `down`,
+`init`, `register`, `send`, `drain`, `dispatch`, `up`, `down`,
 `gallery`, `status`, `reset`. An unknown verb exits 2 and prints this list.
 
 ```
@@ -53,7 +53,6 @@ seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [-- CMD...]
 seat send [--from <from>] <to> <body>
 seat drain --seat <name>
 seat dispatch [--once]
-seat room create|post|read|follow|list
 seat up [name...]
 seat down [name...]
 seat gallery
@@ -109,27 +108,28 @@ hapi-bound. Two modes, byte for byte against the scripts they replace:
   `<seat>/webhook-attempted.json` and `<seat>/webhook-delivered.json`
   (moved from the doorbell's `--runtime` directory; moving kotek's
   config files on Slix is the cutover, not this code). Everything
-  else — other senders, rooms, mail over 8 KiB, mail whose MAC does
+  else — other senders, mail over 8 KiB, mail whose MAC does
   not verify — gets the signal, and while an attempted hq message is
   still unread nothing at all is sent.
 
 ### Alarms
 
 Five causes, each latched once (one line in `<root>/dispatch.log` and
-one post to the room `blacklite-factory` as seat `sb-watch`) until the
-condition clears and returns: `undelivered` (an item of that seat
-older than 15 minutes still undelivered), `session-inactive` (the
-bound session is 404 or not active), `no-answer` (the hub does not
-answer for that seat's session), `hub-auth` (the hub refuses auth —
-board-wide), and `webhook-failing` (3 failed rings in a row). The
-fired set persists in `<root>/dispatch-alarms.json`; a successful hub
-response clears `no-answer` and `hub-auth` even when it reports the
-session inactive.
+one direct message from seat `sb-watch` to the seat named in
+`<root>/alarm-seat` — one line; when that file is absent or empty the
+alarm is the log line only) until the condition clears and returns:
+`undelivered` (an item of that seat older than 15 minutes still
+undelivered), `session-inactive` (the bound session is 404 or not
+active), `no-answer` (the hub does not answer for that seat's
+session), `hub-auth` (the hub refuses auth — board-wide), and
+`webhook-failing` (3 failed rings in a row). The fired set persists
+in `<root>/dispatch-alarms.json`; a successful hub response clears
+`no-answer` and `hub-auth` even when it reports the session inactive.
 
 ### The identity rule on `--from`
 
-`send` and `room post` accept an optional `--from`. Who the message is
-from is decided like this:
+`send` accepts an optional `--from`. Who the message is from is
+decided like this:
 
 - Sessions are bound to seats by `<root>/hapi-sessions.json` (written by
   seat-role; a missing or unreadable file means no bindings). When the
@@ -140,8 +140,7 @@ from is decided like this:
   `--from` behaves exactly as `--from` always did.
 - An omitted `--from` on `send` means the message goes as `inbox`, and
   only to a factory seat: a seat named in `hapi-sessions.json`. Any
-  other destination is refused. In rooms there is no implicit sender:
-  an unbound caller must give `--from`.
+  other destination is refused.
 - An unbound sender that has a `HAPI_SESSION_ID` writes it as an
   optional `session` field in the message header, covered by the
   message HMAC like the other header fields: the MAC input is
@@ -170,19 +169,27 @@ minutes (read from `<seat>/dispatch.json`; status never asks the hub).
 that seat's inbox. It is printed on every row. Mail does not change
 presence.
 
-`seat reset` removes the marker, `seats/`, and `rooms/`. It removes the
-root directory only when that leaves the directory empty.
+`seat reset` removes the marker, `seats/` (the room cursors inside
+it included), and any leftover `rooms/` from before 0.7.0 (when rooms
+were removed). It removes the root directory only when that leaves
+the directory empty.
 
 ## Board
 
 ```
 <root>/marker                 the literal seat
 <root>/seats/<name>/          meta.json, token, inbox/, archive/
-<root>/rooms/<name>/          posted messages
+<root>/alarm-seat             the seat alarms are mailed to (one line;
+                              absent or empty: the log line only)
 <root>/dispatch.log           one line per delivery, failure, alarm
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
 ```
+
+A board from before 0.7.0 may still carry `<root>/rooms/` and
+`seats/<name>/cursors/`; nothing reads or writes them, and nothing in
+normal operation (`drain`, `dispatch`, `send`) deletes them. Only
+`seat reset` removes them, with the rest of the board.
 
 A command other than `init` refuses a directory it does not recognize
 and names the path.

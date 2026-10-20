@@ -31,10 +31,6 @@ pub fn seats_dir(root: &Path) -> PathBuf {
     root.join("seats")
 }
 
-pub fn rooms_dir(root: &Path) -> PathBuf {
-    root.join("rooms")
-}
-
 pub fn marker_path(root: &Path) -> PathBuf {
     root.join("marker")
 }
@@ -46,8 +42,8 @@ pub fn marker_ok(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Seat and room names become path components: alphanumeric plus
-/// `-`, `_`, `.`, no leading dot, max 64 chars. Rejected names are the
+/// Seat names become path components: alphanumeric plus `-`, `_`,
+/// `.`, no leading dot, max 64 chars. Rejected names are the
 /// named BadName error, never a path traversal.
 pub fn valid_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -83,6 +79,8 @@ fn is_empty_dir(root: &Path) -> Result<bool> {
 /// Create the board. A missing root is created here and nowhere else.
 /// An empty directory is not refused; a non-empty root without our
 /// marker is (init included). Idempotent when the marker is `seat`.
+/// 0.7.0 removed rooms: a `rooms/` directory is no longer created (a
+/// leftover from before is never read, written, or deleted here).
 pub fn init(root: &Path) -> Result<()> {
     if root.exists() {
         if !root.is_dir() || (!is_empty_dir(root)? && !marker_ok(root)) {
@@ -95,12 +93,12 @@ pub fn init(root: &Path) -> Result<()> {
         std::fs::write(marker_path(root), MARKER)?;
     }
     std::fs::create_dir_all(seats_dir(root))?;
-    std::fs::create_dir_all(rooms_dir(root))?;
     Ok(())
 }
 
 /// The burn switch (FR-010): remove `marker`, `seats/`, and `rooms/`
-/// under the root. The root itself is deleted only when that leaves it
+/// (a leftover from before 0.7.0, so a burned board is clean) under
+/// the root. The root itself is deleted only when that leaves it
 /// empty. Works on a root this program does not recognize.
 pub fn reset(root: &Path) -> Result<()> {
     match std::fs::remove_file(marker_path(root)) {
@@ -108,7 +106,7 @@ pub fn reset(root: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(SeatError::Io(e)),
     }
-    for dir in [seats_dir(root), rooms_dir(root)] {
+    for dir in [seats_dir(root), root.join("rooms")] {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -141,7 +139,10 @@ mod tests {
             MARKER
         );
         assert!(root.join("seats").is_dir());
-        assert!(root.join("rooms").is_dir());
+        assert!(
+            !root.join("rooms").exists(),
+            "0.7.0 creates no rooms/ (they are gone)"
+        );
         assert!(marker_ok(&root));
     }
 
@@ -225,8 +226,19 @@ mod tests {
         assert!(root.exists(), "root kept: not empty");
         assert!(!marker_path(&root).exists());
         assert!(!seats_dir(&root).exists());
-        assert!(!rooms_dir(&root).exists());
         assert!(root.join("keep-me").is_file());
+    }
+
+    /// `reset` still burns a leftover `rooms/` from before 0.7.0: the
+    /// burn switch leaves a clean board.
+    #[test]
+    fn reset_removes_a_leftover_rooms_directory() {
+        let root = temp_root("board-reset-rooms");
+        init(&root).unwrap();
+        std::fs::create_dir_all(root.join("rooms").join("ops")).unwrap();
+        std::fs::write(root.join("rooms").join("ops").join("old"), "0.6.0 data").unwrap();
+        reset(&root).unwrap();
+        assert!(!root.join("rooms").exists());
     }
 
     #[test]
