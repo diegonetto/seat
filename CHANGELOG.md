@@ -2,6 +2,19 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.7.2] - 2026-10-20
+
+### Fixed
+
+- `session_active` read the hub's `active` at the top level of the
+  `GET /api/sessions/<id>` answer; the live hub nests it inside a
+  `session` object (`{"session": {..., "active": true, ...}}`), so at
+  the 2026-10-20 cutover every bound session read "not active" and
+  every pass re-logged it — no mail was lost, but none was delivered
+  either. The flag is now read from `session.active` (a top-level
+  `active` is still accepted), and the fake hub in the tests answers
+  the nested shape, so the miss cannot hide again.
+
 ## [0.7.1] - 2026-10-20
 
 ### Fixed

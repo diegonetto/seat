@@ -1,6 +1,6 @@
 [package]
 name = "seat"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Offline agent-to-agent mail plus a tmux supervisor for each agent's stored command"
 repository = "https://github.com/diegonetto/seat"

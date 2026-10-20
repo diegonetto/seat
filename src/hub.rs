@@ -216,15 +216,21 @@ impl Hub {
     }
 
     /// `GET /api/sessions/<id>`: false on 404 or `active` not true.
-    /// The dispatcher never calls `/resume`.
+    /// The live hub nests the flag (`{"session":{...,"active":..}}`);
+    /// a top-level `active` is still accepted. The dispatcher never
+    /// calls `/resume`.
     pub fn session_active(&mut self, session_id: &str) -> Result<bool> {
         let url = format!("{}/api/sessions/{session_id}", self.cfg.base);
         let mut resp = self.call("GET", &url, "")?;
         match resp.status().as_u16() {
-            200 => Ok(Self::json_body(&mut resp)?
-                .get("active")
-                .and_then(|a| a.as_bool())
-                .unwrap_or(false)),
+            200 => {
+                let body = Self::json_body(&mut resp)?;
+                let active = body
+                    .get("session")
+                    .and_then(|s| s.get("active"))
+                    .or_else(|| body.get("active"));
+                Ok(active.and_then(|a| a.as_bool()).unwrap_or(false))
+            }
             404 => Ok(false),
             c => Err(SeatError::Hub(format!(
                 "GET session {session_id}: status {c}"
@@ -309,5 +315,25 @@ mod tests {
             (cfg.base.as_str(), cfg.token.as_str()),
             ("http://127.0.0.1:9999", "file-token")
         );
+    }
+
+    /// The live hub nests the flag under `session`; `session_active`
+    /// reads it there (a top-level `active` still accepted), and a 404
+    /// reads false.
+    #[test]
+    fn session_active_reads_the_flag_where_the_hub_puts_it() {
+        let hub = crate::testutil::fakehub::FakeHub::start();
+        {
+            let mut ctl = hub.ctl.lock().unwrap();
+            ctl.sessions.insert("nested-true".into(), true);
+            ctl.sessions.insert("nested-false".into(), false);
+            ctl.get_bodies
+                .insert("flat-true".into(), "{\"active\":true}".into());
+        }
+        let mut client = Hub::new(hub.config());
+        assert!(client.session_active("nested-true").unwrap());
+        assert!(!client.session_active("nested-false").unwrap());
+        assert!(client.session_active("flat-true").unwrap());
+        assert!(!client.session_active("absent").unwrap());
     }
 }

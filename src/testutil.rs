@@ -91,6 +91,7 @@ pub mod fakehub {
     use std::sync::{Arc, Mutex};
 
     /// The scripted behavior: sessions (id → active, absent = 404),
+    /// exact GET bodies (id → raw JSON, overriding the active flag),
     /// marks (localId → "queued"|"indeterminate"|"invoked"; no entry =
     /// the hub lost it), hung sessions, banned JWTs, sessions to flip
     /// inactive when queued-state is first asked, localIds whose
@@ -98,6 +99,7 @@ pub mod fakehub {
     #[derive(Default)]
     pub struct HubCtl {
         pub sessions: BTreeMap<String, bool>,
+        pub get_bodies: BTreeMap<String, String>,
         pub marks: BTreeMap<String, String>,
         pub hang: BTreeSet<String>,
         pub banned_jwts: BTreeSet<String>,
@@ -216,11 +218,23 @@ pub mod fakehub {
             return;
         }
         match (method.as_str(), action) {
-            ("GET", "") => match ctl.sessions.get(&session) {
-                Some(true) => respond(&mut writer, 200, "{\"active\":true}"),
-                Some(false) => respond(&mut writer, 200, "{\"active\":false}"),
-                None => respond(&mut writer, 404, "{}"),
-            },
+            ("GET", "") => {
+                if let Some(raw) = ctl.get_bodies.get(&session) {
+                    respond(&mut writer, 200, raw);
+                } else {
+                    // The live hub's shape — the flag nested under
+                    // `session`. A plain top-level `active` here once
+                    // hid the parse the dispatcher runs against the
+                    // real hub.
+                    match ctl.sessions.get(&session) {
+                        Some(true) => respond(&mut writer, 200, "{\"session\":{\"active\":true}}"),
+                        Some(false) => {
+                            respond(&mut writer, 200, "{\"session\":{\"active\":false}}")
+                        }
+                        None => respond(&mut writer, 404, "{}"),
+                    }
+                }
+            }
             ("POST", "messages") => {
                 let key = json["localId"].as_str().unwrap_or_default().to_string();
                 ctl.journal.push(format!("POST-MSG {session} {key}"));
