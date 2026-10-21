@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+"""One ttyd per factory seat, bound to 127.0.0.1, attaching that seat's tmux pane.
+
+The root page on port 7700 is a grid: a static HTML document with one iframe
+per seat, and each iframe loads that seat's own ttyd page. Nothing attaches
+to a tiled window anymore.
+
+Shift+Enter on the page is translated. tmux 3.4 with extended-keys off drops
+the real Shift+Enter sequence, and the seats that are already up were created
+that way. LF (Ctrl+J) is the newline Claude Code, Codex, Antigravity, and
+OpenCode document for every terminal. Grok uses Ctrl+J to scroll and documents
+Alt+Enter (ESC CR) when Shift+Enter is not a distinct key. The glm seat runs
+OpenCode, so it gets LF.
+
+ttyd is the 1.7.7 release binary at ~/.local/share/pane-door/ttyd-1.7.7.
+The wrapper refuses a different file. It never passes ttyd -a, -c, or -S.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+TTYD_SHA256 = "8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55"
+XTERM_SHA256 = "1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495"
+XTERM_CSS_SHA256 = "ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6"
+FIT_SHA256 = "bdaefa370b1bfc42ee88d46fe6072400902a4d4b2d45cd93438dda9b23c97089"
+
+PORT_BASE = 7701
+ROOT_NAME = "root"
+ROOT_PORT = 7700
+SEAT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+PANE_RE = re.compile(r"^%\d+$")
+SOCKET_RE = re.compile(r"^/[A-Za-z0-9._@+/-]+$")
+
+# (bytes sent for Shift+Enter, short name printed by plan)
+NEWLINES = {
+    "claude": ((10,), "ctrl-j"),
+    "codex": ((10,), "ctrl-j"),
+    "agy": ((10,), "ctrl-j"),
+    "opencode": ((10,), "ctrl-j"),
+    "glm": ((10,), "ctrl-j"),
+    "grok": ((27, 13), "alt-enter"),
+}
+DEFAULT_NEWLINE = ((10,), "ctrl-j")
+
+
+def kit_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def vendor_dir() -> Path:
+    override = os.environ.get("PANE_DOOR_VENDOR")
+    if override:
+        return Path(override)
+    return kit_dir() / "assets" / "pane-door"
+
+
+def state_dir() -> Path:
+    override = os.environ.get("PANE_DOOR_STATE")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "pane-door"
+
+
+def runtimes_dir() -> Path:
+    override = os.environ.get("PANE_DOOR_RUNTIMES") or os.environ.get("SEAT_RUNTIMES")
+    if override:
+        return Path(override)
+    return Path.home() / "Projects" / ".seat-runtimes"
+
+
+def ttyd_path() -> Path:
+    override = os.environ.get("PANE_DOOR_TTYD")
+    if override:
+        return Path(override)
+    return state_dir() / "ttyd-1.7.7"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"pane-door: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_file(path: Path, expected: str | None) -> None:
+    if not path.is_file():
+        fail(f"missing {path}")
+    if expected is None:
+        return
+    found = sha256_file(path)
+    if found != expected:
+        fail(f"{path} sha256 {found} does not match the pinned {expected}")
+
+
+def require_vendor() -> dict[str, Path]:
+    root = vendor_dir()
+    files = {
+        "xterm": root / "xterm.js",
+        "css": root / "xterm.css",
+        "fit": root / "addon-fit.js",
+        "client": root / "client.js",
+    }
+    require_file(files["xterm"], XTERM_SHA256)
+    require_file(files["css"], XTERM_CSS_SHA256)
+    require_file(files["fit"], FIT_SHA256)
+    require_file(files["client"], None)
+    return files
+
+
+def require_ttyd() -> Path:
+    path = ttyd_path()
+    pinned = os.environ.get("PANE_DOOR_TTYD") is None
+    require_file(path, TTYD_SHA256 if pinned else None)
+    return path
+
+
+def run_text(argv: list[str]) -> str:
+    try:
+        out = subprocess.run(argv, check=False, capture_output=True, text=True)
+    except OSError as err:
+        fail(f"cannot run {argv[0]}: {err}")
+    if out.returncode != 0:
+        detail = (out.stderr or out.stdout or "").strip()
+        fail(f"{' '.join(argv)} failed: {detail}")
+    return out.stdout
+
+
+def seat_names() -> list[str]:
+    sb = os.environ.get("PANE_DOOR_SB", "sb")
+    text = run_text([sb, "seats", "--names"])
+    names = []
+    for line in text.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if not SEAT_RE.fullmatch(name):
+            fail(f"seat map has a name this door will not serve: {name!r}")
+        names.append(name)
+    if not names:
+        fail("seat map is empty")
+    return names
+
+
+def newline_for(harness: str) -> tuple[tuple[int, ...], str]:
+    return NEWLINES.get(harness, DEFAULT_NEWLINE)
+
+
+def attach_script(tmux: str, socket: str, target: str) -> str:
+    # One command: this client attaches that pane, and the browser grid sizes it.
+    if not PANE_RE.fullmatch(target):
+        fail(f"a seat door needs a pane id, got {target!r}")
+    return f"exec {tmux} -S {socket} attach -t {target}"
+
+
+def ttyd_argv(binary: Path, port: int, seat: str, page: Path, socket: str, target: str, base: str) -> list[str]:
+    tmux = os.environ.get("PANE_DOOR_TMUX", "tmux")
+    argv = [
+        str(binary),
+        "-i", "127.0.0.1",
+        "-p", str(port),
+    ]
+    if base:
+        argv += ["-b", base]
+    argv += [
+        "-W",
+        "-O",
+        "-m", "1",
+        "-P", "5",
+        "-I", str(page),
+        "--",
+        "sh", "-c", attach_script(tmux, socket, target),
+    ]
+    return argv
+
+
+def strip_source_map(text: str) -> str:
+    # Do not split the whole file. xterm's bundle contains raw control
+    # characters inside strings, and str.splitlines() treats some of those
+    # as line breaks, which would put a real newline inside a JS string.
+    marker = "\n//# sourceMappingURL="
+    index = text.rfind(marker)
+    if index == -1:
+        return text
+    return text[:index]
+
+
+def build_page(seat: str, newline: tuple[int, ...], label: str, vendor: dict[str, Path]) -> str:
+    css = strip_source_map(vendor["css"].read_text())
+    xterm = strip_source_map(vendor["xterm"].read_text())
+    fit = strip_source_map(vendor["fit"].read_text())
+    client = vendor["client"].read_text()
+    client = client.replace("__SEAT__", json.dumps(seat))
+    client = client.replace("__NEWLINE__", json.dumps(list(newline)))
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{seat}</title>\n"
+        f'<style>\n{css}\n'
+        "html,body{margin:0;height:100%;background:#000;color:#ccc;"
+        "font:13px ui-monospace,monospace;}\n"
+        "#term{position:absolute;inset:0;overflow:hidden;}\n"
+        ".xterm .xterm-viewport{overflow-y:hidden;scrollbar-width:none}\n"
+        ".xterm .xterm-viewport::-webkit-scrollbar{display:none;width:0;height:0}\n"
+        "#status{position:absolute;left:8px;bottom:6px;z-index:2;color:#9a9a9a;}\n"
+        "</style>\n"
+        "</head>\n"
+        f'<body data-seat="{seat}" data-newline="{label}">\n'
+        '<div id="term"></div>\n'
+        '<div id="status">connecting</div>\n'
+        f"<script>\n{xterm}\n</script>\n"
+        f"<script>\n{fit}\n</script>\n"
+        f"<script>\n{client}\n</script>\n"
+        "</body>\n</html>\n"
+    )
+
+
+# Tabler arrows-maximize and arrows-minimize, outline, MIT. Same 16px stroke
+# as the terminal mark on the board. No box around the glyph.
+EXPAND_ICON = (
+    '<svg class="expand" width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+    'aria-hidden="true">'
+    '<path d="M16 4l4 0l0 4"/>'
+    '<path d="M14 10l6 -6"/>'
+    '<path d="M8 20l-4 0l0 -4"/>'
+    '<path d="M4 20l6 -6"/>'
+    '<path d="M16 20l4 0l0 -4"/>'
+    '<path d="M14 14l6 6"/>'
+    '<path d="M8 4l-4 0l0 4"/>'
+    '<path d="M4 4l6 6"/>'
+    "</svg>"
+)
+RESTORE_ICON = (
+    '<svg class="restore" width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+    'aria-hidden="true">'
+    '<path d="M5 9l4 0l0 -4"/>'
+    '<path d="M3 3l6 6"/>'
+    '<path d="M5 15l4 0l0 4"/>'
+    '<path d="M3 21l6 -6"/>'
+    '<path d="M19 9l-4 0l0 -4"/>'
+    '<path d="M15 9l6 -6"/>'
+    '<path d="M19 15l-4 0l0 4"/>'
+    '<path d="M15 15l6 6"/>'
+    "</svg>"
+)
+
+
+def build_grid(names: list[str]) -> str:
+    # One tile per seat, in seat order, each iframe loading that seat's own page.
+    # The script picks the column count whose cells sit nearest 2:1, places each
+    # tile in its own cell, and toggles one tile to fill the window. No websocket,
+    # no off-page asset, no key listener: Escape belongs to the agent.
+    cells = []
+    for seat in names:
+        cells.append(
+            '<div class="tile">\n'
+            f'<iframe src="/{seat}/" title="{seat}"></iframe>\n'
+            f'<button type="button" aria-label="Expand {seat}">'
+            f"{EXPAND_ICON}{RESTORE_ICON}</button>\n"
+            "</div>\n"
+        )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>factory seats</title>\n"
+        "<style>\n"
+        "html,body,main{height:100%;overflow:hidden;}\n"
+        "html,body{margin:0;background:#000;color:#ccc;"
+        "font:13px ui-monospace,monospace;}\n"
+        "main{display:grid;gap:4px;box-sizing:border-box;padding:4px;"
+        "grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr);}\n"
+        ".tile{position:relative;min-width:0;min-height:0;background:#000;}\n"
+        ".tile.full{position:fixed;inset:0;z-index:10;}\n"
+        "iframe{display:block;width:100%;height:100%;border:0;background:#000;}\n"
+        "button{position:absolute;top:6px;right:6px;z-index:2;width:16px;height:16px;"
+        "padding:0;border:0;background:transparent;color:#9a9a9a;cursor:pointer;}\n"
+        "button svg{display:block;}\n"
+        "button .restore{display:none;}\n"
+        ".tile.full button .expand{display:none;}\n"
+        ".tile.full button .restore{display:block;}\n"
+        "button:hover,button:focus-visible{color:#ccc;}\n"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n<main>\n"
+        + "".join(cells)
+        + "</main>\n"
+        "<script>\n"
+        "(function () {\n"
+        '  const main = document.querySelector("main");\n'
+        '  const tiles = Array.from(main.querySelectorAll(".tile"));\n'
+        "  const n = tiles.length;\n"
+        "  function layout() {\n"
+        "    if (!n) return;\n"
+        "    const w = main.clientWidth, h = main.clientHeight;\n"
+        "    let cols = 1, best = Infinity;\n"
+        "    for (let c = 1; c <= n; c++) {\n"
+        "      const r = Math.ceil(n / c);\n"
+        "      const score = Math.abs(Math.log((w / c) / (h / r) / 2));\n"
+        "      if (score < best) { best = score; cols = c; }\n"
+        "    }\n"
+        "    const rows = Math.ceil(n / cols);\n"
+        '    main.style.gridTemplateColumns = "repeat(" + cols + ",minmax(0,1fr))";\n'
+        '    main.style.gridTemplateRows = "repeat(" + rows + ",minmax(0,1fr))";\n'
+        "    // Every tile holds its own cell, so a tile lifted to fill the window\n"
+        "    // leaves the others where they are and their sessions keep their size.\n"
+        "    tiles.forEach((tile, i) => {\n"
+        "      const col = i % cols, row = Math.floor(i / cols);\n"
+        "      const span = i === n - 1 ? cols - col : 1;\n"
+        '      tile.style.gridRow = String(row + 1);\n'
+        '      tile.style.gridColumn = (col + 1) + " / span " + span;\n'
+        "    });\n"
+        "  }\n"
+        "  tiles.forEach((tile) => {\n"
+        '    const button = tile.querySelector("button");\n'
+        '    const frame = tile.querySelector("iframe");\n'
+        '    button.addEventListener("click", () => {\n'
+        '      const full = tile.classList.toggle("full");\n'
+        '      button.setAttribute("aria-label", full ? "Show every seat" : "Expand " + frame.title);\n'
+        "      if (frame.contentWindow) frame.contentWindow.focus();\n"
+        "    });\n"
+        "  });\n"
+        '  window.addEventListener("resize", layout);\n'
+        "  layout();\n"
+        "})();\n"
+        "</script>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def read_target(seat: str) -> tuple[dict | None, str | None]:
+    path = runtimes_dir() / seat / "wake-target.json"
+    if not path.is_file():
+        return None, "no wake-target"
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None, "wake-target is not json"
+    socket = data.get("socket")
+    pane = data.get("pane")
+    if not isinstance(socket, str) or SOCKET_RE.fullmatch(socket) is None:
+        return None, "wake-target socket is not a tmux socket path"
+    if not isinstance(pane, str) or PANE_RE.fullmatch(pane) is None:
+        return None, "wake-target pane is not a pane id"
+    harness = data.get("harness")
+    if not isinstance(harness, str):
+        harness = ""
+    data["harness"] = harness
+    return data, None
+
+
+def pane_listed(socket: str, pane: str) -> bool:
+    tmux = os.environ.get("PANE_DOOR_TMUX", "tmux")
+    try:
+        out = subprocess.run(
+            [tmux, "-S", socket, "list-panes", "-a", "-F", "#{pane_id}"],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError as err:
+        fail(f"cannot run tmux: {err}")
+    if out.returncode != 0:
+        return False
+    return pane in out.stdout.split()
+
+
+def resolve_wanted(argv: list[str]) -> tuple[list[str], list[str]]:
+    names = seat_names()
+    if not argv:
+        return names, names
+    bad = [name for name in argv if name not in names]
+    if bad:
+        for name in bad:
+            print(f"pane-door: {name} is not on the seat map", file=sys.stderr)
+        raise SystemExit(2)
+    seen = []
+    for name in argv:
+        if name not in seen:
+            seen.append(name)
+    return names, seen
+
+
+def pid_path() -> Path:
+    return state_dir() / "pids.json"
+
+
+def load_pids() -> dict:
+    path = pid_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_pids(data: dict) -> None:
+    path = pid_path()
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def cmdline(pid: int) -> bytes:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return b""
+
+
+def pid_is_grid(pid: int) -> bool:
+    raw = cmdline(pid)
+    return raw.endswith(b"\0grid") or b"\0grid\0" in raw
+
+
+def stop_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def stop_if_redirect(known: dict | None) -> bool:
+    # The old door left a listener on 7707. The next full up or down stops
+    # that process and does not start another.
+    if not isinstance(known, dict) or not isinstance(known.get("pid"), int):
+        return False
+    raw = cmdline(known["pid"])
+    if raw.endswith(b"\0redirect") or b"\0redirect\0" in raw:
+        stop_pid(known["pid"])
+        return True
+    return False
+
+
+def ensure_grid(names: list[str]) -> bool:
+    # Tests set PANE_DOOR_STATE and must not bind the live root port.
+    if os.environ.get("PANE_DOOR_STATE"):
+        return False
+    pids = load_pids()
+    # The retired gallery ttyd also held port 7700. Stop it before the grid binds.
+    old = pids.pop("terminals", None)
+    if isinstance(old, dict) and isinstance(old.get("pid"), int) and pid_is_door(old["pid"], "terminals"):
+        stop_pid(old["pid"])
+    stop_if_redirect(pids.pop("redirect", None))
+    save_pids(pids)
+    known = pids.get(ROOT_NAME)
+    if isinstance(known, dict) and isinstance(known.get("pid"), int) and pid_is_grid(known["pid"]):
+        if known.get("seats") == names:
+            return True
+        stop_pid(known["pid"])
+        pids.pop(ROOT_NAME, None)
+        save_pids(pids)
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "grid"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        fail("the root grid exited")
+    pids[ROOT_NAME] = {"pid": proc.pid, "port": ROOT_PORT, "seats": names}
+    save_pids(pids)
+    return True
+
+
+def cmd_grid() -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    page_path = state_dir() / "pages" / f"{ROOT_NAME}.html"
+    try:
+        page = page_path.read_bytes()
+    except OSError:
+        fail(f"missing {page_path}")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path != "/":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(page)
+
+        def do_HEAD(self) -> None:
+            self.do_GET()
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+    ThreadingHTTPServer(("127.0.0.1", ROOT_PORT), Handler).serve_forever()
+
+
+def pid_is_door(pid: int, seat: str) -> bool:
+    raw = cmdline(pid)
+    if not raw:
+        return False
+    return b"ttyd" in raw and f"/{seat}".encode() in raw and b"127.0.0.1" in raw
+
+
+def root_row(names: list[str], pages: Path, write: bool) -> dict:
+    page = pages / f"{ROOT_NAME}.html"
+    if write:
+        page.write_text(build_grid(names))
+        os.chmod(page, 0o644)
+    return {
+        "seat": ROOT_NAME,
+        "port": ROOT_PORT,
+        "url": f"http://127.0.0.1:{ROOT_PORT}/",
+        "seats": names,
+        "page": str(page),
+        "root": True,
+        "skip": None,
+    }
+
+
+def describe(names: list[str], wanted: list[str], binary: Path, vendor: dict[str, Path] | None, write: bool, root: bool):
+    rows = []
+    pages = state_dir() / "pages"
+    if write:
+        pages.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if root:
+        rows.append(root_row(names, pages, write))
+    for index, seat in enumerate(names):
+        port = PORT_BASE + index
+        if seat not in wanted:
+            continue
+        target, reason = read_target(seat)
+        if reason:
+            rows.append({"seat": seat, "port": port, "skip": reason})
+            continue
+        if not pane_listed(target["socket"], target["pane"]):
+            rows.append({"seat": seat, "port": port, "skip": "pane is not in tmux"})
+            continue
+        newline, label = newline_for(target["harness"])
+        page = pages / f"{seat}.html"
+        if write:
+            if vendor is None:
+                fail("page vendor was not loaded")
+            page.write_text(build_page(seat, newline, label, vendor))
+            os.chmod(page, 0o644)
+        rows.append({
+            "seat": seat,
+            "port": port,
+            "url": f"http://127.0.0.1:{port}/{seat}/",
+            "newline": label,
+            "socket": target["socket"],
+            "pane": target["pane"],
+            "page": str(page),
+            "base": f"/{seat}",
+            "argv": ttyd_argv(binary, port, seat, page, target["socket"], target["pane"], f"/{seat}"),
+            "skip": None,
+        })
+    return rows
+
+
+def print_row(row: dict) -> None:
+    if row.get("skip"):
+        print(f"pane-door: {row['seat']} skipped: {row['skip']}", file=sys.stderr)
+        return
+    if row.get("root"):
+        print(f"{row['seat']}  {row['url']}  grid")
+        return
+    print(f"{row['seat']}  {row['url']}  shift+enter={row['newline']}")
+
+
+def cmd_plan(argv: list[str]) -> None:
+    binary = require_ttyd()
+    names, wanted = resolve_wanted(argv)
+    for row in describe(names, wanted, binary, None, write=False, root=not argv):
+        print_row(row)
+
+
+def ingress_path(name: str) -> str:
+    return "^/" + name.replace(".", "\\.") + "($|/)"
+
+
+def cmd_ingress(argv: list[str]) -> None:
+    if argv:
+        fail("ingress takes no seat names")
+    names = seat_names()
+    print("# not applied. This prints the map and does not change DNS.")
+    print("# The grid page is the root.")
+    print("ingress:")
+    for index, seat in enumerate(names):
+        print("  - hostname: tmux.bll.dev")
+        print(f"    path: '{ingress_path(seat)}'")
+        print(f"    service: http://127.0.0.1:{PORT_BASE + index}")
+    print("  - hostname: tmux.bll.dev")
+    print("    path: '^/$'")
+    print(f"    service: http://127.0.0.1:{ROOT_PORT}")
+    print("  - service: http_status:404")
+
+
+def cmd_up(argv: list[str]) -> None:
+    binary = require_ttyd()
+    vendor = require_vendor()
+    names, wanted = resolve_wanted(argv)
+    rows = describe(names, wanted, binary, vendor, write=True, root=not argv)
+    pids = load_pids()
+    started = 0
+    for row in rows:
+        print_row(row)
+        if row.get("skip") or row.get("root"):
+            continue
+        seat = row["seat"]
+        known = pids.get(seat)
+        if isinstance(known, dict):
+            pid = known.get("pid")
+            alive = isinstance(pid, int) and pid_is_door(pid, seat)
+            # The zoom door recorded view=pane and no attach field. Require
+            # attach so the next up replaces that script instead of leaving it.
+            identity = (
+                known.get("pane") == row["pane"]
+                and known.get("view") == "pane"
+                and known.get("attach") == "pane"
+            )
+            if alive and identity and known.get("port") == row["port"]:
+                started += 1
+                continue
+            if alive:
+                os.kill(pid, signal.SIGTERM)
+        log_path = state_dir() / f"{seat}.log"
+        log_handle = log_path.open("ab")
+        try:
+            proc = subprocess.Popen(
+                row["argv"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=str(state_dir()),
+            )
+        finally:
+            log_handle.close()
+        time.sleep(0.3)
+        if proc.poll() is not None:
+            tail = log_path.read_text(errors="replace")[-500:].strip()
+            print(f"pane-door: {seat} ttyd exited: {tail}", file=sys.stderr)
+            continue
+        record = {"pid": proc.pid, "port": row["port"], "base": row.get("base", "")}
+        record["pane"] = row["pane"]
+        record["view"] = "pane"
+        record["attach"] = "pane"
+        pids[seat] = record
+        save_pids(pids)
+        started += 1
+    if not argv:
+        if ensure_grid(names):
+            started += 1
+    if started == 0:
+        fail("no door is listening")
+
+
+def cmd_down() -> None:
+    pids = load_pids()
+    for seat, known in list(pids.items()):
+        if not isinstance(known, dict) or not isinstance(known.get("pid"), int):
+            pids.pop(seat, None)
+            continue
+        pid = known["pid"]
+        if seat == "redirect":
+            if stop_if_redirect(known):
+                print(f"{seat}  stopped")
+            pids.pop(seat, None)
+            continue
+        if seat == ROOT_NAME:
+            owns = pid_is_grid(pid)
+        else:
+            owns = pid_is_door(pid, seat)
+        if not owns:
+            pids.pop(seat, None)
+            continue
+        stop_pid(pid)
+        pids.pop(seat, None)
+        print(f"{seat}  stopped")
+    save_pids(pids)
+
+
+def main(argv: list[str]) -> None:
+    if not argv or argv[0] in {"-h", "--help"}:
+        print("usage: pane-door up [seat...] | down | plan [seat...] | ingress | grid")
+        raise SystemExit(0 if argv else 2)
+    command, rest = argv[0], argv[1:]
+    if command == "up":
+        cmd_up(rest)
+    elif command == "down":
+        if rest:
+            fail("down takes no seat names")
+        cmd_down()
+    elif command == "plan":
+        cmd_plan(rest)
+    elif command == "ingress":
+        cmd_ingress(rest)
+    elif command == "grid":
+        if rest:
+            fail("grid takes no arguments")
+        cmd_grid()
+    else:
+        fail(f"unknown command {command}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

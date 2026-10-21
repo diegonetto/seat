@@ -1,0 +1,21 @@
+# Localhost doors onto the seat panes. Stopping this unit runs `pane-door down`,
+# which stops every seat ttyd and the root grid on 7700.
+# The tmux server is not a child of this unit.
+# Install:
+#   cp ~/Projects/seat/kit/systemd/pane-door.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now pane-door.service
+[Unit]
+Description=Localhost doors onto the factory seat panes
+After=seat-gallery.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/Projects
+ExecStart=%h/Projects/seat/kit/scripts/pane-door up
+ExecStop=%h/Projects/seat/kit/scripts/pane-door down
+
+[Install]
+WantedBy=default.target

@@ -2,6 +2,21 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.7.3] - 2026-10-20
+
+### Added
+
+- `kit/`, the seat's host kit, moved from the agent-skills library
+  (the skill `seat-arm`) unchanged in behaviour: `seat-role` (wake a
+  role's seat and link its phone session, plus `pins`), `seat-sit`
+  (the stored pane command), `seat-gallery-up` (boot), `pane-door`
+  with its vendored xterm assets (the localhost web terminal grid),
+  the two systemd user units, and the kit's unittest suites. Paths
+  inside the copies now name `kit/` (`%h/Projects/seat/kit/...` in
+  the units); the live units and the board's stored `seat-sit`
+  command still point at the agent-skills copy until the follow-up
+  cutover. `kit/` is excluded from the crate package, like `specs/`.
+
 ## [0.7.2] - 2026-10-20
 
 ### Fixed

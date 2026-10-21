@@ -1,0 +1,27 @@
+# Start the factory's panes after Slix boots, then link each HAPI session and report its result in the journal. Before this, a Windows
+# restart brought every service back but left the seats down until someone ran `seat up` by hand (2026-10-14).
+# `seat up` is idempotent (a second call does not duplicate a running seat), so starting this while they run is a no-op.
+# Install:
+#   cp ~/Projects/seat/kit/systemd/seat-gallery.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable seat-gallery.service
+[Unit]
+Description=Factory seats up after boot (seat up for the gallery seats, after the HAPI hub)
+After=hapi-hub.service hapi-runner.service network-online.target
+Wants=hapi-hub.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The tmux server that `seat up` starts lives in this unit's cgroup: stopping or restarting the unit must never kill it.
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/Projects
+# Give the hub a moment to listen before the wrapped seats connect to it.
+ExecStartPre=/bin/sleep 5
+# The map names the seats. The script starts each pane, links sessions serially,
+# and reports failures after attempting every seat. seat up skips running panes; a wake restarts only a
+# running plain seat it moves under HAPI.
+ExecStart=%h/Projects/seat/kit/scripts/seat-gallery-up
+
+[Install]
+WantedBy=default.target

@@ -6,8 +6,9 @@
 //! byte against today's scripts: **signal** (eng-grokbot,
 //! sales-grokbot; `wake-grokbot`) POSTs `{"schema_version":1,
 //! "seat":..,"ts":..,"nonce":..}` HMAC'd with `bridge.key`, never a
-//! message body; **payload** (kotek-grokbot; `grok-doorbell.py`;
-//! enabled by `<seat>/webhook.payload`) carries verified direct mail
+//! message body; **payload mode** (kotek-grokbot; enabled by
+//! `<seat>/webhook.payload`; the contract came from the retired
+//! `grok-doorbell.py`) carries verified direct mail
 //! from the `inbox` seat in the body at most once per message id,
 //! with its attempted/delivered records; everything else gets the
 //! signal. After each successful payload delivery, a marker file
