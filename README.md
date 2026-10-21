@@ -108,13 +108,14 @@ hapi-bound. Two modes, byte for byte against the scripts they replace:
   `{"schema_version":1,"seat":<seat>,"ts":<UTC ts>,"nonce":<32 hex>}`
   with `X-Memo-Signature: sha256=<HMAC-SHA256 of the body with
   bridge.key>` — never a message body.
-- **payload** (`grok-doorbell.py`, kotek-grokbot; enabled by a marker
-  file `<seat>/webhook.payload`): verified direct mail from the
+- **payload mode** (kotek-grokbot; enabled by a marker file
+  `<seat>/webhook.payload`; the contract came from the retired
+  `grok-doorbell.py`): verified direct mail from the
   `inbox` seat rides in the body at most once per message id, with its
   attempted/delivered records kept in the seat directory as
   `<seat>/webhook-attempted.json` and `<seat>/webhook-delivered.json`
-  (moved from the doorbell's `--runtime` directory; moving kotek's
-  config files on Slix is the cutover, not this code). Everything
+  (moved from the retired script's `--runtime` directory; moving
+  kotek's config files on Slix is the cutover, not this code). Everything
   else — other senders, mail over 8 KiB, mail whose MAC does
   not verify — gets the signal, and while an attempted hq message is
   still unread nothing at all is sent. When the seat directory also
@@ -209,6 +210,30 @@ normal operation (`drain`, `dispatch`, `send`) deletes them. Only
 
 A command other than `init` refuses a directory it does not recognize
 and names the path.
+
+## Kit
+
+`kit/` is the home of the seat's host scripts, moved unchanged in
+behaviour from the agent-skills library. One line each:
+
+- `kit/scripts/seat-role` — wake one role's seat and link its phone
+  (HAPI) session, answering one JSON result, or report why it cannot;
+  `seat-role pins` reports each seat's model and effort drift.
+- `kit/scripts/seat-sit` — the stored pane command for a gallery seat:
+  it records the pane target, then replaces itself with the harness.
+- `kit/scripts/seat-gallery-up` — boot: start every seat's pane, then
+  link each session through the normal wake path.
+- `kit/scripts/pane-door` — one localhost ttyd per seat pane plus the
+  root grid on `127.0.0.1:7700`; its vendored xterm files are in
+  `kit/assets/pane-door/`.
+- `kit/systemd/` — the user units: `seat-gallery.service` (boot) and
+  `pane-door.service` (the doors).
+- `kit/tests/` — the kit's unittest suites; run each `*_test.py` with
+  `python3`.
+
+`kit/` is not part of the crate package. The live units and the
+board's stored `seat-sit` command still point at the agent-skills copy
+until the follow-up cutover repoints them here.
 
 ## Tests
 

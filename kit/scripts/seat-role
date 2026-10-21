@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# One JSON result; no waiter, resume, or background process.
+set -euo pipefail
+exec python3 -I "$(dirname -- "${BASH_SOURCE[0]}")/seat-role.py" "$@"

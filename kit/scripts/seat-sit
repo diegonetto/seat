@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Stored pane command for one gallery seat: seat-sit <seat>.
+# Records the pane target (pane.pid, wake-target.json) for the wake and
+# pane-door lookups, then replaces this process with the harness so the
+# tmux pane pid stays the harness and seat down stops it.
+set -u
+
+SEAT="${1:-}"
+RUNTIME="${SEAT_RUNTIMES:-/home/slix/Projects/.seat-runtimes}/${SEAT}"
+
+case "$SEAT" in
+  ""|.*|*[!A-Za-z0-9._-]*)
+    printf 'seat-sit: bad seat name\n' >&2
+    exit 1
+    ;;
+esac
+
+HARNESS="$RUNTIME/harness.json"
+if [ ! -f "$HARNESS" ]; then
+  printf 'seat-sit: missing %s\n' "$HARNESS" >&2
+  exit 1
+fi
+if [ -z "${TMUX_PANE:-}" ] || [ -z "${TMUX:-}" ]; then
+  printf 'seat-sit: not inside a tmux pane\n' >&2
+  exit 1
+fi
+
+mkdir -p "$RUNTIME"
+printf '%s\n' "$$" >"$RUNTIME/pane.pid"
+
+mapfile -d '' -t LAUNCH < <(python3 - "$SEAT" "$RUNTIME" "$HARNESS" "$$" "${TMUX_PANE}" "${TMUX%%,*}" <<'PY'
+import datetime, json, pathlib, sys
+seat, runtime, harness_path, pane_pid, pane, socket = sys.argv[1:]
+harness = json.loads(pathlib.Path(harness_path).read_text())
+argv = harness.get("argv") or []
+cwd = harness.get("cwd") or ""
+if not argv or not cwd.startswith("/"):
+    sys.stderr.write("seat-sit: harness.json needs an absolute cwd and an argv\n")
+    sys.exit(1)
+index_path = pathlib.Path.home() / ".codex" / "session_index.jsonl"
+known = []
+if harness.get("harness") == "codex":
+    if index_path.is_file():
+        for line in index_path.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("id"):
+                known.append(rec["id"])
+    lock_dir = pathlib.Path.home() / ".codex" / "thread-writer-locks"
+    if lock_dir.is_dir():
+        for lock in lock_dir.glob("*.lock"):
+            if lock.name.endswith(".lock"):
+                known.append(lock.name[:-5])
+target = {
+    "seat": seat,
+    "socket": socket,
+    "pane": pane,
+    "pane_pid": int(pane_pid),
+    "harness": harness.get("harness") or "",
+    "session": harness.get("session") or "",
+    "codex": (harness.get("codex_bin") or argv[0]) if harness.get("harness") == "codex" else "",
+    "cwd": cwd,
+    "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "session_index": str(index_path),
+    "session_ids_before": known,
+}
+path = pathlib.Path(runtime) / "wake-target.json"
+tmp = path.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(target) + "\n")
+tmp.replace(path)
+out = sys.stdout.buffer
+out.write(cwd.encode() + b"\0")
+for arg in argv:
+    out.write(str(arg).encode() + b"\0")
+PY
+)
+if [ "${#LAUNCH[@]}" -lt 2 ]; then
+  printf 'seat-sit: harness launch is incomplete\n' >&2
+  exit 1
+fi
+CWD="${LAUNCH[0]}"
+ARGV=("${LAUNCH[@]:1}")
+
+if ! cd -- "$CWD"; then
+  exit 1
+fi
+exec -- "${ARGV[@]}"
