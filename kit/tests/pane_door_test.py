@@ -318,3 +318,64 @@ class PaneDoorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DoorSessionTest(unittest.TestCase):
+    """ensure_door_session against a scripted tmux: the fake answers display/has-session from a
+    small table and records every mutating call, so group selection and recreation are checked."""
+
+    def run_with(self, table):
+        import tempfile, textwrap, json as _json
+        root = Path(tempfile.mkdtemp())
+        log = root / "calls.jsonl"
+        fake = root / "tmux"
+        fake.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import json, sys
+            table = {table!r}
+            args = sys.argv[1:]
+            with open({str(log)!r}, "a") as f: f.write(json.dumps(args) + "\\n")
+            if "display" in args:
+                key = (args[args.index("-t") + 1], args[-1]); print(table.get(key, "")); sys.exit(0 if key in table else 1)
+            if "has-session" in args:
+                sys.exit(0 if args[-1] in table.get("sessions", ()) else 1)
+            if "select-window" in args:
+                sys.exit(0 if args[-1].split(":")[-1] in table.get("windows", ()) else 1)
+            sys.exit(0)
+            """))
+        fake.chmod(0o755)
+        os.environ["PANE_DOOR_TMUX"] = str(fake)
+        try:
+            DOOR.ensure_door_session("/tmp/tmux-1/default", "grok-main", "%8")
+        finally:
+            os.environ.pop("PANE_DOOR_TMUX", None)
+        return [_json.loads(l) for l in log.read_text().splitlines()]
+
+    def test_new_door_joins_the_panes_group_and_selects_its_window(self):
+        calls = self.run_with({("%8", "#{session_group}"): "swarm", ("%8", "#{session_name}"): "swarm",
+                               ("%8", "#{window_id}"): "@3", "windows": ("@3",)})
+        kinds = [c[2] for c in calls]
+        self.assertIn("new-session", kinds)
+        self.assertNotIn("kill-session", kinds)
+        self.assertEqual(calls[-1][2:], ["select-window", "-t", "door-grok-main:@3"])
+
+    def test_door_in_another_group_is_recreated(self):
+        calls = self.run_with({("%8", "#{session_group}"): "swarm", ("%8", "#{session_name}"): "swarm",
+                               ("%8", "#{window_id}"): "@3", ("=door-grok-main", "#{session_group}"): "other",
+                               "sessions": ("=door-grok-main",), "windows": ("@3",)})
+        kinds = [c[2] for c in calls]
+        self.assertIn("kill-session", kinds)
+        self.assertIn("new-session", kinds)
+
+    def test_ungrouped_pane_recreates_a_surviving_door(self):
+        calls = self.run_with({("%8", "#{session_group}"): "", ("%8", "#{session_name}"): "swarm",
+                               ("%8", "#{window_id}"): "@3", ("=door-grok-main", "#{session_group}"): "stale",
+                               "sessions": ("=door-grok-main",), "windows": ("@3",)})
+        kinds = [c[2] for c in calls]
+        self.assertIn("kill-session", kinds)
+        self.assertIn("new-session", kinds)
+
+    def test_failed_window_select_fails_the_up(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_with({("%8", "#{session_group}"): "swarm", ("%8", "#{session_name}"): "swarm",
+                           ("%8", "#{window_id}"): "@3", "windows": ()})

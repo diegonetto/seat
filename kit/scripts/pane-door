@@ -191,12 +191,16 @@ def ensure_door_session(socket: str, seat: str, pane: str) -> None:
     window = _tmux_read(tmux, socket, "display", "-p", "-t", pane, "#{window_id}")
     if not owner or not window:
         fail(f"{seat}: no tmux session holds pane {pane}")
-    have = _tmux_read(tmux, socket, "display", "-p", "-t", "=" + name, "#{session_group}")
-    if have and group and have != group:
+    exists = subprocess.run([tmux, "-S", socket, "has-session", "-t", "=" + name],
+                            check=False, capture_output=True).returncode == 0
+    have = _tmux_read(tmux, socket, "display", "-p", "-t", "=" + name, "#{session_group}") if exists else ""
+    # The door must sit in the pane's group. An ungrouped pane has no group yet, so a surviving
+    # door session is always recreated against it; a door in another group is recreated too.
+    if exists and (not group or have != group):
         subprocess.run([tmux, "-S", socket, "kill-session", "-t", "=" + name],
                        check=False, capture_output=True)
-        have = ""
-    if not have:
+        exists = False
+    if not exists:
         made = subprocess.run([tmux, "-S", socket, "new-session", "-d", "-s", name, "-t", owner],
                               check=False, capture_output=True, text=True)
         if made.returncode != 0:
@@ -205,6 +209,15 @@ def ensure_door_session(socket: str, seat: str, pane: str) -> None:
                             check=False, capture_output=True, text=True)
     if chosen.returncode != 0:
         fail(f"{seat}: its door session cannot select window {window}: {chosen.stderr.strip()}")
+
+
+def record_socket(seat: str) -> str:
+    # An older pid record names no socket; the seat's own registration does.
+    try:
+        target, _problem = read_target(seat)
+    except Exception:
+        return ""
+    return target.get("socket", "") if isinstance(target, dict) else ""
 
 
 def drop_door_session(socket: str, seat: str) -> None:
@@ -757,8 +770,9 @@ def cmd_down() -> None:
             owns = pid_is_grid(pid)
         else:
             owns = pid_is_door(pid, seat)
-            if isinstance(known.get("socket"), str):
-                drop_door_session(known["socket"], seat)
+            socket = known.get("socket") if isinstance(known.get("socket"), str) else record_socket(seat)
+            if socket:
+                drop_door_session(socket, seat)
         if not owns:
             pids.pop(seat, None)
             continue
