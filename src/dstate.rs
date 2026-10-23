@@ -23,6 +23,10 @@ pub(crate) enum Phase {
     #[default]
     Staged,
     Posted,
+    /// The bound session is on it (BLL-124): recorded while the
+    /// session read says `thinking` exactly `true`, returned to
+    /// `Posted` by the first read that does not.
+    Working,
     Done,
 }
 
@@ -31,6 +35,9 @@ pub(crate) struct ItemState {
     pub(crate) phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) accepted_at: Option<String>,
+    /// When the read that recorded `working` ran (BLL-124).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) working_at: Option<String>,
 }
 
 /// A successful delivery, for status's `awake`.
