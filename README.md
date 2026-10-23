@@ -49,7 +49,7 @@ the inbox.
 
 ```
 seat init
-seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [-- CMD...]
+seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [-- CMD...]
 seat send [--from <from>] <to> <body>
 seat drain --seat <name>
 seat dispatch [--once]
@@ -59,6 +59,11 @@ seat gallery
 seat status
 seat reset
 ```
+
+`--idle-after` takes a duration (`30m`, `2h` — one integer plus
+`s`/`m`/`h`). Omitted on a first register it means never; a later
+register that omits it keeps the stored value, and a passed value
+updates it even when the launch fields are omitted.
 
 `gallery` prints the names that have a live pane in `swarm`, joins those
 panes into one window named `gallery`, tiles it, and attaches. Each
@@ -92,6 +97,68 @@ session is active again (the hub marks queued messages invoked at
 session end, and a resume can keep the same session id — mail nobody
 read is never archived). One line per delivery and one per failure
 land in `<root>/dispatch.log`.
+
+### Sleep and wake
+
+A hapi seat registered with `--idle-after` sleeps when it has been
+idle that long: its inbox empty and nothing in flight, its idle clock
+(the first pass the dispatcher saw its pane, or the later of that and
+a delivery to its currently bound session) past the threshold, the
+bound session's `thinking` flag explicitly false (a missing, mistyped,
+or unreadable answer — and a session that is gone — never counts as
+quiet), a role for the seat in the kernel seat map (`sb seats
+--json`), because the wake needs one, and the dispatcher's board being
+the very board the wake script writes
+(`<SEAT_ROLE_HOME|$HOME>/.local/share/seat`; seat-role fixes its
+binding file there and calls `seat up` with no `--root`, so a
+dispatcher on any other `--root` never sleeps a seat — its wake could
+never rewrite this board's bindings). The clock belongs to one pane —
+the fact in `dispatch.json` names the pane's id — so a pane that just
+started (`seat up`, the gallery, a down-and-up inside one 2 s scan)
+starts the clock over and is never killed on the previous pane's
+timestamp. Only the pane the fact names goes down — a dead-but-listed
+pane never shields it, and a different live pane under the same seat
+name cancels the sleep instead of dying — and mail is looked for one
+last time (`inbox/` and `draining/`, the pass's own owed set)
+immediately before the record and again before any recovery kill, so
+a seat holding mail is never put down. The pane goes down through the
+same `down` path one pane already uses, `dispatch.json` records
+`asleep: {at, reason}`, and `hapi-sessions.json` is left exactly as
+the wake's own script wrote it — this crate never writes that file.
+
+A sleep whose kill never landed (the dispatcher died between the
+record and the kill) is settled on the next pass, and only when
+everything the decision used still holds: the recorded pane id is
+still the seat's live pane, the bound session's `thinking` reads
+exactly `false` again, the binding stands, and nothing is owed. The
+same quiet pane is killed; a pane that is already gone only clears
+the fact. A decided miss — a replacement pane, a session that resumed
+work or no longer reads quiet (a missing flag, a 404), no binding, or
+owed mail — cancels the sleep: the mark and the pane fact clear
+together, so the pane stands and the next pane fact starts a fresh
+clock. A GET error is no decision: the mark, the fact, and the clock
+all stay, and the next pass asks again. A pane brought back after a
+completed sleep (the fact already clear) ends the sleep — the mark
+clears and that pane starts a fresh clock; it is never killed for the
+old decision.
+
+Mail reverses it in the pass that sees it. The scan starts a worker
+for an asleep seat whose inbox holds mail — even when the binding file
+no longer names the seat, and even when a leftover `webhook.url` would
+otherwise route it to the hook — and that worker's first act is the
+wake: it
+runs the kit's own `kit/scripts/seat-role wake <role>` (found at
+`$SEAT_KIT`, else the kit beside the binary, else PATH), waits for the
+script to run to its own deadlines, and only a JSON `awake` answer
+plus a binding on the re-read delivers in that pass, clearing the mark
+and recording `woken: {at, key}`. Any other answer (`busy` from the
+cross-role lock, `refused`, `failed`, or no binding after an `awake`)
+leaves the seat asleep with the item in the inbox, one failure line
+naming the script's reason, and the next scan retries. The script's
+`up` answer is a hold, not a retry: a pane runs with no phone
+session — `up` means stop calling, and a resume-style pane holds the
+script's cross-role lock through its idle watch — so the wake is not
+attempted again until that pane is verifiably gone.
 
 ### The webhook adapter
 
@@ -177,13 +244,16 @@ This rule prevents mistakes on one Unix user, not a deliberate forgery.
 <name> <presence> mail=<N>
 ```
 
-Presence is `pane`, `awake`, or `unattended`. `pane` is a live pane in
-`swarm` tagged `@seat`. `awake` is no pane and a delivery the
-dispatcher recorded for this seat's bound session within the last 10
-minutes (read from `<seat>/dispatch.json`; status never asks the hub).
-`unattended` is everything else. `mail=<N>` is the number of files in
-that seat's inbox. It is printed on every row. Mail does not change
-presence.
+Presence is `pane`, `asleep`, `awake`, or `unattended`, in that
+precedence. `pane` is a live pane in `swarm` tagged `@seat`. `asleep`
+is no live pane and the dispatcher's own sleep mark in
+`<seat>/dispatch.json` (`asleep: {at, reason}` from `--idle-after`);
+it outranks a delivery inside the awake window. `awake` is no pane and
+no mark, with a delivery the dispatcher recorded for this seat's bound
+session within the last 10 minutes (read from
+`<seat>/dispatch.json`; status never asks the hub). `unattended` is
+everything else. `mail=<N>` is the number of files in that seat's
+inbox. It is printed on every row. Mail does not change presence.
 
 `seat reset` removes the marker, `seats/` (the room cursors inside
 it included), and any leftover `rooms/` from before 0.7.0 (when rooms

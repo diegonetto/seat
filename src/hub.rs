@@ -97,6 +97,17 @@ pub struct QueuedState {
     pub invoked: Vec<String>,
 }
 
+/// The session flags `GET /api/sessions/<id>` reports (`session`
+/// nested, top level still accepted): `thinking` and `thinkingAt`
+/// are `None` when the key is missing or not the right type, so a
+/// missing fact can never read as a quiet session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionState {
+    pub active: bool,
+    pub thinking: Option<bool>,
+    pub thinking_at: Option<u64>,
+}
+
 type Response = ureq::http::Response<ureq::Body>;
 
 fn hub_err(e: ureq::Error) -> SeatError {
@@ -215,27 +226,47 @@ impl Hub {
             .unwrap_or_default()
     }
 
-    /// `GET /api/sessions/<id>`: false on 404 or `active` not true.
-    /// The live hub nests the flag (`{"session":{...,"active":..}}`);
-    /// a top-level `active` is still accepted. The dispatcher never
-    /// calls `/resume`.
-    pub fn session_active(&mut self, session_id: &str) -> Result<bool> {
+    /// `GET /api/sessions/<id>` as the sleep rule needs it: the
+    /// session's flags from the body already fetched (`session`
+    /// nested, top level still accepted). `thinking` and
+    /// `thinkingAt` are `None` when the key is missing or not the
+    /// right type — never a silent `false` — and a 404 (no session)
+    /// leaves them `None` while `active` reads false, so the sleep
+    /// rule can never feed a missing session's answer in as
+    /// permission to sleep.
+    pub fn session_state(&mut self, session_id: &str) -> Result<SessionState> {
         let url = format!("{}/api/sessions/{session_id}", self.cfg.base);
         let mut resp = self.call("GET", &url, "")?;
         match resp.status().as_u16() {
             200 => {
                 let body = Self::json_body(&mut resp)?;
-                let active = body
-                    .get("session")
-                    .and_then(|s| s.get("active"))
-                    .or_else(|| body.get("active"));
-                Ok(active.and_then(|a| a.as_bool()).unwrap_or(false))
+                let flag = |name: &str| {
+                    body.get("session")
+                        .and_then(|s| s.get(name))
+                        .or_else(|| body.get(name))
+                };
+                Ok(SessionState {
+                    active: flag("active").and_then(|a| a.as_bool()).unwrap_or(false),
+                    thinking: flag("thinking").and_then(|t| t.as_bool()),
+                    thinking_at: flag("thinkingAt").and_then(|t| t.as_u64()),
+                })
             }
-            404 => Ok(false),
+            404 => Ok(SessionState {
+                active: false,
+                thinking: None,
+                thinking_at: None,
+            }),
             c => Err(SeatError::Hub(format!(
                 "GET session {session_id}: status {c}"
             ))),
         }
+    }
+
+    /// `GET /api/sessions/<id>`: false on 404 or `active` not true.
+    /// Kept on top of `session_state`, with its old meaning, for the
+    /// delivery gate.
+    pub fn session_active(&mut self, session_id: &str) -> Result<bool> {
+        Ok(self.session_state(session_id)?.active)
     }
 
     /// One message per POST, the delivery key as `localId`; the hub
@@ -334,6 +365,68 @@ mod tests {
         assert!(client.session_active("nested-true").unwrap());
         assert!(!client.session_active("nested-false").unwrap());
         assert!(client.session_active("flat-true").unwrap());
+        assert!(!client.session_active("absent").unwrap());
+    }
+
+    /// `session_state` reads `thinking`/`thinkingAt` where the hub
+    /// puts them, and nothing unreadable ever reads as `false`: a
+    /// missing key, a non-boolean, a 404, and a GET error all leave
+    /// `thinking` unset (the sleep rule fails closed on them), while
+    /// `session_active` keeps its old meaning on top.
+    #[test]
+    fn session_state_never_turns_a_missing_fact_into_false() {
+        let hub = crate::testutil::fakehub::FakeHub::start();
+        {
+            let mut ctl = hub.ctl.lock().unwrap();
+            ctl.get_bodies.insert(
+                "thinking".into(),
+                "{\"session\":{\"active\":true,\"thinking\":true,\"thinkingAt\":123}}".into(),
+            );
+            ctl.get_bodies.insert(
+                "quiet".into(),
+                "{\"session\":{\"active\":true,\"thinking\":false,\"thinkingAt\":0}}".into(),
+            );
+            ctl.get_bodies.insert(
+                "not-bool".into(),
+                "{\"session\":{\"active\":true,\"thinking\":\"yes\",\"thinkingAt\":0}}".into(),
+            );
+            ctl.get_bodies
+                .insert("no-key".into(), "{\"session\":{\"active\":true}}".into());
+            ctl.fail_get.insert("boom".into());
+        }
+        let mut client = Hub::new(hub.config());
+        assert_eq!(
+            client.session_state("thinking").unwrap(),
+            SessionState {
+                active: true,
+                thinking: Some(true),
+                thinking_at: Some(123)
+            }
+        );
+        assert_eq!(
+            client.session_state("quiet").unwrap(),
+            SessionState {
+                active: true,
+                thinking: Some(false),
+                thinking_at: Some(0)
+            }
+        );
+        for session in ["not-bool", "no-key"] {
+            let s = client.session_state(session).unwrap();
+            assert_eq!(s.active, true);
+            assert_eq!(s.thinking, None, "{session}: not idle either way");
+        }
+        assert_eq!(
+            client.session_state("absent").unwrap(),
+            SessionState {
+                active: false,
+                thinking: None,
+                thinking_at: None
+            },
+            "a 404 is no session, never a quiet one"
+        );
+        assert!(client.session_state("boom").is_err(), "a GET error is an error");
+        assert!(client.session_active("thinking").unwrap());
         assert!(!client.session_active("absent").unwrap());
     }
 }

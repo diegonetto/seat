@@ -16,7 +16,10 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 /// Register a seat: layout + one-time token mint (O_EXCL) + meta. A
 /// duplicate register keeps that seat's token, inbox, and meta — only
 /// launch fields actually passed change, and a refused register (a
-/// relative or empty `--cwd`) writes nothing (T004, T009). The retired
+/// relative or empty `--cwd`, or an unreadable `--idle-after`)
+/// writes nothing (T004, T009). `--idle-after` follows the same rule
+/// as the launch fields: omitted keeps the stored value, a passed
+/// value updates it even when cwd and command are omitted. The retired
 /// `meta.lifecycle` field is accepted on read and never written
 /// (0.4.0 deleted `seat arm`).
 pub fn cmd_register(
@@ -26,6 +29,7 @@ pub fn cmd_register(
     model: Option<String>,
     cwd: Option<String>,
     cmd: Vec<String>,
+    idle_after: Option<String>,
 ) -> Result<()> {
     board::ensure_board(root)?;
     valid_name(name)?;
@@ -36,14 +40,21 @@ pub fn cmd_register(
             return Err(SeatError::BadCwd(c.to_string()));
         }
     }
+    // An unreadable duration is refused the same way: nothing written.
+    if let Some(d) = idle_after.as_deref() {
+        if seat::parse_idle_after(d).is_none() {
+            return Err(SeatError::BadIdleAfter(d.to_string()));
+        }
+    }
     let dir = seat::seat_dir(root, name);
     if seat::meta_path(&dir).exists() || seat::token_path(&dir).exists() {
         // Zero words after `--` means the command was omitted, not
         // cleared (contract: register). Nothing passed changes nothing.
-        if cwd.is_none() && cmd.is_empty() {
+        if cwd.is_none() && cmd.is_empty() && idle_after.is_none() {
             println!("seat '{name}' already registered (token and mail kept)");
             return Ok(());
         }
+        let launch_changed = cwd.is_some() || !cmd.is_empty();
         seat::update_meta(&dir, |m| {
             if let Some(c) = cwd {
                 m.cwd = Some(c);
@@ -51,9 +62,14 @@ pub fn cmd_register(
             if !cmd.is_empty() {
                 m.cmd = Some(cmd);
             }
+            if let Some(d) = idle_after {
+                m.idle_after = Some(d);
+            }
         })?;
         println!("seat '{name}' already registered (token and mail kept)");
-        println!("seat '{name}' launch updated");
+        if launch_changed {
+            println!("seat '{name}' launch updated");
+        }
         return Ok(());
     }
     seat::create(root, name)?;
@@ -69,6 +85,9 @@ pub fn cmd_register(
     }
     if !cmd.is_empty() {
         meta.cmd = Some(cmd);
+    }
+    if let Some(d) = idle_after {
+        meta.idle_after = Some(d);
     }
     seat::write_meta(&dir, &meta)?;
     println!("registered seat '{name}' (harness={harness})");
@@ -191,7 +210,16 @@ mod tests {
     #[test]
     fn register_writes_no_lifecycle() {
         let root = setup();
-        cmd_register(&root, "alpha", "sb", Some("glm".into()), None, Vec::new()).unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            Some("glm".into()),
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         let dir = seat::seat_dir(&root, "alpha");
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.harness, "sb");
@@ -206,15 +234,15 @@ mod tests {
     #[test]
     fn duplicate_register_keeps_token_and_inbox() {
         let root = setup();
-        cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
-        cmd_register(&root, "beta", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+        cmd_register(&root, "beta", "sb", None, None, Vec::new(), None).unwrap();
         cmd_send(&root, Some("beta"), "alpha", "keep my mail", None).unwrap();
         let dir = seat::seat_dir(&root, "alpha");
         let token_before = std::fs::read_to_string(seat::token_path(&dir)).unwrap();
         let inbox_before = msg::list_msg_dir(&dir.join("inbox")).unwrap();
 
         // Duplicate register succeeds and touches nothing.
-        cmd_register(&root, "alpha", "other-harness", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "alpha", "other-harness", None, None, Vec::new(), None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(seat::token_path(&dir)).unwrap(),
@@ -235,11 +263,11 @@ mod tests {
     fn register_refuses_bad_names() {
         let root = setup();
         assert!(matches!(
-            cmd_register(&root, "../evil", "sb", None, None, Vec::new()),
+            cmd_register(&root, "../evil", "sb", None, None, Vec::new(), None),
             Err(SeatError::BadName(_))
         ));
         assert!(matches!(
-            cmd_register(&root, "a b", "sb", None, None, Vec::new()),
+            cmd_register(&root, "a b", "sb", None, None, Vec::new(), None),
             Err(SeatError::BadName(_))
         ));
     }
@@ -247,8 +275,8 @@ mod tests {
     #[test]
     fn send_requires_both_seats_and_updates_last_seen() {
         let root = setup();
-        cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
-        cmd_register(&root, "beta", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+        cmd_register(&root, "beta", "sb", None, None, Vec::new(), None).unwrap();
 
         assert!(matches!(
             cmd_send(&root, Some("ghost"), "beta", "hi", None),
@@ -269,7 +297,7 @@ mod tests {
     #[test]
     fn reset_removes_the_board() {
         let root = setup();
-        cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
         cmd_reset(&root).unwrap();
         assert!(!root.exists());
     }
@@ -285,6 +313,7 @@ mod tests {
             None,
             Some(cwd.clone()),
             vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            None,
         )
         .unwrap();
         let meta = seat::read_meta(&seat::seat_dir(&root, "runner")).unwrap();
@@ -300,7 +329,7 @@ mod tests {
             )
         );
         // A mail-only seat stores neither field.
-        cmd_register(&root, "mailbox", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "mailbox", "sb", None, None, Vec::new(), None).unwrap();
         let meta = seat::read_meta(&seat::seat_dir(&root, "mailbox")).unwrap();
         assert_eq!(meta.cwd, None);
         assert_eq!(meta.cmd, None);
@@ -324,6 +353,7 @@ mod tests {
                     None,
                     Some(bad.to_string()),
                     vec!["/bin/sleep".into(), "1".into()],
+                    None,
                 ),
                 Err(SeatError::BadCwd(_))
             ));
@@ -342,6 +372,7 @@ mod tests {
             None,
             Some(cwd.clone()),
             vec!["/bin/sleep".into(), "30".into()],
+            None,
         )
         .unwrap();
         let dir = seat::seat_dir(&root, "alpha");
@@ -355,6 +386,7 @@ mod tests {
                 None,
                 Some("relative/path".to_string()),
                 vec!["/bin/sleep".into(), "9".into()],
+                None,
             ),
             Err(SeatError::BadCwd(_))
         ));
@@ -384,9 +416,10 @@ mod tests {
             None,
             Some(cwd.clone()),
             vec!["/bin/sleep".into(), "30".into()],
+            None,
         )
         .unwrap();
-        cmd_register(&root, "box", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "box", "sb", None, None, Vec::new(), None).unwrap();
         cmd_send(&root, Some("run"), "box", "kept", None).unwrap();
         let dir = seat::seat_dir(&root, "box");
         let token_before = std::fs::read(seat::token_path(&dir)).unwrap();
@@ -399,6 +432,7 @@ mod tests {
             None,
             Some(cwd.clone()),
             vec!["/bin/sleep".into(), "5".into()],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -427,9 +461,10 @@ mod tests {
             None,
             None,
             vec!["/bin/sleep".into(), "9".into()],
+            None,
         )
         .unwrap();
-        cmd_register(&root, "box", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "box", "sb", None, None, Vec::new(), None).unwrap();
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(
             meta.cwd.as_deref(),
@@ -459,12 +494,13 @@ mod tests {
             None,
             Some(cwd.clone()),
             vec!["/bin/sleep".into(), "5".into()],
+            None,
         )
         .unwrap();
         let dir = seat::seat_dir(&root, "alpha");
 
         // Zero words after `--` is an omission, not a clear.
-        cmd_register(&root, "alpha", "sb", None, None, Vec::new()).unwrap();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(
             meta.cmd.as_deref(),
@@ -479,6 +515,7 @@ mod tests {
             None,
             None,
             vec!["/bin/sleep".into(), "9".into()],
+            None,
         )
         .unwrap();
         let meta = seat::read_meta(&dir).unwrap();
@@ -491,12 +528,124 @@ mod tests {
         // Only the directory passed: the command stays.
         let other = root.join("elsewhere").display().to_string();
         std::fs::create_dir_all(&other).unwrap();
-        cmd_register(&root, "alpha", "sb", None, Some(other.clone()), Vec::new()).unwrap();
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            Some(other.clone()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.cwd.as_deref(), Some(other.as_str()));
         assert_eq!(
             meta.cmd.as_deref(),
             Some(&["/bin/sleep".to_string(), "9".to_string()][..])
+        );
+    }
+
+    /// `--idle-after` (0.8.0): stored on meta.json, kept when a later
+    /// register omits it, updated when passed — even with cwd and
+    /// command both omitted, the path that used to return early — and
+    /// an unreadable duration writes nothing.
+    #[test]
+    fn register_stores_keeps_and_updates_idle_after() {
+        let root = setup();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+        let dir = seat::seat_dir(&root, "alpha");
+        assert_eq!(
+            seat::read_meta(&dir).unwrap().idle_after,
+            None,
+            "a first register without it means never"
+        );
+        let raw = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
+        assert!(!raw.contains("idle_after"), "{raw}");
+
+        // A passed flag stores it; a later register that omits it keeps it.
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            None,
+            Vec::new(),
+            Some("30m".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            seat::read_meta(&dir).unwrap().idle_after.as_deref(),
+            Some("30m")
+        );
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            None,
+            vec!["/bin/sleep".into(), "9".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            seat::read_meta(&dir).unwrap().idle_after.as_deref(),
+            Some("30m"),
+            "an omitted flag keeps the stored value"
+        );
+
+        // A passed flag updates it even when cwd and command are omitted.
+        cmd_register(
+            &root,
+            "alpha",
+            "sb",
+            None,
+            None,
+            Vec::new(),
+            Some("2h".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            seat::read_meta(&dir).unwrap().idle_after.as_deref(),
+            Some("2h")
+        );
+
+        // An unreadable duration is refused and writes nothing. The
+        // last one parses as u64 but its seconds overflow (9.2e18
+        // minutes): refused the same way, never wrapped to a zero
+        // threshold.
+        let before = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
+        for bad in [
+            "30",
+            "m",
+            "30x",
+            "1h30m",
+            "9223372036854775808m",
+            "18446744073709551616s",
+        ] {
+            assert!(
+                matches!(
+                    cmd_register(&root, "alpha", "sb", None, None, Vec::new(), Some(bad.into())),
+                    Err(SeatError::BadIdleAfter(_))
+                ),
+                "{bad} must be refused"
+            );
+            assert!(
+                matches!(
+                    cmd_register(&root, "fresh", "sb", None, None, Vec::new(), Some(bad.into())),
+                    Err(SeatError::BadIdleAfter(_))
+                ),
+                "{bad} refused for a new seat too"
+            );
+        }
+        assert!(
+            !seat::seat_dir(&root, "fresh").exists(),
+            "a refused register created nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(seat::meta_path(&dir)).unwrap(),
+            before,
+            "a refused register wrote no meta.json"
         );
     }
 
@@ -506,7 +655,7 @@ mod tests {
         let root = temp_root("verbs-identity");
         board::init(&root).unwrap();
         for name in ["alpha", "inbox", "opus-main", "bll-factory"] {
-            cmd_register(&root, name, "sb", None, None, Vec::new()).unwrap();
+            cmd_register(&root, name, "sb", None, None, Vec::new(), None).unwrap();
         }
         crate::testutil::write_bindings(
             &root,
@@ -651,7 +800,7 @@ mod tests {
         let bare = temp_root("verbs-identity-bare");
         board::init(&bare).unwrap();
         for name in ["alpha", "inbox"] {
-            cmd_register(&bare, name, "sb", None, None, Vec::new()).unwrap();
+            cmd_register(&bare, name, "sb", None, None, Vec::new(), None).unwrap();
         }
         assert!(cmd_send(&bare, None, "alpha", "no file", None).is_err());
     }

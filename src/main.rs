@@ -13,6 +13,7 @@ mod identity;
 mod msg;
 mod seat;
 mod session;
+mod sleep;
 #[cfg(test)]
 mod testutil;
 mod verbs;
@@ -82,7 +83,7 @@ enum Command {
     },
     /// Print the running seats, tile them into one window, then attach
     Gallery,
-    /// One row per registered seat: `<name> pane|awake|unattended mail=<N>`
+    /// One row per registered seat: `<name> pane|asleep|awake|unattended mail=<N>`
     Status,
     /// Remove the board under the root (marker, seats/, leftover rooms/)
     Reset,
@@ -106,6 +107,11 @@ struct RegisterArgs {
     /// command and clears none
     #[arg(last = true)]
     cmd: Vec<String>,
+    /// Idle threshold before the dispatcher sleeps this seat's pane
+    /// (e.g. 30m, 2h); omitting means never, and a later register
+    /// that omits it keeps the stored value
+    #[arg(long, value_name = "DURATION")]
+    idle_after: Option<String>,
 }
 
 /// Unknown-verb refusal (exit 2) with the keep-list.
@@ -134,6 +140,7 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             args.model,
             args.cwd,
             args.cmd,
+            args.idle_after,
         ),
         Command::Send { from, to, body } => {
             verbs::cmd_send(root, from.as_deref(), &to, &body, session)

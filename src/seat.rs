@@ -39,6 +39,27 @@ pub struct Meta {
     /// empty) means no command: the seat is mail-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
+    /// The idle threshold (0.8.0): how long the dispatcher lets this
+    /// seat's pane stand with nothing to do before sleeping it
+    /// (`--idle-after`, e.g. `30m`, `2h`). Omitted means never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_after: Option<String>,
+}
+
+/// Parse an `--idle-after` duration: one integer followed by exactly
+/// one unit — `s`, `m`, or `h` (e.g. `30m`, `2h`). Anything else,
+/// including a value whose seconds do not fit, is refused by
+/// `register` and means "never sleep" wherever it is read.
+pub fn parse_idle_after(raw: &str) -> Option<Duration> {
+    let unit = raw.chars().last()?;
+    let per_sec: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        _ => return None,
+    };
+    let n: u64 = raw[..raw.len() - 1].parse().ok()?;
+    Some(Duration::from_secs(n.checked_mul(per_sec)?))
 }
 
 /// 0.7.0 removed rooms: the room-cursor directory is no longer

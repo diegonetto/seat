@@ -40,6 +40,33 @@ pub struct LastDelivery {
     pub invoked_at: String,
 }
 
+/// The dispatcher's sleep mark (0.8.0): the seat's pane was stopped
+/// for idleness. Kept until a successful wake clears it; `status`
+/// prints `asleep` for it while the pane is gone.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Asleep {
+    pub at: String,
+    pub reason: String,
+}
+
+/// A successful wake's record (0.8.0): the delivery key of the mail
+/// that woke the seat.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Woken {
+    pub at: String,
+    pub key: String,
+}
+
+/// The script's `up` answer held against further wakes (0.8.0): a pane
+/// runs with no phone session, and the script answers `up` precisely
+/// so the caller stops calling — the wake is not retried until that
+/// pane is verifiably gone.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WakeHold {
+    pub at: String,
+    pub reason: String,
+}
+
 /// The webhook adapter's ring state (inside `dispatch.json`): the
 /// burst still open — files rung, waiting for the bot's own drain —
 /// the doubling re-ring backoff (0 = no burst) and the failed-ring
@@ -68,6 +95,24 @@ pub struct DispatchState {
     pub(crate) items: BTreeMap<String, ItemState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ring: Option<RingState>,
+    /// The idle clock's pane fact (0.8.0): when the timed pane was
+    /// first seen, and (`pane_id`) which pane that is. A live pane with
+    /// a different id — `seat up`, the gallery, or a down-and-up that
+    /// landed inside one 2 s scan — starts the clock over; a gone pane
+    /// clears the fact, and a seat with no fact is never slept. Beside
+    /// an `asleep` mark the fact means the sleep's kill is still
+    /// pending against that pane (`sleep::settle_pending_sleep`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pane_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) asleep: Option<Asleep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) woken: Option<Woken>,
+    /// The held wake above (0.8.0): set when seat-role answers `up`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) wake_hold: Option<WakeHold>,
 }
 
 pub fn load_state(dir: &Path) -> DispatchState {
@@ -141,6 +186,15 @@ pub fn awake(root: &Path, seat_name: &str) -> bool {
                 .is_ok_and(|a| a <= AWAKE_WINDOW)
         })
         .unwrap_or(false)
+}
+
+/// Status's `asleep` and the scan's wake rule: dispatch.json holds
+/// the dispatcher's own sleep mark. A local read; the live pane is a
+/// separate fact (presence checks both — the record plus no pane).
+pub fn is_asleep(root: &Path, seat_name: &str) -> bool {
+    load_state(&seat::seat_dir(root, seat_name))
+        .asleep
+        .is_some()
 }
 
 /// Delivery keys: never the 4-byte id alone.
