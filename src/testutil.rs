@@ -104,7 +104,7 @@ pub mod fakehub {
         /// inactive when queued-state is first asked, localIds whose
         /// message POST answers 500, session GETs to answer 500 (the
         /// sleep rule must read that as an error, not a quiet session),
-        /// each POSTed localId → text.
+        /// queued-state POSTs to answer 500, each POSTed localId → text.
         #[derive(Default)]
         pub struct HubCtl {
             pub sessions: BTreeMap<String, bool>,
@@ -115,6 +115,7 @@ pub mod fakehub {
             pub flip_inactive: BTreeSet<String>,
             pub fail_keys: BTreeSet<String>,
             pub fail_get: BTreeSet<String>,
+            pub fail_queued_state: BTreeSet<String>,
             pub texts: BTreeMap<String, String>,
             auths: usize,
             journal: Vec<String>,
@@ -259,6 +260,10 @@ pub mod fakehub {
                 respond(&mut writer, 200, "{}");
             }
             ("POST", "messages/queued-state") => {
+                if ctl.fail_queued_state.contains(&session) {
+                    respond(&mut writer, 500, "{}");
+                    return;
+                }
                 if ctl.flip_inactive.contains(&session) {
                     ctl.sessions.insert(session.clone(), false);
                 }

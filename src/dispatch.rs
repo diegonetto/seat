@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const SCAN_EVERY: Duration = Duration::from_secs(2);
-const QUEUED_CHUNK: usize = 1000; // localIds per queued-state call (hub limit)
+/// localIds per queued-state call (hub limit).
+pub(crate) const QUEUED_CHUNK: usize = 1000;
 const SLICE: Duration = Duration::from_millis(100);
 
 /// The worker's queued-state poll backoff (5 s doubling to 5 min in
@@ -164,9 +165,17 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // The `undelivered` cause, by message age (hapi has no
     // payload-delivered record; committed mail is archived away): mail
     // sitting in `inbox/` or `draining/` — the seat's own files —
-    // older than 15 minutes by its verified header `ts`.
+    // older than 15 minutes by its verified header `ts`. The bound
+    // session is read before the decision (BLL-124): a posted item on
+    // a session that is thinking is `working` — the record gets the
+    // phase with the time of the read, and the next pass re-reads —
+    // and an item the hub reports invoked on an active session is
+    // delivered, not undelivered (this decision runs before the
+    // pass's poll commits and archives that mark). Every other old
+    // file still pages and a hub error pages with the error named
+    // (alarm.rs).
     let owed = webhook::present_files(&dir);
-    alarm::undelivered(root, seat, &BTreeSet::new(), &owed)?;
+    alarm::undelivered_hapi(root, seat, &dir, &mut state, &owed, hub, &session)?;
     // The idle clock's pane fact: the first pass a pane is seen starts
     // the clock on that pane's own id, a gone pane clears it, and a
     // live pane the clock was not timing — `seat up`, the gallery, or

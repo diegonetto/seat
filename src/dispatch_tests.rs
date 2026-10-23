@@ -1,7 +1,8 @@
 //! The dispatcher check cases against the one small fake hub on
 //! 127.0.0.1 (never the live hub): the brief's hapi contract plus the
 //! local-state cases (`awake`, the fresh-work wake), the alarm matrix
-//! and the reload, and the sleep/wake cases (0.8.0).
+//! and the reload, the undelivered-versus-thinking cases (0.8.1), and
+//! the sleep/wake cases (0.8.0).
 use crate::alarm;
 use crate::dispatch::{self, Pass, Waits};
 use crate::error::SeatError;
@@ -697,6 +698,378 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
         1,
         "cleared by the successful ring"
     );
+}
+
+// ---- undelivered against a thinking session (0.8.1, BLL-124) ------
+
+/// The BLL-124 fixture: one real message, renamed old (the file name
+/// is what the alarm ages), already staged in `draining/`, and
+/// recorded in `dispatch.json` as in flight `Posted` under its
+/// delivery key — exactly the record a pass that POSTed it leaves
+/// behind when the turn outlives the wait. Returns the delivery key.
+fn old_posted_item(root: &std::path::Path, seat_name: &str, session: &str) -> String {
+    send(root, seat_name, "a long turn");
+    let dir = seat::seat_dir(root, seat_name);
+    let inbox = dir.join("inbox");
+    let fresh = msg::list_msg_dir(&inbox).unwrap()[0].clone();
+    let old = "20260101T000000.000000-deadbeef.msg";
+    std::fs::create_dir_all(dir.join("draining")).unwrap();
+    std::fs::rename(&fresh, dir.join("draining").join(old)).unwrap();
+    let key = dstate::direct_key(seat_name, old);
+    let mut state = dstate::DispatchState::default();
+    state.session = Some(session.into());
+    state.items.insert(
+        key.clone(),
+        dstate::ItemState {
+            phase: dstate::Phase::Posted,
+            accepted_at: Some(seat::now_ts()),
+            working_at: None,
+        },
+    );
+    dstate::store_state(&dir, &state).unwrap();
+    key
+}
+
+/// The hub marks a queued message invoked only when the turn ends, so
+/// a posted item on a thinking session is being worked — however long
+/// the turn — and is not `undelivered`: no page while the session
+/// thinks, and the record gets phase `working` with the time of the
+/// read (the next pass re-reads, and the first read that does not say
+/// thinking returns the item to `posted`). A second old file the
+/// record does not hold as in-flight `Posted` still pages — the skip
+/// is per file — and once every old file is worked again the latch
+/// clears. The turn ends with the message still not invoked: the item
+/// is `posted` again and one page names what the pass saw. An invoked
+/// message clears as today. HOME points at a throwaway directory for
+/// the whole case, like the alarm matrix.
+#[test]
+fn a_thinking_session_is_working_not_undelivered() {
+    crate::testutil::with_throwaway_home(a_thinking_session_is_working_not_undelivered_isolated);
+}
+
+fn a_thinking_session_is_working_not_undelivered_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    watch_board(&root, "diego");
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":true,"thinkingAt":60000}}"#.into(),
+    );
+    let key = old_posted_item(&root, "opus", "s1");
+    mark(&hub, &key, "queued"); // posted, not invoked: the turn goes on
+
+    // Thinking past the threshold: no page, nothing re-POSTed, and the
+    // record holds `working` with the time of the read.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    let log = log_text(&root);
+    assert!(!log.contains("cause=undelivered"), "{log}");
+    assert_eq!(n_posts(&hub.journal()), 0, "the item is already posted");
+    let dir = seat::seat_dir(&root, "opus");
+    let item = dstate::load_state(&dir).items.get(&key).unwrap().clone();
+    assert_eq!(
+        item.phase,
+        dstate::Phase::Working,
+        "the record gets the working phase"
+    );
+    assert!(item.working_at.is_some(), "with the time of the read");
+    assert_eq!(n_files(&root, "opus", "draining"), 1);
+
+    // A second old file the record does not hold as in-flight Posted —
+    // never-posted mail — still pages: the skip is per file.
+    std::fs::write(
+        seat::seat_dir(&root, "opus")
+            .join("inbox")
+            .join("20260101T000000.000000-feedface.msg"),
+        "stale\n\nstale",
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=undelivered").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(alarm_mail(&root).len(), 1);
+
+    // The stale file is quarantined away; every old file is worked
+    // again, and the latch clears (the next beat is the proof).
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        log_text(&root).matches("cause=undelivered").count(),
+        1,
+        "no re-fire while the session works"
+    );
+
+    // The turn ends and the message is still not invoked: the item is
+    // `posted` again and one page names the read, so a dead delivery
+    // reads apart from a long turn.
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":false,"thinkingAt":0}}"#.into(),
+    );
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    let item = dstate::load_state(&dir).items.get(&key).unwrap().clone();
+    assert_eq!(
+        item.phase,
+        dstate::Phase::Posted,
+        "the read that does not say thinking ends the working phase"
+    );
+    assert!(item.working_at.is_none());
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=undelivered").count(),
+        2,
+        "{log}"
+    );
+    assert!(
+        log.contains("posted, session idle for"),
+        "the page names what the pass saw: {log}"
+    );
+    assert_eq!(alarm_mail(&root).len(), 2);
+
+    // Invoked clears as today: archived, delivered, and the next pass
+    // clears the latch.
+    mark(&hub, &key, "invoked");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    dispatch::pass_seat(&root, "opus", &mut client).unwrap();
+    assert_eq!(n_files(&root, "opus", "archive"), 1);
+    assert!(
+        !std::fs::read_to_string(root.join("dispatch-alarms.json"))
+            .unwrap_or_default()
+            .contains("undelivered:opus"),
+        "the condition cleared"
+    );
+}
+
+/// A hub error is never a skip: today's page still happens, the page
+/// names the error it saw, and the delivery gate fails the pass as it
+/// already did.
+#[test]
+fn a_hub_error_pages_undelivered_with_the_error_named() {
+    crate::testutil::with_throwaway_home(a_hub_error_pages_undelivered_with_the_error_named_isolated);
+}
+
+fn a_hub_error_pages_undelivered_with_the_error_named_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    watch_board(&root, "diego");
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":true,"thinkingAt":60000}}"#.into(),
+    );
+    let key = old_posted_item(&root, "opus", "s1");
+    mark(&hub, &key, "queued");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert!(!log_text(&root).contains("cause=undelivered"));
+
+    // The hub stops answering the session read: the page happens with
+    // the error named — never a silent skip.
+    hub.ctl.lock().unwrap().fail_get.insert("s1".into());
+    assert!(
+        dispatch::pass_seat(&root, "opus", &mut client).is_err(),
+        "the delivery gate fails as today"
+    );
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=undelivered").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("posted, hub session read failed") && log.contains("status 500"),
+        "the page names the error: {log}"
+    );
+    let mail = alarm_mail(&root);
+    assert_eq!(mail.len(), 1);
+    assert!(mail[0].contains("hub session read failed"));
+}
+
+/// The other hub error path (BLL-124 review): the session read
+/// succeeds and says idle, but the queued-state read fails. That
+/// failure is never a skip and never a bare idle page — the item's
+/// invoked fact is unknown, so the page names the queued error (the
+/// pass's later poll fails with the same error, but it cannot amend
+/// the message already latched here).
+#[test]
+fn a_queued_read_failure_pages_with_the_error_named() {
+    crate::testutil::with_throwaway_home(a_queued_read_failure_pages_with_the_error_named_isolated);
+}
+
+fn a_queued_read_failure_pages_with_the_error_named_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    watch_board(&root, "diego");
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":false,"thinkingAt":0}}"#.into(),
+    );
+    let key = old_posted_item(&root, "opus", "s1");
+    mark(&hub, &key, "queued"); // not invoked: the fact must come from the read
+    hub.ctl.lock().unwrap().fail_queued_state.insert("s1".into());
+    assert!(
+        dispatch::pass_seat(&root, "opus", &mut client).is_err(),
+        "the delivery gate fails as today"
+    );
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=undelivered").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("posted, waited")
+            && log.contains("hub queued read failed")
+            && log.contains("status 500"),
+        "the page names the queued error: {log}"
+    );
+    assert!(!log.contains("session idle"), "{log}");
+    let mail = alarm_mail(&root);
+    assert_eq!(mail.len(), 1);
+    assert!(mail[0].contains("hub queued read failed"));
+}
+
+/// Only an explicit `thinking: true` skips. The fake hub's default
+/// body for an active session omits the flag, and a missing fact is
+/// never a working session — the missing flag pages, it does not hush,
+/// and the page says the flag was not reported (idle means an
+/// explicit `false`, as ever).
+#[test]
+fn a_missing_thinking_flag_does_not_skip() {
+    crate::testutil::with_throwaway_home(a_missing_thinking_flag_does_not_skip_isolated);
+}
+
+fn a_missing_thinking_flag_does_not_skip_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    watch_board(&root, "diego");
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), true);
+    let key = old_posted_item(&root, "opus", "s1");
+    mark(&hub, &key, "queued");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    let log = log_text(&root);
+    assert_eq!(
+        log.matches("alarm seat=opus cause=undelivered").count(),
+        1,
+        "a missing flag is not a working session: {log}"
+    );
+    assert!(
+        log.contains("posted, waited") && log.contains("session thinking unknown"),
+        "the page says the read did not report the flag: {log}"
+    );
+    assert!(!log.contains("session idle"), "{log}");
+}
+
+/// The pass that observes the turn end (BLL-124 review): the hub marks
+/// a queued message invoked when the turn ends — the session is no
+/// longer thinking — while the file still sits in `draining/`, because
+/// the decision runs before this pass's poll commits and archives the
+/// invoked mark. That pass must not page: an active session's invoked
+/// item is delivered. Only a pass that reads the item still not
+/// invoked, session not thinking, past the threshold, pages.
+#[test]
+fn the_pass_that_observes_invoked_does_not_page() {
+    crate::testutil::with_throwaway_home(the_pass_that_observes_invoked_does_not_page_isolated);
+}
+
+fn the_pass_that_observes_invoked_does_not_page_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+    watch_board(&root, "diego");
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":true,"thinkingAt":60000}}"#.into(),
+    );
+    let key = old_posted_item(&root, "opus", "s1");
+    mark(&hub, &key, "queued");
+
+    // The turn runs past the threshold: working, no page.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert!(!log_text(&root).contains("cause=undelivered"));
+
+    // The turn ends and the hub has marked the message invoked: one
+    // pass observes both facts together — not thinking, invoked, file
+    // still in draining/ — and delivers without a page.
+    hub.ctl.lock().unwrap().get_bodies.insert(
+        "s1".into(),
+        r#"{"session":{"active":true,"thinking":false,"thinkingAt":0}}"#.into(),
+    );
+    mark(&hub, &key, "invoked");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    let log = log_text(&root);
+    assert!(!log.contains("cause=undelivered"), "{log}");
+    assert_eq!(n_files(&root, "opus", "archive"), 1);
+    assert!(
+        !std::fs::read_to_string(root.join("dispatch-alarms.json"))
+            .unwrap_or_default()
+            .contains("undelivered:opus"),
+        "the condition never arose"
+    );
+}
+
+/// The page words match the read (BLL-124 review): `session idle`
+/// only for an explicit `thinking: false` on an active session — a
+/// missing flag pages as `thinking unknown`, a session that is not
+/// active (a 404 reads `Ok` with the flag unset) as `session not
+/// active` — and both still page; the inactive pass keeps today's
+/// file-age page beside its `session-inactive`.
+#[test]
+fn the_page_names_the_session_fact_it_actually_read() {
+    crate::testutil::with_throwaway_home(the_page_names_the_session_fact_it_actually_read_isolated);
+}
+
+fn the_page_names_the_session_fact_it_actually_read_isolated() {
+    let (root, hub, mut client) = kit(&[("opus", "s1"), ("bll", "s2")], &[]);
+    watch_board(&root, "diego");
+    // opus: active, the thinking flag missing from the answer.
+    hub.ctl.lock().unwrap().sessions.insert("s1".into(), true);
+    // bll: no session at all — the 404 reads Ok with the flag unset.
+    let opus_key = old_posted_item(&root, "opus", "s1");
+    let bll_key = old_posted_item(&root, "bll", "s2");
+    mark(&hub, &opus_key, "queued");
+    mark(&hub, &bll_key, "queued");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Waiting
+    );
+    assert_eq!(
+        dispatch::pass_seat(&root, "bll", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    let log = log_text(&root);
+    assert!(
+        log.contains("seat=opus cause=undelivered") && log.contains("seat=bll cause=undelivered"),
+        "both still page: {log}"
+    );
+    assert!(
+        log.matches("posted, waited").count() == 2
+            && log.contains("session thinking unknown")
+            && log.contains("session not active"),
+        "the words match the read: {log}"
+    );
+    assert!(!log.contains("session idle"), "{log}");
 }
 
 /// dispatch.json and the alarm state survive a reload: both are

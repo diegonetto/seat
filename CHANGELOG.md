@@ -2,6 +2,38 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.1] - 2026-10-23
+
+### Fixed
+
+- The `undelivered` alarm checks the session before it pages
+  (BLL-124). On 2026-10-22 `sb watch` paged a seat whose item was
+  delivered: the hub marks a queued message invoked only when the turn
+  ends, so a posted item on a session still thinking stays `posted`
+  while the turn runs, and every turn past 15 minutes tripped the
+  file-age alarm — a false page, no lost mail. The hapi pass now reads
+  the bound session (0.8.0's `Hub::session_state`; no hub field was
+  added) before the decision, per old file. An in-flight `posted` item
+  on an active session reporting `thinking` exactly `true` is
+  `working`: the record gets that phase with the time of the read,
+  there is no new timer, and the next pass re-reads — a read that
+  does not say thinking (a missing flag, a quiet or inactive session,
+  a GET error) returns the item to `posted`, the phase the alarm
+  fires on. An old `posted` item the hub reports invoked on an active
+  session is delivered, not paged: the decision runs before the
+  pass's poll commits and archives that mark, so the invoked state is
+  read there too — only a pass that reads the item still not invoked,
+  the session not thinking, past the threshold, pages. Every other
+  old file still pages: never-posted mail, the asleep seat's call,
+  and the webhook seats keep today's file-age rule unchanged; a
+  missing or non-boolean `thinking` never skips; and a hub error
+  never skips — today's page happens with the error named. The page
+  text names what the pass saw (`posted, session idle for 16 min` —
+  N the file's own age — only for an explicit `false`; `thinking
+  unknown` or `session not active` when that is the read), so a dead
+  delivery reads apart from a long turn; and when every old file is
+  skipped the latch clears, so a later genuine page can fire.
+
 ## [0.8.0] - 2026-10-23
 
 ### Added

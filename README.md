@@ -202,7 +202,17 @@ one direct message from seat `sb-watch` to the seat named in
 `<root>/alarm-seat` — one line; when that file is absent or empty the
 alarm is the log line only) until the condition clears and returns:
 `undelivered` (an item of that seat older than 15 minutes still
-undelivered), `session-inactive` (the bound session is 404 or not
+undelivered, by the age of its mail file in `inbox/` or `draining/`;
+on the hapi pass the bound session is read first: such a file in
+flight as `posted` on an active session reporting `thinking: true` is
+`working` — the record gets that phase with the time of the read, and
+the next pass re-reads — and such a file the hub reports invoked on
+an active session is delivered, not paged, however long the turn;
+every other old file still pages, a hub error pages with the error
+named, and the page names what the pass saw — `posted, session idle
+for 16 min` only for an explicit `false`, else `thinking unknown` or
+`session not active` for what the read said),
+`session-inactive` (the bound session is 404 or not
 active), `no-answer` (the hub does not answer for that seat's
 session), `hub-auth` (the hub refuses auth — board-wide), and
 `webhook-failing` (3 failed rings in a row). The fired set persists
