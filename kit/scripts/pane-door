@@ -175,30 +175,36 @@ def attach_script(tmux: str, socket: str, seat: str, target: str) -> str:
     return f"exec {tmux} -S {socket} attach -t {door_session(seat)}"
 
 
+def _tmux_read(tmux: str, socket: str, *args: str) -> str:
+    out = subprocess.run([tmux, "-S", socket, *args], check=False, capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 def ensure_door_session(socket: str, seat: str, pane: str) -> None:
     # A grouped session shares the swarm's windows and keeps its own current
     # window, so each door shows its seat whatever the swarm has selected.
+    # Runs on every up: the pane's group and window are read fresh each time.
     tmux = os.environ.get("PANE_DOOR_TMUX", "tmux")
     name = door_session(seat)
-    group = subprocess.run(
-        [tmux, "-S", socket, "display", "-p", "-t", pane, "#{session_name}"],
-        check=False, capture_output=True, text=True,
-    ).stdout.strip()
-    if not group:
+    group = _tmux_read(tmux, socket, "display", "-p", "-t", pane, "#{session_group}")
+    owner = _tmux_read(tmux, socket, "display", "-p", "-t", pane, "#{session_name}")
+    window = _tmux_read(tmux, socket, "display", "-p", "-t", pane, "#{window_id}")
+    if not owner or not window:
         fail(f"{seat}: no tmux session holds pane {pane}")
-    has = subprocess.run([tmux, "-S", socket, "has-session", "-t", "=" + name],
-                         check=False, capture_output=True)
-    if has.returncode != 0:
-        made = subprocess.run([tmux, "-S", socket, "new-session", "-d", "-s", name, "-t", group],
+    have = _tmux_read(tmux, socket, "display", "-p", "-t", "=" + name, "#{session_group}")
+    if have and group and have != group:
+        subprocess.run([tmux, "-S", socket, "kill-session", "-t", "=" + name],
+                       check=False, capture_output=True)
+        have = ""
+    if not have:
+        made = subprocess.run([tmux, "-S", socket, "new-session", "-d", "-s", name, "-t", owner],
                               check=False, capture_output=True, text=True)
         if made.returncode != 0:
             fail(f"{seat}: cannot open its door session: {made.stderr.strip()}")
-    window = subprocess.run(
-        [tmux, "-S", socket, "display", "-p", "-t", pane, "#{window_id}"],
-        check=False, capture_output=True, text=True,
-    ).stdout.strip()
-    subprocess.run([tmux, "-S", socket, "select-window", "-t", f"{name}:{window}"],
-                   check=False, capture_output=True)
+    chosen = subprocess.run([tmux, "-S", socket, "select-window", "-t", f"{name}:{window}"],
+                            check=False, capture_output=True, text=True)
+    if chosen.returncode != 0:
+        fail(f"{seat}: its door session cannot select window {window}: {chosen.stderr.strip()}")
 
 
 def drop_door_session(socket: str, seat: str) -> None:
@@ -685,23 +691,23 @@ def cmd_up(argv: list[str]) -> None:
         if row.get("skip") or row.get("root"):
             continue
         seat = row["seat"]
+        ensure_door_session(row["socket"], seat, row["pane"])
         known = pids.get(seat)
         if isinstance(known, dict):
             pid = known.get("pid")
             alive = isinstance(pid, int) and pid_is_door(pid, seat)
-            # The zoom door recorded view=pane and no attach field. Require
-            # attach so the next up replaces that script instead of leaving it.
+            # Older records attached the pane (attach=pane) or recorded no attach
+            # field; both are replaced so no door keeps the swarm's current window.
             identity = (
                 known.get("pane") == row["pane"]
                 and known.get("view") == "pane"
-                and known.get("attach") == "pane"
+                and known.get("attach") == "door"
             )
             if alive and identity and known.get("port") == row["port"]:
                 started += 1
                 continue
             if alive:
                 os.kill(pid, signal.SIGTERM)
-        ensure_door_session(row["socket"], seat, row["pane"])
         log_path = state_dir() / f"{seat}.log"
         log_handle = log_path.open("ab")
         try:
@@ -724,7 +730,7 @@ def cmd_up(argv: list[str]) -> None:
         record["pane"] = row["pane"]
         record["socket"] = row["socket"]
         record["view"] = "pane"
-        record["attach"] = "pane"
+        record["attach"] = "door"
         pids[seat] = record
         save_pids(pids)
         started += 1
@@ -751,12 +757,12 @@ def cmd_down() -> None:
             owns = pid_is_grid(pid)
         else:
             owns = pid_is_door(pid, seat)
+            if isinstance(known.get("socket"), str):
+                drop_door_session(known["socket"], seat)
         if not owns:
             pids.pop(seat, None)
             continue
         stop_pid(pid)
-        if isinstance(known.get("socket"), str):
-            drop_door_session(known["socket"], seat)
         pids.pop(seat, None)
         print(f"{seat}  stopped")
     save_pids(pids)
