@@ -6,6 +6,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// One process-wide lock for every test that sets process-wide
+/// environment (SEAT_TMUX, SEAT_FAKE_STATE, PATH, SEAT_KIT,
+/// HAPI_API_URL, CLI_API_TOKEN): env is shared by all parallel test
+/// threads, and the stubs these tests install are visible to every
+/// subprocess this process spawns.
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn temp_root(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
@@ -90,25 +97,28 @@ pub mod fakehub {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
-    /// The scripted behavior: sessions (id → active, absent = 404),
-    /// exact GET bodies (id → raw JSON, overriding the active flag),
-    /// marks (localId → "queued"|"indeterminate"|"invoked"; no entry =
-    /// the hub lost it), hung sessions, banned JWTs, sessions to flip
-    /// inactive when queued-state is first asked, localIds whose
-    /// message POST answers 500, each POSTed localId → text.
-    #[derive(Default)]
-    pub struct HubCtl {
-        pub sessions: BTreeMap<String, bool>,
-        pub get_bodies: BTreeMap<String, String>,
-        pub marks: BTreeMap<String, String>,
-        pub hang: BTreeSet<String>,
-        pub banned_jwts: BTreeSet<String>,
-        pub flip_inactive: BTreeSet<String>,
-        pub fail_keys: BTreeSet<String>,
-        pub texts: BTreeMap<String, String>,
-        auths: usize,
-        journal: Vec<String>,
-    }
+        /// The scripted behavior: sessions (id → active, absent = 404),
+        /// exact GET bodies (id → raw JSON, overriding the active flag),
+        /// marks (localId → "queued"|"indeterminate"|"invoked"; no entry =
+        /// the hub lost it), hung sessions, banned JWTs, sessions to flip
+        /// inactive when queued-state is first asked, localIds whose
+        /// message POST answers 500, session GETs to answer 500 (the
+        /// sleep rule must read that as an error, not a quiet session),
+        /// each POSTed localId → text.
+        #[derive(Default)]
+        pub struct HubCtl {
+            pub sessions: BTreeMap<String, bool>,
+            pub get_bodies: BTreeMap<String, String>,
+            pub marks: BTreeMap<String, String>,
+            pub hang: BTreeSet<String>,
+            pub banned_jwts: BTreeSet<String>,
+            pub flip_inactive: BTreeSet<String>,
+            pub fail_keys: BTreeSet<String>,
+            pub fail_get: BTreeSet<String>,
+            pub texts: BTreeMap<String, String>,
+            auths: usize,
+            journal: Vec<String>,
+        }
 
     pub struct FakeHub {
         pub ctl: Arc<Mutex<HubCtl>>,
@@ -219,7 +229,9 @@ pub mod fakehub {
         }
         match (method.as_str(), action) {
             ("GET", "") => {
-                if let Some(raw) = ctl.get_bodies.get(&session) {
+                if ctl.fail_get.contains(&session) {
+                    respond(&mut writer, 500, "{}");
+                } else if let Some(raw) = ctl.get_bodies.get(&session) {
                     respond(&mut writer, 200, raw);
                 } else {
                     // The live hub's shape — the flag nested under
@@ -414,7 +426,7 @@ pub mod dispatchkit {
         let root = temp_root("dispatch");
         board::init(&root).unwrap();
         for (seat, _) in seats {
-            verbs::cmd_register(&root, seat, "sb", None, None, Vec::new()).unwrap();
+            verbs::cmd_register(&root, seat, "sb", None, None, Vec::new(), None).unwrap();
         }
         write_bindings(&root, seats);
         root

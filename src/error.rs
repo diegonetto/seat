@@ -66,6 +66,9 @@ pub enum SeatError {
     #[error("register: --cwd must be an absolute path, got {0:?}")]
     BadCwd(String),
 
+    #[error("register: --idle-after must be a duration like 30m or 2h, got {0:?}")]
+    BadIdleAfter(String),
+
     #[error("up: seat {0} has no command stored")]
     NoCmd(String),
 

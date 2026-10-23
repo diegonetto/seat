@@ -235,6 +235,27 @@ tm5 status | grep -qx "parked unattended mail=1";    note $? "mail does not chan
 printf '%s\n' "$$" > "$R5/seats/fresh/wait.pid"
 tm5 status | grep -qx "fresh unattended mail=0";     note $? "presence never reads wait.pid"
 
+## 0.8.0: status prints asleep from a prepared record --------------
+# Smoke has no hub and makes no sleep claim of its own: this checks
+# only that status prints the fourth word from dispatch.json. A live
+# pane still outranks the record.
+R8="$(mktemp -d)"; EXTRA_ROOTS="$EXTRA_ROOTS $R8"
+F8="$R8/tmux.state"
+tm8() { SEAT_TMUX="$FAKE" SEAT_FAKE_STATE="$F8" "$S" --root "$R8" "$@"; }
+
+"$S" --root "$R8" init >/dev/null 2>&1;            note $? "asleep: init a fresh root"
+"$S" --root "$R8" register --seat plain --harness sb --idle-after nope 2>/dev/null; rc=$?
+[ "$rc" -ne 0 ];                                    note $? "register refuses a bad --idle-after"
+"$S" --root "$R8" register --seat plain --harness sb >/dev/null 2>&1
+                                                    note $? "asleep: register plain"
+"$S" --root "$R8" register --seat snooze --harness sb --cwd "$R8" --idle-after 30m -- /bin/sleep 30 >/dev/null 2>&1
+                                                    note $? "asleep: register snooze with a threshold"
+printf '%s\n' '{"asleep":{"at":"2026-10-23T00:00:00Z","reason":"idle 30m"}}' > "$R8/seats/snooze/dispatch.json"
+tm8 status | grep -qx "snooze asleep mail=0";      note $? "status prints asleep from the record"
+tm8 status | grep -qx "plain unattended mail=0";   note $? "a seat with no record is unattended"
+tm8 up snooze >/dev/null 2>&1;                     note $? "asleep: bring snooze back up"
+tm8 status | grep -qx "snooze pane mail=0";        note $? "a live pane outranks the sleep record"
+
 ## dispatch (0.5.0): --once on a board with no bindings is pull ------
 # No seat here is hapi-bound, so one dispatch pass pushes nothing and
 # never runs receive: parked's unread mail waits for the seat itself.

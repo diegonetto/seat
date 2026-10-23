@@ -303,7 +303,6 @@ pub fn cmd_up(root: &Path, names: &[String]) -> Result<()> {
 /// registered seat that is already stopped is success.
 pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
     board::ensure_board(root)?;
-    let prog = tmux_prog();
     let registered = verbs::sorted_seat_names(root)?;
     // No names means every registered seat, the same shape as `up`.
     let targets: Vec<&str> = if names.is_empty() {
@@ -316,21 +315,74 @@ pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
         }
         names.iter().map(|s| s.as_str()).collect()
     };
-    let swarm: Vec<Pane> = panes(&prog)?
-        .into_iter()
-        .filter(|p| p.session == SESSION)
-        .collect();
     // One kill per seat: a name twice on the command line is one pane.
     let mut seen = BTreeSet::new();
     for n in targets {
         if !seen.insert(n) {
             continue;
         }
-        if let Some(pane) = swarm.iter().find(|p| p.seat == n) {
-            tmux_ok(&prog, &["kill-pane", "-t", &pane.id])?;
-        }
+        kill_seat_pane(n)?;
     }
     Ok(())
+}
+
+/// The `down` path for one pane: kill this seat's own pane in the
+/// `swarm` session (dead-but-listed counts; a seat with no pane is a
+/// no-op). The dispatcher's idle sleep stops a pane through here too —
+/// the same command and the same target, never a signal by pid, never
+/// a pane the board did not start. `only_if` names the pane id the
+/// caller's decision was about: the search then skips dead-but-listed
+/// panes, so a dead listing never shields the live pane the decision
+/// named, and a live pane that is another pane — a replacement under
+/// the same seat name — is left standing. Without `only_if`
+/// (`cmd_down`) the first pane listed for the seat dies, dead-but-
+/// listed included. True when a pane was killed.
+pub fn kill_seat_pane_if(name: &str, only_if: Option<&str>) -> Result<bool> {
+    let prog = tmux_prog();
+    let swarm: Vec<Pane> = panes(&prog)?
+        .into_iter()
+        .filter(|p| p.session == SESSION)
+        .collect();
+    if let Some(pane) = swarm
+        .iter()
+        .find(|p| p.seat == name && (only_if.is_none() || !p.dead))
+    {
+        if only_if.is_some_and(|id| pane.id != id) {
+            return Ok(false); // not the pane the decision named
+        }
+        tmux_ok(&prog, &["kill-pane", "-t", &pane.id])?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `cmd_down`'s one-pane kill, by seat name alone.
+pub fn kill_seat_pane(name: &str) -> Result<bool> {
+    kill_seat_pane_if(name, None)
+}
+
+/// Does this seat have a live pane in the `swarm` session right now
+/// (the same query `status` uses; a dead pane is not up)? `None` when
+/// the multiplexer cannot be asked at all — the caller leaves any
+/// idle-clock fact untouched, because unknown is never permission to
+/// sleep.
+pub fn pane_is_up(seat_name: &str) -> Option<bool> {
+    running_seats(&tmux_prog())
+        .ok()
+        .map(|running| running.contains(seat_name))
+}
+
+/// The id of this seat's live pane in the `swarm` session — the pane
+/// the idle clock times. `Some(None)`: asked, and the seat has no live
+/// pane. `None`: the multiplexer cannot be asked, which changes
+/// nothing (unknown is never permission to sleep and never a clock
+/// reset).
+pub fn live_pane_id(seat_name: &str) -> Option<Option<String>> {
+    panes(&tmux_prog()).ok().map(|all| {
+        all.into_iter()
+            .find(|p| p.session == SESSION && p.seat == seat_name && !p.dead)
+            .map(|p| p.id)
+    })
 }
 
 /// `seat gallery` — print the live seat names, tile those panes into
@@ -451,12 +503,16 @@ struct StatusRow {
 }
 
 /// Presence, separate from the mail count: `pane` (a live swarm
-/// pane), `awake` (no pane, a dispatcher delivery to the bound
-/// session within 10 minutes), else `unattended`
-/// (specs/status-presence.md). Mail never changes the word.
-fn presence(in_pane: bool, awake: bool) -> &'static str {
+/// pane), `asleep` (the dispatcher's own sleep mark and no pane),
+/// `awake` (a dispatcher delivery to the bound session within 10
+/// minutes), else `unattended` (specs/status-presence.md). The
+/// dispatcher's words outrank the delivery's: a threshold under ten
+/// minutes still prints `asleep`. Mail never changes the word.
+fn presence(in_pane: bool, asleep: bool, awake: bool) -> &'static str {
     if in_pane {
         "pane"
+    } else if asleep {
+        "asleep"
     } else if awake {
         "awake"
     } else {
@@ -474,10 +530,11 @@ fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
         let dir = seat::seat_dir(root, &name);
         let mail = msg::list_msg_dir(&dir.join("inbox"))?.len();
         let in_pane = running.contains(&name);
+        let asleep = crate::dstate::is_asleep(root, &name); // a local read
         let awake = crate::dstate::awake(root, &name); // a local read
         rows.push(StatusRow {
             name,
-            presence: presence(in_pane, awake),
+            presence: presence(in_pane, asleep, awake),
             mail,
         });
     }
@@ -512,17 +569,77 @@ mod tests {
     }
 
     #[test]
-    fn presence_is_pane_awake_or_unattended() {
-        assert_eq!(presence(true, true), "pane");
-        assert_eq!(presence(true, false), "pane");
-        assert_eq!(presence(false, true), "awake");
-        assert_eq!(presence(false, false), "unattended");
+    fn presence_is_pane_asleep_awake_or_unattended() {
+        assert_eq!(presence(true, true, true), "pane");
+        assert_eq!(presence(true, false, false), "pane");
+        assert_eq!(presence(false, true, false), "asleep");
+        // The sleep mark outranks a delivery inside the awake window:
+        // a threshold under ten minutes still prints asleep.
+        assert_eq!(presence(false, true, true), "asleep");
+        assert_eq!(presence(false, false, true), "awake");
+        assert_eq!(presence(false, false, false), "unattended");
     }
 
-    /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE:
-    /// process-wide env is safe under the parallel test threads only
-    /// one such test runs at a time.
-    static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `status` prints the fourth word from the dispatcher's own
+    /// record: a seat whose dispatch.json says `asleep` and whose pane
+    /// is gone prints `asleep`; a pane that came back outranks the
+    /// record (the wake or a manual `up` happened first).
+    #[test]
+    fn status_prints_asleep_from_the_record() {
+        let _guard = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = temp_root("status-asleep");
+        board::init(&root).unwrap();
+        let cwd = root.display().to_string();
+        verbs::cmd_register(
+            &root,
+            "snorlax",
+            "sb",
+            None,
+            Some(cwd),
+            vec!["/bin/sleep".into(), "30".into()],
+            Some("30m".into()),
+        )
+        .unwrap();
+        let state = root.join("tmux.state");
+        std::env::set_var("SEAT_TMUX", fake_tmux());
+        std::env::set_var("SEAT_FAKE_STATE", &state);
+
+        std::fs::write(
+            seat::seat_dir(&root, "snorlax").join("dispatch.json"),
+            "{\"asleep\":{\"at\":\"2026-10-23T00:00:00Z\",\"reason\":\"idle 30m\"}}",
+        )
+        .unwrap();
+        let rows = status_rows(&root, &fake_tmux()).unwrap();
+        assert_eq!(
+            rows,
+            vec![StatusRow {
+                name: "snorlax".into(),
+                presence: "asleep",
+                mail: 0
+            }]
+        );
+
+        // A live pane outranks the record.
+        cmd_up(&root, &["snorlax".to_string()]).unwrap();
+        assert_eq!(
+            status_rows(&root, &fake_tmux()).unwrap()[0].presence,
+            "pane",
+            "a pane that came back outranks the sleep mark"
+        );
+        cmd_down(&root, &["snorlax".to_string()]).unwrap();
+        assert_eq!(status_rows(&root, &fake_tmux()).unwrap()[0].presence, "asleep");
+
+        std::env::remove_var("SEAT_TMUX");
+        std::env::remove_var("SEAT_FAKE_STATE");
+    }
+
+    /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE
+    /// (the process-wide env lock in testutil, shared with the
+    /// dispatcher tests that stub PATH): process-wide env is safe
+    /// under the parallel test threads only one such test runs at a
+    /// time.
 
     /// Presence and the mail count are separate: a live pane is
     /// `pane`, everything else — mail or not — is `unattended` (this
@@ -530,7 +647,7 @@ mod tests {
     /// file count and does not change presence.
     #[test]
     fn status_presence_and_mail_are_separate() {
-        let _guard = FAKE_LOCK.lock().unwrap();
+        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("status-presence");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -541,10 +658,11 @@ mod tests {
             None,
             Some(cwd),
             vec!["/bin/sleep".into(), "30".into()],
+            None,
         )
         .unwrap();
-        verbs::cmd_register(&root, "quiet", "sb", None, None, vec![]).unwrap();
-        verbs::cmd_register(&root, "stocked", "sb", None, None, vec![]).unwrap();
+        verbs::cmd_register(&root, "quiet", "sb", None, None, vec![], None).unwrap();
+        verbs::cmd_register(&root, "stocked", "sb", None, None, vec![], None).unwrap();
         let state = root.join("tmux.state");
         std::env::set_var("SEAT_TMUX", fake_tmux());
         std::env::set_var("SEAT_FAKE_STATE", &state);
@@ -580,7 +698,7 @@ mod tests {
     /// The whole session story against the fake (T015's consumer).
     #[test]
     fn session_verbs_drive_the_fake_multiplexer() {
-        let _guard = FAKE_LOCK.lock().unwrap();
+        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("session");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -592,6 +710,7 @@ mod tests {
                 None,
                 Some(cwd.clone()),
                 vec!["/bin/sleep".into(), "30".into()],
+                None,
             )
             .unwrap();
         }
@@ -853,12 +972,12 @@ mod tests {
     /// leaves earlier seats running and later seats unstarted.
     #[test]
     fn up_starts_the_stored_command() {
-        let _guard = FAKE_LOCK.lock().unwrap();
+        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("session-launch");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
         let reg = |name: &str, cwd: Option<String>, cmd: Vec<String>| {
-            verbs::cmd_register(&root, name, "sb", None, cwd, cmd).unwrap();
+            verbs::cmd_register(&root, name, "sb", None, cwd, cmd, None).unwrap();
         };
         let sleep30 = || vec!["/bin/sleep".to_string(), "30".to_string()];
         reg("runner", Some(cwd.clone()), sleep30());

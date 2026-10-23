@@ -2,6 +2,98 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.0] - 2026-10-23
+
+### Added
+
+- Seats sleep when idle and wake on mail (BLL-127). `seat register
+  --idle-after <duration>` (one integer plus `s`/`m`/`h`, e.g. `30m`,
+  `2h`; anything else is refused and writes nothing) stores a per-seat
+  threshold on `seats/<name>/meta.json`: a first register that omits it
+  means never, a later register that omits it keeps the stored value,
+  and a passed flag updates it even when cwd and command are omitted.
+  Inside the hapi pass — never in `fresh_work` — a seat sleeps when
+  all hold: it has `idle_after`; its idle clock is at least that old,
+  where the clock is `pane_seen_at` (recorded in `dispatch.json` the
+  first pass a pane is seen, stamped with that pane's id, and cleared
+  when the pane is gone — a live pane with a different id — `seat up`,
+  the gallery, or a down-and-up that landed inside one 2 s scan —
+  starts the clock over, so a pane that just started is never killed
+  on the previous pane's timestamp, and a seat with no seen pane is
+  never slept) or the later of it and a
+  delivery to the currently bound session (a delivery to a session the
+  seat is no longer bound to does not count); its inbox is empty and
+  nothing is in flight; the bound session's `GET /api/sessions/<id>`
+  reports `thinking` explicitly `false` — a missing key, a non-boolean,
+  a 404, or a GET error means not idle, so a missing flag is never
+  permission to sleep; the seat has a role in the kernel seat map
+  (`sb seats --json`, the same map `seat-role` reads; a map failure
+  means not idle), because the wake takes a role; and the dispatcher's
+  board is the very board the wake script writes
+  (`<SEAT_ROLE_HOME|$HOME>/.local/share/seat` — seat-role fixes its
+  binding file there and calls `seat up` with no `--root`, so a
+  dispatcher on any other `--root` never sleeps a seat; its wake could
+  never rewrite this board's bindings). An idle seat goes
+  down through the same `down` path one pane already uses (tmux
+  kill-pane of the seat's own pane; never a signal by pid, never a
+  pane the board did not start), and `dispatch.json` records
+  `asleep: {at, reason}`; `hapi-sessions.json` is left as it is. The
+  kill names only the pane the fact times — dead-but-listed panes
+  never shield it, and a different live pane under the same seat name
+  cancels the sleep it just recorded — and the owed set (`inbox/` and
+  `draining/`) is read once more immediately before the record and
+  before any recovery kill, so a seat holding mail is never put down.
+  A sleep whose kill never landed (a crash between the record and the
+  kill) is settled on the next pass only when everything the decision
+  used still holds: the recorded pane id is still the seat's live
+  pane, the bound session's `thinking` reads exactly `false` again,
+  the binding stands, and nothing is owed. The same quiet pane is
+  killed and a pane already gone only clears the fact; a decided miss
+  — a replacement pane, a session that resumed work or no longer
+  reads quiet (a missing flag, a 404), no binding, or owed mail —
+  cancels the sleep, clearing the mark and the pane fact together so
+  the clock restarts, and a GET error keeps the mark, the fact, and
+  the clock for a retry on the next pass. A recovery kill refused
+  because the pane set moved between recovery's own pane query and
+  the kill is decided by the same re-query the first sleep runs — a
+  different live pane cancels, an unanswerable multiplexer keeps the
+  mark pending, and only a gone pane completes — and every settlement
+  outcome logs the case it saw. A pane brought back after a
+  completed sleep ends it: the mark clears and that pane starts a
+  fresh clock, never killed for the old decision.
+- `seat status` prints a fourth presence word, `asleep`, for a seat
+  whose `dispatch.json` records the dispatcher's sleep mark and whose
+  pane is gone. Precedence: `pane`, then `asleep`, then `awake`, then
+  `unattended` — a threshold under ten minutes still prints `asleep`.
+  `specs/status-presence.md` and `README.md` carry the fourth word.
+- Mail wakes an asleep seat in the pass that sees it: the 2-second
+  scan starts a worker for an asleep seat whose inbox holds mail —
+  even when `hapi-sessions.json` no longer names the seat, because
+  seat-role's `start_down` pops the binding before `seat up` — and
+  that worker's first act is the wake: it runs
+  `kit/scripts/seat-role wake <role>` (found at `$SEAT_KIT`, else the
+  kit beside the binary, else PATH; called, never reimplemented — the
+  script stays the only writer of `hapi-sessions.json`, and the
+  dispatcher waits for the script's own deadlines rather than cutting
+  a live wake at 45 s). Only a JSON `status: awake` answer plus a
+  binding for the seat on the re-read delivers in that pass, clears
+  `asleep`, and records `woken: {at, key}` with the delivery key that
+  woke it; `busy` (the cross-role lock, no reason string), `refused`,
+  `failed`, or no binding after an `awake` leaves the seat asleep with
+  the item in the inbox, reported like undelivered mail naming the
+  script's reason, and the next scan retries. The script's `up`
+  answer is a hold, not a retry: a pane runs with no phone session —
+  `up` means stop calling, and a resume-style pane holds
+  `role-wake.lock` through its idle watch — so the wake is not
+  attempted again until that pane is verifiably gone (`wake_hold` in
+  `dispatch.json` records it, one failure line naming the script's
+  reason).
+- `Hub::session_state(id)` returns `{active, thinking, thinking_at}`
+  from the `GET /api/sessions/<id>` body already fetched (`thinking`
+  and `thinking_at` are unset when the key is missing or not the right
+  type, and a 404 leaves them unset while `active` reads false);
+  `session_active` keeps its name and meaning on top of it.
+
 ## [0.7.3] - 2026-10-20
 
 ### Added
