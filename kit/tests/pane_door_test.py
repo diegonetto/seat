@@ -113,11 +113,11 @@ class PaneDoorTest(unittest.TestCase):
             self.assertNotIn(banned, flags)
         self.assertEqual(argv[split + 1:split + 3], ["sh", "-c"])
         script = argv[split + 3]
-        self.assertEqual(script, "exec tmux -S /tmp/tmux-1/default attach -t %12")
+        self.assertEqual(script, "exec tmux -S /tmp/tmux-1/default attach -t door-grok-main")
         for gone in ("sleep", "resize-pane", "if-shell", ";"):
             self.assertNotIn(gone, script)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            DOOR.attach_script("tmux", "/tmp/tmux-1/default", "swarm:gallery")
+            DOOR.attach_script("tmux", "/tmp/tmux-1/default", "grok-main", "swarm:gallery")
 
     def test_off_map_starts_nothing(self):
         result = self.run_door("up", "not-a-seat")

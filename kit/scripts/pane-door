@@ -162,11 +162,49 @@ def newline_for(harness: str) -> tuple[tuple[int, ...], str]:
     return NEWLINES.get(harness, DEFAULT_NEWLINE)
 
 
-def attach_script(tmux: str, socket: str, target: str) -> str:
-    # One command: this client attaches that pane, and the browser grid sizes it.
+def door_session(seat: str) -> str:
+    return f"door-{seat}"
+
+
+def attach_script(tmux: str, socket: str, seat: str, target: str) -> str:
+    # One command: this client attaches the seat's own grouped session, which
+    # ensure_door_session pointed at the pane's window. Clients on the swarm
+    # session itself would all follow its one current window.
     if not PANE_RE.fullmatch(target):
         fail(f"a seat door needs a pane id, got {target!r}")
-    return f"exec {tmux} -S {socket} attach -t {target}"
+    return f"exec {tmux} -S {socket} attach -t {door_session(seat)}"
+
+
+def ensure_door_session(socket: str, seat: str, pane: str) -> None:
+    # A grouped session shares the swarm's windows and keeps its own current
+    # window, so each door shows its seat whatever the swarm has selected.
+    tmux = os.environ.get("PANE_DOOR_TMUX", "tmux")
+    name = door_session(seat)
+    group = subprocess.run(
+        [tmux, "-S", socket, "display", "-p", "-t", pane, "#{session_name}"],
+        check=False, capture_output=True, text=True,
+    ).stdout.strip()
+    if not group:
+        fail(f"{seat}: no tmux session holds pane {pane}")
+    has = subprocess.run([tmux, "-S", socket, "has-session", "-t", "=" + name],
+                         check=False, capture_output=True)
+    if has.returncode != 0:
+        made = subprocess.run([tmux, "-S", socket, "new-session", "-d", "-s", name, "-t", group],
+                              check=False, capture_output=True, text=True)
+        if made.returncode != 0:
+            fail(f"{seat}: cannot open its door session: {made.stderr.strip()}")
+    window = subprocess.run(
+        [tmux, "-S", socket, "display", "-p", "-t", pane, "#{window_id}"],
+        check=False, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run([tmux, "-S", socket, "select-window", "-t", f"{name}:{window}"],
+                   check=False, capture_output=True)
+
+
+def drop_door_session(socket: str, seat: str) -> None:
+    tmux = os.environ.get("PANE_DOOR_TMUX", "tmux")
+    subprocess.run([tmux, "-S", socket, "kill-session", "-t", "=" + door_session(seat)],
+                   check=False, capture_output=True)
 
 
 def ttyd_argv(binary: Path, port: int, seat: str, page: Path, socket: str, target: str, base: str) -> list[str]:
@@ -185,7 +223,7 @@ def ttyd_argv(binary: Path, port: int, seat: str, page: Path, socket: str, targe
         "-P", "5",
         "-I", str(page),
         "--",
-        "sh", "-c", attach_script(tmux, socket, target),
+        "sh", "-c", attach_script(tmux, socket, seat, target),
     ]
     return argv
 
@@ -663,6 +701,7 @@ def cmd_up(argv: list[str]) -> None:
                 continue
             if alive:
                 os.kill(pid, signal.SIGTERM)
+        ensure_door_session(row["socket"], seat, row["pane"])
         log_path = state_dir() / f"{seat}.log"
         log_handle = log_path.open("ab")
         try:
@@ -683,6 +722,7 @@ def cmd_up(argv: list[str]) -> None:
             continue
         record = {"pid": proc.pid, "port": row["port"], "base": row.get("base", "")}
         record["pane"] = row["pane"]
+        record["socket"] = row["socket"]
         record["view"] = "pane"
         record["attach"] = "pane"
         pids[seat] = record
@@ -715,6 +755,8 @@ def cmd_down() -> None:
             pids.pop(seat, None)
             continue
         stop_pid(pid)
+        if isinstance(known.get("socket"), str):
+            drop_door_session(known["socket"], seat)
         pids.pop(seat, None)
         print(f"{seat}  stopped")
     save_pids(pids)
