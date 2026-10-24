@@ -3193,3 +3193,205 @@ fn a_board_the_wake_script_cannot_write_never_sleeps() {
         "the pane went down"
     );
 }
+
+// ---- pending recovery and the working phase (0.8.2) -------------------
+
+/// One `--once` scan: a worker per scheduled seat, exactly one pass
+/// each, then the scan returns.
+fn one_pass_scan(root: &Path) {
+    let stop = Arc::new(AtomicBool::new(false));
+    dispatch::run(
+        root,
+        true,
+        &stop,
+        Waits {
+            first: Duration::from_millis(5),
+            max: Duration::from_millis(5),
+        },
+    )
+    .unwrap();
+}
+
+/// A dispatcher restart leaves an unbound asleep seat carrying a
+/// pending sleep mark with an empty inbox: the scan schedules it —
+/// no binding, no mail — and the first pass settles the mark through
+/// the no-binding cancel, logging one settlement line and no failure.
+#[test]
+fn the_scan_settles_a_pending_sleep_with_no_binding_and_no_mail() {
+    let root = board_with(&[]); // no bindings at all
+    verbs::cmd_register(
+        &root,
+        "opus",
+        "sb",
+        None,
+        Some(root.display().to_string()),
+        vec!["/bin/sleep".into(), "30".into()],
+        None,
+    )
+    .unwrap();
+    let kit_dir = stub_kit(
+        "scan-settle",
+        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        None,
+    );
+    let hub = FakeHub::start();
+    let _env = lock_env(&[
+        ("PATH", path_with(&kit_dir)),
+        ("SEAT_KIT", OsString::from("")),
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+        (
+            "SEAT_FAKE_STATE",
+            OsString::from(root.join("tmux.state").display().to_string()),
+        ),
+        ("HAPI_API_URL", OsString::from(hub.config().base)),
+        ("CLI_API_TOKEN", OsString::from("test-token")),
+    ]);
+    // The restart's leftover: the sleep mark beside a pane fact naming
+    // the live pane — a kill that never landed — and an empty inbox.
+    crate::session::cmd_up(&root, &["opus".to_string()]).unwrap();
+    let pane = crate::session::live_pane_id("opus")
+        .expect("the fake multiplexer answers")
+        .expect("the pane is up");
+    let dir = seat::seat_dir(&root, "opus");
+    dstate::store_state(
+        &dir,
+        &dstate::DispatchState {
+            asleep: Some(dstate::Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            pane_seen_at: Some("2026-10-23T00:00:00Z".into()),
+            pane_id: Some(pane),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    one_pass_scan(&root);
+
+    let state = dstate::load_state(&dir);
+    assert_eq!(
+        state.asleep, None,
+        "the pending sleep is settled on the first pass"
+    );
+    assert_eq!(state.pane_seen_at, None, "the pane fact cleared with it");
+    assert!(
+        crate::session::running_seats(&fake_tmux())
+            .unwrap()
+            .contains("opus"),
+        "the pane was never killed"
+    );
+    let log = log_text(&root);
+    assert!(
+        log.contains("cancelled=1 cause=no-binding"),
+        "the settlement logs its line: {log}"
+    );
+    assert!(
+        !log.contains("failure") && !log.contains("wake"),
+        "no binding and no mail is not a delivery failure: {log}"
+    );
+}
+
+/// The mixed-age case: a turn marks every in-flight posted item
+/// `working`, younger mail included; the turn ends between one pass's
+/// session read and its poll, so the pass archives the older item and
+/// leaves the younger one stored `working`. Once the session reads
+/// idle, the next pass — nothing old owed, the younger file fresh —
+/// must still re-read the session and return the item to `posted`,
+/// and the alarm stays silent until the item's own file crosses the
+/// threshold (a late alarm, never a false one).
+#[test]
+fn a_stored_working_item_returns_to_posted_when_the_session_stops_thinking() {
+    let (root, hub, _client) = kit(&[("opus", "s1")], &[]);
+    let thinking = r#"{"session":{"active":true,"thinking":true,"thinkingAt":60000}}"#;
+    hub.ctl
+        .lock()
+        .unwrap()
+        .get_bodies
+        .insert("s1".into(), thinking.into());
+    let _env = lock_env(&[
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+        (
+            "SEAT_FAKE_STATE",
+            OsString::from(root.join("tmux.state").display().to_string()),
+        ),
+        ("HAPI_API_URL", OsString::from(hub.config().base)),
+        ("CLI_API_TOKEN", OsString::from("test-token")),
+    ]);
+    // The older item: posted in an earlier turn, its file old, still
+    // queued. The younger one arrives mid-turn and stays fresh.
+    let old_key = old_posted_item(&root, "opus", "s1");
+    send(&root, "opus", "the younger one");
+    let young_key = only_key(&root, "opus");
+    mark(&hub, &old_key, "queued");
+    mark(&hub, &young_key, "queued");
+    let dir = seat::seat_dir(&root, "opus");
+
+    // Pass one: the older item is worked (no page), the younger is
+    // posted.
+    one_pass_scan(&root);
+    let item = dstate::load_state(&dir)
+        .items
+        .get(&young_key)
+        .unwrap()
+        .clone();
+    assert_eq!(item.phase, dstate::Phase::Posted);
+
+    // Pass two: the session is on the turn, so both in-flight items
+    // are stored `working`, younger mail included.
+    one_pass_scan(&root);
+    for key in [&old_key, &young_key] {
+        let item = dstate::load_state(&dir).items.get(key).unwrap().clone();
+        assert_eq!(item.phase, dstate::Phase::Working, "{key}");
+    }
+
+    // The turn ends between pass three's session read and its poll:
+    // the hub has already marked the older item invoked while the
+    // session still reads thinking. The pass archives the older item
+    // and leaves the younger one stored `working` — the stale fact.
+    mark(&hub, &old_key, "invoked");
+    one_pass_scan(&root);
+    let state = dstate::load_state(&dir);
+    assert_eq!(
+        state.items.get(&old_key).unwrap().phase,
+        dstate::Phase::Done
+    );
+    let item = state.items.get(&young_key).unwrap().clone();
+    assert_eq!(item.phase, dstate::Phase::Working, "the stale fact is stored");
+    assert_eq!(n_files(&root, "opus", "archive"), 1);
+
+    // The session goes idle. The next pass owes nothing old, but the
+    // stored `working` item is re-read and returned to `posted`.
+    hub.ctl
+        .lock()
+        .unwrap()
+        .get_bodies
+        .insert("s1".into(), QUIET.into());
+    one_pass_scan(&root);
+    let item = dstate::load_state(&dir)
+        .items
+        .get(&young_key)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        item.phase,
+        dstate::Phase::Posted,
+        "the stale working phase is gone on the next pass"
+    );
+    assert_eq!(item.working_at, None);
+    assert_eq!(
+        n_files(&root, "opus", "draining"),
+        1,
+        "the younger item is still in flight"
+    );
+    assert_eq!(
+        n_posts(&hub.journal()),
+        1,
+        "the younger item was posted exactly once"
+    );
+    let log = log_text(&root);
+    assert!(
+        !log.contains("cause=undelivered"),
+        "no page before the item's own threshold: {log}"
+    );
+}

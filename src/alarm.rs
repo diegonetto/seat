@@ -191,10 +191,12 @@ fn item_state(seat: &str, state: &DispatchState, file: &str) -> Option<(String, 
 
 /// The hapi pass's `undelivered` (BLL-124): the same file-age rule
 /// with the exceptions the session read decides, per old file. The
-/// bound session is read first — asked only when something is old —
-/// and an in-flight `posted` item on an active session reporting
+/// bound session is read first — asked only when something is old or
+/// an item is stored `working` — and an in-flight `posted` item on an
+/// active session reporting
 /// `thinking` exactly `true` is `working`: the record gets that phase
-/// with the time of the read, and the next pass re-reads (a read that
+/// with the time of the read, and every later pass re-reads — old
+/// files or not, while any item is stored `working` — (a read that
 /// does not say thinking — a missing flag, a quiet or inactive
 /// session, a GET error — returns the item to `posted`, so no page is
 /// silenced by a stale fact and no new timer is needed). The hub
@@ -227,11 +229,14 @@ pub(crate) fn undelivered_hapi(
     session: &str,
 ) -> Result<()> {
     let old = old_files(present, &BTreeSet::new(), cutoff());
-    if old.is_empty() {
+    // A stored `working` item is reconciled even when nothing is old
+    // yet: a turn that ended must not leave the phase stale until the
+    // item's own file crosses the threshold.
+    if old.is_empty() && !state.items.values().any(|i| i.phase == Phase::Working) {
         return clear(root, Some(seat), UNDELIVERED); // nothing old is owed
     }
-    // Asked only when something is old: a clean pass never pays for
-    // this read.
+    // Asked only when something is old or something is stored
+    // `working`: a clean pass never pays for this read.
     let session_read = hub.session_state(session).map_err(|e| e.to_string());
     let thinking = matches!(&session_read, Ok(s) if s.active && s.thinking == Some(true));
     // The stored `working` phase: set for every in-flight posted item

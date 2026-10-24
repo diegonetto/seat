@@ -145,7 +145,10 @@ old decision.
 Mail reverses it in the pass that sees it. The scan starts a worker
 for an asleep seat whose inbox holds mail — even when the binding file
 no longer names the seat, and even when a leftover `webhook.url` would
-otherwise route it to the hook — and that worker's first act is the
+otherwise route it to the hook — and for an asleep seat whose mark
+sits beside a pane fact, a pending kill, whether or not a binding or
+mail waits: a restart's leftover mark is settled by the first scan
+that sees it. The mail worker's first act is the
 wake: it
 runs the kit's own `kit/scripts/seat-role wake <role>` (found at
 `$SEAT_KIT`, else the kit beside the binary, else PATH), waits for the
@@ -206,7 +209,8 @@ undelivered, by the age of its mail file in `inbox/` or `draining/`;
 on the hapi pass the bound session is read first: such a file in
 flight as `posted` on an active session reporting `thinking: true` is
 `working` — the record gets that phase with the time of the read, and
-the next pass re-reads — and such a file the hub reports invoked on
+every pass re-reads while any item is stored `working`, old files or
+not — and such a file the hub reports invoked on
 an active session is delivered, not paged, however long the turn;
 every other old file still pages, a hub error pages with the error
 named, and the page names what the pass saw — `posted, session idle
