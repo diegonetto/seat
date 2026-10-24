@@ -193,13 +193,13 @@ fn item_state(seat: &str, state: &DispatchState, file: &str) -> Option<(String, 
 /// with the exceptions the session read decides, per old file. The
 /// bound session is read first — asked only when something is old or
 /// an item is stored `working` — and an in-flight `posted` item on an
-/// active session reporting
-/// `thinking` exactly `true` is `working`: the record gets that phase
-/// with the time of the read, and every later pass re-reads — old
-/// files or not, while any item is stored `working` — (a read that
-/// does not say thinking — a missing flag, a quiet or inactive
-/// session, a GET error — returns the item to `posted`, so no page is
-/// silenced by a stale fact and no new timer is needed). The hub
+/// active session reporting `thinking` exactly `true` is `working`:
+/// the record gets that phase with the time of the read, and every
+/// pass re-reads while any item is stored `working`, old files or
+/// not (a read that does not say thinking — a missing flag, a quiet
+/// or inactive session, a GET error — returns the item to `posted`,
+/// so no page is silenced by a stale fact and no new timer is
+/// needed). The hub
 /// marks a queued message invoked only when the turn ends, and this
 /// decision runs before the pass's poll commits that mark (the file
 /// is still in `draining/`), so an old `posted` item the hub reports

@@ -3229,15 +3229,10 @@ fn the_scan_settles_a_pending_sleep_with_no_binding_and_no_mail() {
         None,
     )
     .unwrap();
-    let kit_dir = stub_kit(
-        "scan-settle",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    // No kit is stubbed and PATH is left alone: the cancel path never
+    // wakes, so nothing in this pass consults the kit.
     let hub = FakeHub::start();
     let _env = lock_env(&[
-        ("PATH", path_with(&kit_dir)),
-        ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
         (
             "SEAT_FAKE_STATE",

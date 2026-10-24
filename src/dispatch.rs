@@ -69,16 +69,13 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // one to kill). A pane that came back after a completed sleep has
     // no pane fact: the early return below ends the sleep — the mark
     // clears and that pane starts a fresh clock.
-    let pending = state.asleep.is_some() && state.pane_seen_at.is_some();
-    if pending {
+    if state.asleep.is_some() && state.pane_seen_at.is_some() {
         sleep::settle_pending_sleep(root, seat, &mut state, hub)?;
-    }
-    if pending && state.asleep.is_none() {
-        // The settlement cancelled the sleep, and it logged its own
-        // line. With no binding and no owed mail nothing is staged
-        // and nothing can be delivered: end the pass clean, never
-        // the staged-mail failure below (there is no mail).
-        if Bindings::load(root).session_id(seat).is_none()
+        // The settlement cancelled the sleep and logged its line: no
+        // binding and no owed mail means nothing staged and nothing
+        // to deliver — end the pass clean, not with the failure below.
+        if state.asleep.is_none()
+            && Bindings::load(root).session_id(seat).is_none()
             && webhook::present_files(&dir).is_empty()
         {
             return Ok(Pass::Idle);
@@ -543,8 +540,7 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
         // never through the hook.
         // An asleep seat whose mark sits beside a pane fact — a kill
         // that never landed — is scheduled with no binding and no
-        // mail too: the pass settles the pending sleep either way,
-        // so the mark and the fact never linger past the first scan.
+        // mail too: the pass settles the pending sleep either way.
         for name in &names {
             if !hapi_seats.contains(name)
                 && crate::dstate::is_asleep(root, name)
