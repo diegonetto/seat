@@ -71,6 +71,15 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // clears and that pane starts a fresh clock.
     if state.asleep.is_some() && state.pane_seen_at.is_some() {
         sleep::settle_pending_sleep(root, seat, &mut state, hub)?;
+        // The settlement cancelled the sleep and logged its line: no
+        // binding and no owed mail means nothing staged and nothing
+        // to deliver — end the pass clean, not with the failure below.
+        if state.asleep.is_none()
+            && Bindings::load(root).session_id(seat).is_none()
+            && webhook::present_files(&dir).is_empty()
+        {
+            return Ok(Pass::Idle);
+        }
     }
     if state.asleep.is_some() {
         let owed = webhook::present_files(&dir);
@@ -529,12 +538,16 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
         // outranks a `webhook.url` the seat also holds too — it slept
         // as a hapi seat (hapi wins while bound), so it wakes as one,
         // never through the hook.
+        // An asleep seat whose mark sits beside a pane fact — a kill
+        // that never landed — is scheduled with no binding and no
+        // mail too: the pass settles the pending sleep either way.
         for name in &names {
             if !hapi_seats.contains(name)
                 && crate::dstate::is_asleep(root, name)
-                && !msg::list_msg_dir(&seat::seat_dir(root, name).join("inbox"))
-                    .unwrap_or_default()
-                    .is_empty()
+                && (crate::dstate::pending_sleep(root, name)
+                    || !msg::list_msg_dir(&seat::seat_dir(root, name).join("inbox"))
+                        .unwrap_or_default()
+                        .is_empty())
             {
                 hapi_seats.push(name.clone());
                 webhook_seats.retain(|s| s != name);

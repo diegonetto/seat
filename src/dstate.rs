@@ -204,6 +204,14 @@ pub fn is_asleep(root: &Path, seat_name: &str) -> bool {
         .is_some()
 }
 
+/// The scan's recovery rule: the sleep mark beside a pane fact — a
+/// kill that never landed. Such a seat is scheduled whether or not it
+/// is bound and whether or not mail waits; the pass settles the mark.
+pub fn pending_sleep(root: &Path, seat_name: &str) -> bool {
+    let state = load_state(&seat::seat_dir(root, seat_name));
+    state.asleep.is_some() && state.pane_seen_at.is_some()
+}
+
 /// Delivery keys: never the 4-byte id alone.
 pub(crate) fn direct_key(seat: &str, file: &str) -> String {
     format!("seat:{seat}:{file}")

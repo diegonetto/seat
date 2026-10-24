@@ -2,6 +2,39 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.2] - 2026-10-23
+
+### Fixed
+
+- A dispatcher restart left an unbound asleep seat carrying a pending
+  sleep mark with an empty inbox unscheduled (BLL-137, accepted at
+  0.8.0): the scan added an asleep seat to its workers only when
+  inbox mail existed, so for that seat the settlement's no-binding
+  cancellation never ran and the mark and the pane fact lingered with
+  no settlement log until mail arrived — never a wrong kill, never
+  lost mail, but a reader was left a wrong fact. The scan now
+  schedules every seat whose state carries a pending sleep mark (the
+  `asleep` record beside a pane fact), whether or not the seat is
+  bound and whether or not mail waits; the pass settles it exactly as
+  before (`settle_pending_sleep` decides and logs its one line), and
+  a settlement that cancels a seat with no binding and no owed mail
+  now ends the pass clean instead of falling through to the
+  staged-mail failure line (nothing was staged). The guards before
+  any kill — the pane id, the re-read session, the inbox — are
+  untouched.
+- The hapi pass reconciled stored `working` items only when something
+  was old (BLL-139, accepted at 0.8.1): a thinking turn marks every
+  in-flight posted item `working`, younger mail included, and once
+  the older item was invoked and archived the empty old-file set
+  returned early, so a younger item stayed `working` after the
+  session stopped thinking — until its own file crossed the 15-minute
+  threshold, a late alarm, never a false one. Every pass that holds a
+  stored `working` item now re-reads the session and returns the item
+  to `posted` (or on) when the session is no longer thinking, before
+  the alarm's age filter runs; a pass with nothing old and nothing
+  stored `working` still never pays for the read, and the threshold
+  and the alarm's words are unchanged.
+
 ## [0.8.1] - 2026-10-23
 
 ### Fixed
