@@ -304,7 +304,18 @@ behaviour from the agent-skills library. One line each:
   (HAPI) session, answering one JSON result, or report why it cannot;
   `seat-role pins` reports each seat's model and effort drift.
 - `kit/scripts/seat-sit` — the stored pane command for a gallery seat:
-  it records the pane target, then replaces itself with the harness.
+  it records the pane target, then replaces itself with seat-supervise.
+- `kit/scripts/seat-supervise` — runs the harness as the pane's foreground
+  process group: tmux still names the harness as the pane's command, a
+  HAPI-wrapped harness waits for the hub first, and a harness that dies at
+  launch leaves `harness-exit.log` (argv, exit code, last lines) in the
+  seat's runtime directory, with up to three retries while the hub port is
+  closed.
+- `kit/scripts/seat-hub-wait` — wait until the HAPI hub accepts a
+  connection on `127.0.0.1:3006`; an expired wait is logged and is never
+  fatal. One script called from both places: the gallery unit's
+  `ExecStartPre` and seat-supervise, so a boot and a hand `seat up` behave
+  alike.
 - `kit/scripts/seat-gallery-up` — boot: start every seat's pane, then
   link each session through the normal wake path.
 - `kit/scripts/pane-door` — one localhost ttyd per seat pane plus the

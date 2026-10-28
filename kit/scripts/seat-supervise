@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Launch supervisor for one gallery seat: seat-supervise SEAT RUNTIME PANE ARGV...
+
+seat-sit execs this once the pane target is recorded, so the pane's process is
+this supervisor while the harness runs as the pane's foreground process group:
+tmux still reports the harness as the pane's current command (the wake path's
+pane check depends on that), and killing the pane stops the harness with it.
+
+A HAPI-wrapped harness (argv beginning `hapi` or `hapi-glm`) first runs the
+same readiness wait the seat-gallery unit uses (seat-hub-wait). A harness that
+exits at launch — inside the launch window — leaves harness-exit.log in the
+seat's runtime directory on every exit: the argv words (never environment
+values), the exit code, and the pane's last 20 lines. While the hub port is
+closed, such an exit is retried up to three times before the code is returned;
+a harness that survives the window, or exits after it, is waited on and its
+exit code becomes the pane's.
+
+SEAT_HUB_WAIT_TIMEOUT, SEAT_HUB_HOST and SEAT_HUB_PORT reach the wait script;
+SEAT_LAUNCH_WINDOW (seconds, default 30) bounds "at launch";
+SEAT_RETRY_GAP (seconds, default 5) spaces the retries.
+"""
+import datetime
+import os
+from pathlib import Path
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+
+RETRIES = 3
+
+
+def env_number(name, default):
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def hub_open(host, port):
+    """True when the hub port accepts a connection right now."""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def hub_wait(script):
+    """Run the shared readiness wait; its own words go to the pane or journal."""
+    try:
+        subprocess.run([str(script)])
+    except OSError:
+        pass
+
+
+def is_wrapped(argv):
+    """True for a HAPI-wrapped harness: `hapi <cli> ...` or glm's `hapi-glm`."""
+    return bool(argv) and Path(argv[0]).name in ("hapi", "hapi-glm")
+
+
+def spawn(argv):
+    """Start the harness as the pane's foreground process group; return its pid."""
+    pid = os.fork()
+    if pid == 0:
+        # New process group led by the harness, default tty signal dispositions
+        # (python ignores SIGPIPE, and an ignored disposition survives exec),
+        # then wait until the parent hands the terminal over before exec.
+        os.setpgid(0, 0)
+        for name in ("SIGPIPE", "SIGXFSZ", "SIGXFZ", "SIGTTIN", "SIGTTOU"):
+            number = getattr(signal, name, None)
+            if number is not None:
+                signal.signal(number, signal.SIG_DFL)
+        for _ in range(40):
+            try:
+                if os.tcgetpgrp(0) == os.getpgrp():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        try:
+            os.execvp(argv[0], argv)
+        except OSError:
+            os._exit(127)
+    try:
+        os.setpgid(pid, pid)
+    except OSError:
+        pass
+    os.tcsetpgrp(0, pid)
+    return pid
+
+
+def foreground():
+    """Take the terminal back after a harness exit, before the pane is read."""
+    try:
+        os.tcsetpgrp(0, os.getpgrp())
+    except OSError:
+        pass
+
+
+def code_of(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def await_exit(pid, window):
+    """(exit code, exited within the launch window) for one harness run."""
+    deadline = time.monotonic() + window
+    at_launch = True
+    while True:
+        got, status = os.waitpid(pid, os.WNOHANG)
+        if got == pid:
+            break
+        if time.monotonic() >= deadline:
+            at_launch = False
+            got, status = os.waitpid(pid, 0)
+            break
+        time.sleep(0.1)
+    foreground()
+    return code_of(status), at_launch
+
+
+def tail_pane(pane):
+    """The pane's last 20 lines as tmux shows them (what the operator saw)."""
+    try:
+        done = subprocess.run(["tmux", "capture-pane", "-p", "-S", "-200", "-t", pane],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if done.returncode:
+        return ""
+    return "\n".join(done.stdout.rstrip().splitlines()[-20:])
+
+
+def write_trace(path, seat, argv, code, tail):
+    """Overwrite harness-exit.log: argv words, exit code, last lines. No env values."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text("\n".join([
+        "seat: " + seat,
+        "at: " + stamp,
+        "argv: " + " ".join(shlex.quote(word) for word in argv),
+        "exit: " + str(code),
+        "last lines:",
+        tail,
+        "",
+    ]))
+
+
+def main(argv):
+    if len(argv) < 4:
+        sys.stderr.write("usage: seat-supervise SEAT RUNTIME PANE ARGV...\n")
+        return 2
+    seat, runtime, pane = argv[1:4]
+    harness = argv[4:]
+    if not harness:
+        sys.stderr.write("seat-supervise: no harness argv\n")
+        return 2
+    script_dir = Path(__file__).resolve().parent
+    wait_script = script_dir / "seat-hub-wait"
+    trace = Path(runtime) / "harness-exit.log"
+    host = os.environ.get("SEAT_HUB_HOST", "127.0.0.1")
+    try:
+        port = int(os.environ.get("SEAT_HUB_PORT", "3006"))
+    except ValueError:
+        port = 3006
+    wrapped = is_wrapped(harness)
+    if wrapped:
+        hub_wait(wait_script)
+    retries = RETRIES
+    while True:
+        pid = spawn(harness)
+        code, at_launch = await_exit(pid, env_number("SEAT_LAUNCH_WINDOW", 30))
+        if not at_launch:
+            return code
+        write_trace(trace, seat, harness, code, tail_pane(pane))
+        # The retry fires only while the hub port is closed; a harness that
+        # exits for any other reason is not relaunched.
+        if retries > 0 and wrapped and code != 0 and not hub_open(host, port):
+            retries -= 1
+            time.sleep(env_number("SEAT_RETRY_GAP", 5))
+            hub_wait(wait_script)
+            continue
+        return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
