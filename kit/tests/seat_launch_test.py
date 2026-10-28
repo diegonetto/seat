@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -30,7 +31,6 @@ def write_exec(path: Path, body: str) -> None:
 
 def free_port() -> int:
     """A loopback port nothing listens on (bound to be chosen, then released)."""
-    import socket
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
@@ -42,7 +42,6 @@ class HubWaitTest(unittest.TestCase):
                               text=True, env=env, timeout=30)
 
     def test_open_port_returns_at_once(self):
-        import socket
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
@@ -86,9 +85,9 @@ class SeatSitTest(unittest.TestCase):
         self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"],
                         capture_output=True)
 
-    def harness(self, argv, cwd, kind="codex"):
+    def harness(self, argv, cwd):
         (self.runtime / "harness.json").write_text(json.dumps({
-            "harness": kind, "argv": argv, "cwd": cwd, "expect_cmds": ["hapi"],
+            "harness": "codex", "argv": argv, "cwd": cwd, "expect_cmds": ["hapi"],
         }))
 
     def sit(self, extra_env=""):
