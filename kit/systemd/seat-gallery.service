@@ -16,8 +16,16 @@ RemainAfterExit=yes
 KillMode=process
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Projects
-# Give the hub a moment to listen before the wrapped seats connect to it.
-ExecStartPre=/bin/sleep 5
+# Wait for the hub's port, not its process: systemd counts a Type=simple unit started
+# the moment its process runs, so After=hapi-hub.service plus a fixed sleep seated every
+# seat inside the hub's 14-second startup window at the 2026-10-28 boot and the Codex
+# harness exited silently at launch. seat-hub-wait polls 127.0.0.1:3006 for a TCP accept
+# (up to 60 s, never touching the hub itself); an expired wait is logged here and is not
+# fatal — seats still start, so a dead hub shows in `seat status`, not a unit that never
+# ran. Keep this ExecStartPre: seat-gallery-up wakes roles right after seating them, and
+# seat-sit runs the same wait, so removing it races the wake's pane check against a
+# still-waiting seat.
+ExecStartPre=%h/Projects/seat/kit/scripts/seat-hub-wait
 # The map names the seats. The script starts each pane, links sessions serially,
 # and reports failures after attempting every seat. seat up skips running panes; a wake restarts only a
 # running plain seat it moves under HAPI.

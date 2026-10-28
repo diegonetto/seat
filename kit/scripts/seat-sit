@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Stored pane command for one gallery seat: seat-sit <seat>.
 # Records the pane target (pane.pid, wake-target.json) for the wake and
-# pane-door lookups, then replaces this process with the harness so the
-# tmux pane pid stays the harness and seat down stops it.
+# pane-door lookups, then replaces itself with seat-supervise, which waits for
+# the HAPI hub (a HAPI-wrapped harness), runs the harness as the pane's
+# foreground process group, and leaves a trace (harness-exit.log) when a
+# harness dies at launch; seat down still stops the harness with the pane.
 set -u
 
 SEAT="${1:-}"
 RUNTIME="${SEAT_RUNTIMES:-/home/slix/Projects/.seat-runtimes}/${SEAT}"
+KIT="$(cd -- "$(dirname -- "$0")" && pwd)"
 
 case "$SEAT" in
   ""|.*|*[!A-Za-z0-9._-]*)
@@ -86,4 +89,4 @@ ARGV=("${LAUNCH[@]:1}")
 if ! cd -- "$CWD"; then
   exit 1
 fi
-exec -- "${ARGV[@]}"
+exec "$KIT/seat-supervise" "$SEAT" "$RUNTIME" "$TMUX_PANE" "${ARGV[@]}"

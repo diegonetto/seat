@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Wait until the HAPI hub accepts a TCP connection on 127.0.0.1:3006.
+# systemd counts a Type=simple unit started the moment its process runs, so
+# After=hapi-hub.service orders only the hub's process, never its port: at the
+# 2026-10-28 boot the gallery seated codex-main 5 s after the hub process ran
+# and 9 s before the hub first listened, and the harness exited at once. So
+# readiness here is a TCP accept on the hub's port, never the hub process
+# existing — and this script never starts, stops or restarts the hub.
+# An expired wait says so and is not fatal (exit 0): seats still start, so a
+# dead hub is visible in `seat status` rather than hidden behind a unit that
+# never ran. One script, called from both places: seat-gallery.service's
+# ExecStartPre and seat-supervise (which seat-sit execs), so the unit and a
+# hand `seat up` behave alike.
+# SEAT_HUB_WAIT_TIMEOUT sets the ceiling in seconds (default 60, measured 14 s
+# on this box); SEAT_HUB_HOST and SEAT_HUB_PORT retarget the probe for tests.
+set -u
+
+HOST="${SEAT_HUB_HOST:-127.0.0.1}"
+PORT="${SEAT_HUB_PORT:-3006}"
+TIMEOUT="${SEAT_HUB_WAIT_TIMEOUT:-60}"
+case "$HOST" in
+  ''|*[!A-Za-z0-9.:-]*) HOST=127.0.0.1 ;;
+esac
+case "$PORT" in
+  ''|*[!0-9]*) PORT=3006 ;;
+esac
+case "$TIMEOUT" in
+  ''|*[!0-9]*) TIMEOUT=60 ;;
+esac
+
+now_us() {
+  # Microseconds since the epoch ($EPOCHREALTIME drops the dot); SECONDS
+  # follows wall-clock second boundaries, too coarse for short ceilings.
+  local t="${EPOCHREALTIME:-}"
+  if [ -z "$t" ]; then
+    t="$(date +%s).000000"
+  fi
+  printf '%s\n' "${t/./}"
+}
+
+deadline=$(( $(now_us) + TIMEOUT * 1000000 ))
+while :; do
+  if (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null; then
+    exit 0
+  fi
+  if [ "$(now_us)" -ge "$deadline" ]; then
+    break
+  fi
+  sleep 0.25
+done
+printf 'seat-hub-wait: the hub at %s:%s did not answer within %s s; starting anyway\n' \
+  "$HOST" "$PORT" "$TIMEOUT" >&2
+exit 0

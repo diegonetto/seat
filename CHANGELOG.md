@@ -2,6 +2,50 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.3] - 2026-10-28
+
+### Fixed
+
+- The gallery waits for the HAPI hub before seating, and a harness that dies
+  at launch leaves a trace (BLL-151). At the 2026-10-28 boot
+  `hapi-hub.service` ran at 13:28:22, the gallery seated codex-main at
+  13:28:31, and the hub first accepted connections at 13:28:36: systemd
+  counts a `Type=simple` unit started the moment its process runs, so
+  `After=hapi-hub.service` plus `ExecStartPre=/bin/sleep 5` seated every seat
+  inside the hub's 14-second startup window, and the Codex harness — which
+  exits when the hub is unreachable at launch — took its pane with it with
+  nothing logged: the lander seat silently down after every reboot.
+  `kit/scripts/seat-hub-wait` (new) polls `127.0.0.1:3006` for a TCP accept
+  up to `SEAT_HUB_WAIT_TIMEOUT` seconds (default 60; 14 measured on this
+  box, `SEAT_HUB_HOST`/`SEAT_HUB_PORT` retarget the probe for tests) —
+  readiness is the port accepting, never the hub process existing, and the
+  wait never starts, stops or restarts the hub. An expired wait says so and
+  is not fatal (exit 0), so seats still start and a dead hub is visible in
+  `seat status` rather than hidden behind a unit that never ran. The
+  gallery unit's `ExecStartPre` now runs this one script (its comment says
+  why the ExecStartPre must stay: `seat-gallery-up` wakes roles right after
+  seating them, and seat-sit runs the same wait, so removing it races the
+  wake's pane check against a still-waiting seat). `seat-sit` no longer
+  execs the harness itself: it execs `kit/scripts/seat-supervise` (new),
+  which starts the harness as the pane's foreground process group — tmux
+  still reports the harness as the pane's current command, the recorded
+  pane pid still matches the pane, and `seat down` still stops the harness
+  with the pane — waits for the hub first when the harness is HAPI-wrapped
+  (`hapi`/`hapi-glm`), and on a harness exit at launch (within
+  `SEAT_LAUNCH_WINDOW`, default 30 s) overwrites `harness-exit.log` in the
+  seat's runtime directory with the argv words (never environment values),
+  the exit code and the pane's last 20 lines; while the hub port is closed
+  such an exit is retried up to three times, `SEAT_RETRY_GAP` seconds apart
+  (default 5), each retry waiting for the hub again. A harness that exits
+  for any other reason is not relaunched, and `seat up` keeps its
+  idempotence (a second call never duplicates a running pane).
+  `kit/tests/seat_launch_test.py` covers both controls of the wait (an
+  open port returns in under a second; a closed port expires at its
+  ceiling, says so and exits 0) and the supervised launch (a harness
+  exiting 1 at launch leaves `harness-exit.log` with the code and the tail
+  beside a matching wake target; a wrapped harness dying on a closed hub
+  port runs once plus the three retries).
+
 ## [0.8.2] - 2026-10-23
 
 ### Fixed
