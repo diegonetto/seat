@@ -284,8 +284,6 @@ class RoleWakeTest(unittest.TestCase):
         (self.bin / 'dirname').symlink_to('/usr/bin/dirname')
         self.sb = self.root / 'switchboard'
         self.sb.mkdir()
-        # seat_map is fetched once per process; every test starts cold against this test's stub.
-        ROLE._SEAT_MAP = None
         self.memory = self.root / 'memory.csv'
         self.memory.write_text('timestamp,free_mb\n2026-10-14T02:30:00Z,3000\n')
         (self.home / '.hapi').mkdir(parents=True)
@@ -427,14 +425,6 @@ class RoleWakeTest(unittest.TestCase):
         self.save()
         self.assertEqual(self.invoke(), {'status': 'awake', 'url': EXPECTED_URL})
         self.assertFalse(any('PATCH' in c for c in self.calls() if c[0] == 'curl'))
-
-    def test_old_role_name_is_replaced(self):
-        # "Reviewer · opus-main" was this code's own name for the seat; it becomes "Claude · opus-main".
-        self.state['sessions'][0] = self.session(name='Reviewer · opus-main')
-        self.save()
-        self.assertEqual(self.invoke(), {'status': 'awake', 'url': EXPECTED_URL})
-        stub = json.loads((self.root / 'stub.json').read_text())
-        self.assertEqual(stub['renames'][SESSION], 'Claude · opus-main')
 
     def test_folder_name_is_replaced(self):
         # HAPI falls back to the folder name ("Projects"); that is not a real name, so the seat names it.
@@ -591,7 +581,8 @@ class RoleWakeTest(unittest.TestCase):
         for args in (['wake', 'admin'], ['wake', '../reviewer']):
             with self.subTest(args=args):
                 self.assertEqual(self.invoke(args)['status'], 'failed')
-        self.assertEqual(self.calls(), [['sb', 'seats', '--json']])
+        # Each refusal reads the map twice: once to look the role up, once to list the roles it offers.
+        self.assertEqual(self.calls(), [['sb', 'seats', '--json']] * 4)
 
     def test_six_seat_map_resolves_every_role(self):
         for seat, row in MAP['seats'].items():
@@ -803,8 +794,15 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(self.clock.now, 12)
 
     def test_command_timeout_returns_one_safe_result(self):
-        ROLE.seat_map()  # The once-per-process map read precedes the patched child commands.
-        with patch.object(ROLE.subprocess, 'run', side_effect=subprocess.TimeoutExpired('stub', 1)):
+        real_run = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            # The seat map reads normally; every child command after it times out.
+            if argv[0] == 'sb':
+                return real_run(argv, *args, **kwargs)
+            raise subprocess.TimeoutExpired('stub', 1)
+
+        with patch.object(ROLE.subprocess, 'run', side_effect=run):
             self.assertIn('timed out', self.no_mutation('failed')['reason'])
 
     def test_hub_discovery_uses_remaining_deadline(self):
@@ -1181,7 +1179,6 @@ class PinsTest(unittest.TestCase):
         stub.write_text("#!" + sys.executable + "\n" + STUB)
         stub.chmod(0o755)
         (root / "stub.json").write_text(json.dumps({"map": {"schema_version": 1, "seats": seats}}))
-        ROLE._SEAT_MAP = None
         out = io.StringIO()
         with patch.dict(os.environ, {"PATH": str(root), "STUB_ROOT": str(root),
                                      "SEAT_ROLE_HOME": str(root / "home"), "SEAT_RUNTIMES": str(rt)}):

@@ -45,7 +45,8 @@ the inbox.
 ## Verbs
 
 `init`, `register`, `send`, `drain`, `dispatch`, `up`, `down`,
-`gallery`, `status`, `reset`. An unknown verb exits 2 and prints this list.
+`gallery`, `status`, `reset`. An unknown verb exits 2 with
+`error: unrecognized subcommand '<verb>'` and a usage line.
 
 ```
 seat init
@@ -148,9 +149,7 @@ no longer names the seat, and even when a leftover `webhook.url` would
 otherwise route it to the hook — and for an asleep seat whose mark
 sits beside a pane fact, a pending kill, whether or not a binding or
 mail waits: a restart's leftover mark is settled by the first scan
-that sees it. The mail worker's first act is the
-wake: it
-runs the kit's own `kit/scripts/seat-role wake <role>` (found at
+that sees it. The mail worker's first act is the wake: it runs the kit's own `kit/scripts/seat-role wake <role>` (found at
 `$SEAT_KIT`, else the kit beside the binary, else PATH), waits for the
 script to run to its own deadlines, and only a JSON `awake` answer
 plus a binding on the re-read delivers in that pass, clearing the mark
@@ -269,10 +268,9 @@ session within the last 10 minutes (read from
 everything else. `mail=<N>` is the number of files in that seat's
 inbox. It is printed on every row. Mail does not change presence.
 
-`seat reset` removes the marker, `seats/` (the room cursors inside
-it included), and any leftover `rooms/` from before 0.7.0 (when rooms
-were removed). It removes the root directory only when that leaves
-the directory empty.
+`seat reset` removes the marker, `seats/`, and any leftover `rooms/`.
+It removes the root directory only when that leaves the directory
+empty.
 
 ## Board
 
@@ -286,11 +284,6 @@ the directory empty.
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
 ```
-
-A board from before 0.7.0 may still carry `<root>/rooms/` and
-`seats/<name>/cursors/`; nothing reads or writes them, and nothing in
-normal operation (`drain`, `dispatch`, `send`) deletes them. Only
-`seat reset` removes them, with the rest of the board.
 
 A command other than `init` refuses a directory it does not recognize
 and names the path.

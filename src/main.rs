@@ -1,5 +1,3 @@
-// Verb dispatch (FR-002). The keep-list is the whole surface; anything
-// else exits 2 and is told the list.
 mod alarm;
 mod board;
 mod dispatch;
@@ -23,9 +21,6 @@ mod webhook_tests;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::Path;
-
-/// The whole verb surface (FR-002).
-pub const KEEP_LIST: &str = "init register send drain dispatch up down gallery status reset";
 
 #[derive(Parser)]
 #[command(
@@ -87,9 +82,6 @@ enum Command {
     Status,
     /// Remove the board under the root (marker, seats/, leftover rooms/)
     Reset,
-    /// Any verb outside the keep-list lands here.
-    #[command(external_subcommand)]
-    Unknown(Vec<String>),
 }
 
 #[derive(clap::Args)]
@@ -112,13 +104,6 @@ struct RegisterArgs {
     /// that omits it keeps the stored value
     #[arg(long, value_name = "DURATION")]
     idle_after: Option<String>,
-}
-
-/// Unknown-verb refusal (exit 2) with the keep-list.
-fn refuse(verb: &str) -> ! {
-    eprintln!("seat: unknown verb '{verb}'");
-    eprintln!("verbs: {KEEP_LIST}");
-    std::process::exit(2);
 }
 
 /// The caller's session id, read once at the CLI edge (empty means
@@ -147,7 +132,7 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         }
         Command::Drain { seat } => {
             let mut out = std::io::stdout().lock();
-            verbs::cmd_drain(root, &seat, &mut out)
+            drain::drain(root, &seat, &mut out)
         }
         Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
         Command::Up { names } => session::cmd_up(root, &names),
@@ -155,8 +140,6 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         Command::Gallery => session::cmd_gallery(root),
         Command::Status => session::cmd_status(root),
         Command::Reset => verbs::cmd_reset(root),
-        // Unknown verbs are refused in main() before dispatch.
-        Command::Unknown(_) => unreachable!("unknown verbs refuse before dispatch"),
     }
 }
 
@@ -171,9 +154,6 @@ fn main() {
                 1
             }
         },
-        Some(Command::Unknown(words)) => {
-            refuse(words.first().map(|w| w.as_str()).unwrap_or_default())
-        }
         Some(cmd) => {
             let session = env_session_id();
             match dispatch(&root, cmd, session.as_deref()) {

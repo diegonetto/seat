@@ -1,4 +1,4 @@
-//! Sleep and wake (BLL-127, 0.8.0): a hapi seat idle past its
+//! Sleep and wake: a hapi seat idle past its
 //! `--idle-after` threshold goes down through the same `down` path
 //! one pane already uses and `dispatch.json` records `asleep`; mail
 //! wakes it through `kit/scripts/seat-role wake <role>`. The script
@@ -179,25 +179,18 @@ fn wake_writes_root(root: &Path) -> bool {
     }
 }
 
-/// Is this hapi seat idle enough to sleep, and does it go down? All
-/// must hold: a stored `idle_after` threshold; an idle clock —
-/// `pane_seen_at`, or the later of it and a delivery to the currently
-/// bound session — at least that old (a delivery to a session the
-/// seat is no longer bound to does not count; no `pane_seen_at` means
-/// never); nothing in flight (the caller is already in the empty
-/// branch); nothing owed — the pass's own set, `inbox/` and
-/// `draining/`, looked for once more immediately before the record,
-/// so mail that landed during the pass still stops the sleep; the
-/// bound session's `thinking` explicitly `false` — a missing key, a
-/// non-boolean, a 404, or a GET error means not idle, so a missing
-/// flag is never permission to sleep; a role in the kernel seat map,
-/// because the wake takes one (a map failure means not idle); and the
-/// dispatcher's board being the very board the wake script writes,
-/// because any other board's wake could never rewrite this board's
-/// bindings. The kill names the pane the fact times — a dead-but-
-/// listed pane never shields it — and when a different live pane
-/// remains under the same seat name the sleep just recorded is
-/// cancelled: nothing dies.
+/// Is this hapi seat idle enough to sleep, and does it go down?
+///
+/// Invariant: a missing fact is never permission to sleep. All must
+/// hold: a stored `idle_after`; an idle clock (`pane_seen_at`, or the
+/// later of it and a delivery to the currently bound session) at least
+/// that old; nothing in flight; nothing owed in `inbox/` or
+/// `draining/`, looked for again just before the record; the bound
+/// session's `thinking` explicitly `false`; a role in the kernel seat
+/// map, because the wake takes one; and the dispatcher's board being
+/// the board the wake script writes. The kill names the pane the clock
+/// timed, and a different live pane under the same seat name cancels
+/// the sleep: nothing dies.
 pub(crate) fn try_sleep(
     root: &Path,
     seat: &str,
@@ -330,34 +323,20 @@ pub(crate) fn try_sleep(
 }
 
 /// Settle a sleep whose kill never landed: `try_sleep` records the
-/// sleep before it stops the pane, so a crash (or a failed kill)
-/// between the two leaves the mark beside a standing pane fact, and
-/// the fact names the pane the clock timed (`pane_id`). Recovery
-/// verifies before it kills — every condition the decision used, and
-/// a last look for mail: the recorded pane id must still be the
-/// seat's live pane, the bound session's `thinking` must read
-/// exactly `false` again (a missing flag, a non-boolean, or a 404 is
-/// a miss, never quiet), the seat must still have its binding, and
-/// nothing may be owed (`inbox/` and `draining/`, read immediately
-/// before the kill). The same quiet pane goes down through the same
-/// `down` path one pane already uses. A decided miss — a different
-/// pane, a session that resumed work or no longer reads quiet, no
-/// binding, or owed mail — cancels the sleep: the mark and the pane
-/// fact clear together (the clock restarts only when the pane id
-/// moves with the mark), the pane stands, and the pass delivers the
-/// mail instead. A GET error is no decision about the session — owed
-/// mail still cancels through it, so an unreadable session never
-/// strands mail behind a retained mark. With nothing owed the mark,
-/// the fact, and the clock all stay for a retry on the next pass,
-/// which never restarts the threshold. A pane already gone completes
-/// the sleep (only the fact clears); a multiplexer that cannot be
-/// asked settles nothing this pass. A refused kill — the pane set
-/// moved between the pane query above and the kill — is decided by
-/// the same re-query the first sleep runs: a different live pane
-/// cancels, an unanswerable multiplexer settles nothing this pass,
-/// and only a gone pane completes. Every settlement outcome logs the
-/// case it saw (`pane-gone`, `pane-unknown`, the cancel's cause, the
-/// GET error, or the finished kill).
+/// sleep before it stops the pane, so a crash or failed kill leaves the
+/// mark beside the pane fact.
+///
+/// Invariant: recovery verifies before it kills, with every condition
+/// the decision used: the recorded pane is still the seat's live pane,
+/// `thinking` reads exactly `false` again, the binding stands, and
+/// nothing is owed just before the kill. A decided miss cancels: the
+/// mark and the pane fact clear together and the pane stands. A GET
+/// error decides nothing about the session, but owed mail still
+/// cancels through it, so mail is never stranded behind a mark. With
+/// nothing owed the mark stays for the next pass without restarting
+/// the threshold. A pane already gone completes the sleep; a
+/// multiplexer that cannot be asked settles nothing. Every outcome logs
+/// the case it saw.
 pub(crate) fn settle_pending_sleep(
     root: &Path,
     seat: &str,
@@ -408,7 +387,7 @@ pub(crate) fn settle_pending_sleep(
             match hub.session_state(&session) {
                 // Only an explicit false is quiet; anything else —
                 // missing, non-boolean, 404 — means the session
-                // worked or went away: never a kill (BLL-124).
+                // worked or went away: never a kill.
                 Ok(s) if s.thinking == Some(false) => {}
                 Ok(_) => return cancel_sleep(root, seat, state, &reason, "session-working"),
                 // A GET error decides nothing about the session, but

@@ -1,10 +1,8 @@
 use crate::board::{self, valid_name};
-use crate::drain;
 use crate::error::{Result, SeatError};
 use crate::identity;
 use crate::msg;
 use crate::seat;
-use std::io::Write;
 use std::path::Path;
 
 pub fn cmd_init(root: &Path) -> Result<()> {
@@ -17,11 +15,9 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 /// duplicate register keeps that seat's token, inbox, and meta — only
 /// launch fields actually passed change, and a refused register (a
 /// relative or empty `--cwd`, or an unreadable `--idle-after`)
-/// writes nothing (T004, T009). `--idle-after` follows the same rule
-/// as the launch fields: omitted keeps the stored value, a passed
-/// value updates it even when cwd and command are omitted. The retired
-/// `meta.lifecycle` field is accepted on read and never written
-/// (0.4.0 deleted `seat arm`).
+/// writes nothing. `--idle-after` follows the same rule as the launch
+/// fields: omitted keeps the stored value, a passed value updates it
+/// even when cwd and command are omitted.
 pub fn cmd_register(
     root: &Path,
     name: &str,
@@ -33,7 +29,7 @@ pub fn cmd_register(
 ) -> Result<()> {
     board::ensure_board(root)?;
     valid_name(name)?;
-    // Record-time check (research: Directory check): the path must
+    // Record-time check: the path must
     // already be absolute. Refused here, before anything is written.
     if let Some(c) = cwd.as_deref() {
         if c.is_empty() || !Path::new(c).is_absolute() {
@@ -169,7 +165,7 @@ pub fn touch_last_seen(root: &Path, seat_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The burn switch: remove the board under the root (FR-010).
+/// The burn switch: remove the board under the root.
 pub fn cmd_reset(root: &Path) -> Result<()> {
     board::reset(root)?;
     if root.exists() {
@@ -190,15 +186,10 @@ pub fn sorted_seat_names(root: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Expose drain for the CLI dispatch (kept here so main stays thin).
-pub fn cmd_drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
-    drain::drain(root, seat_name, out)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drain;
     use crate::testutil::temp_root;
 
     fn setup() -> std::path::PathBuf {
@@ -208,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn register_writes_no_lifecycle() {
+    fn register_writes_meta_and_token() {
         let root = setup();
         cmd_register(
             &root,
@@ -224,11 +215,8 @@ mod tests {
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.harness, "sb");
         assert_eq!(meta.model.as_deref(), Some("glm"));
-        assert_eq!(meta.lifecycle, None, "0.4.0 writes no lifecycle");
         assert!(meta.last_seen.is_some());
         assert!(seat::token_path(&dir).is_file());
-        let raw = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
-        assert!(!raw.contains("lifecycle"), "{raw}");
     }
 
     #[test]
@@ -256,7 +244,6 @@ mod tests {
         );
         let meta = seat::read_meta(&dir).unwrap();
         assert_eq!(meta.harness, "sb", "meta kept");
-        assert_eq!(meta.lifecycle, None);
     }
 
     #[test]
@@ -401,8 +388,7 @@ mod tests {
         );
     }
 
-    /// The duplicate-register rows quickstart step 4 exercises (003
-    /// US2): recording a launch on a seat that already has mail keeps
+    /// Duplicate register: recording a launch on a seat that already has mail keeps
     /// the token byte-for-byte, leaves the inbox drainable, and never
     /// touches launch fields the call omitted.
     #[test]
@@ -546,7 +532,7 @@ mod tests {
         );
     }
 
-    /// `--idle-after` (0.8.0): stored on meta.json, kept when a later
+    /// `--idle-after`: stored on meta.json, kept when a later
     /// register omits it, updated when passed — even with cwd and
     /// command both omitted, the path that used to return early — and
     /// an unreadable duration writes nothing.

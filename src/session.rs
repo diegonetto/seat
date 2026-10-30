@@ -8,11 +8,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The one shared session every seat runs in. Not stored on the board:
-/// tmux is the record (data model: Session).
+/// tmux is the record.
 pub const SESSION: &str = "swarm";
 
-/// The liveness format every session verb agrees on (data model:
-/// Session record): tab-separated session, pane id, `@seat`,
+/// The liveness format every session verb agrees on: tab-separated session, pane id, `@seat`,
 /// `pane_dead`, `@cwd` (JSON string), `@cmd` (JSON array). Compact
 /// JSON escapes tabs, so a tab inside a path or word cannot split a
 /// field. Seat names cannot contain whitespace.
@@ -22,7 +21,7 @@ const PANE_FMT: &str =
 /// The window `gallery` builds so every live seat is on one screen.
 const GALLERY_WINDOW: &str = "gallery";
 
-/// Every tmux query funnels through here (T019): SEAT_TMUX is the
+/// Every tmux query funnels through here: SEAT_TMUX is the
 /// program invoked instead of tmux, with the same arguments. `attach`
 /// does not: see `tmux_attach`.
 fn tmux_prog() -> String {
@@ -32,7 +31,7 @@ fn tmux_prog() -> String {
         .unwrap_or_else(|| "tmux".to_string())
 }
 
-/// `gallery` attaches only when SEAT_TMUX is unset (T018): with the
+/// `gallery` attaches only when SEAT_TMUX is unset: with the
 /// fake in place it prints the names and stops.
 fn attach_allowed() -> bool {
     std::env::var_os("SEAT_TMUX")
@@ -97,7 +96,7 @@ pub struct Pane {
     pub window: String,
 }
 
-/// The liveness query (T021): `list-panes -a -F` over every session.
+/// The liveness query: `list-panes -a -F` over every session.
 /// A pane with no `@seat` (a window this program did not open) yields
 /// an empty third field and is skipped. A dead server is not an error:
 /// nothing is running.
@@ -144,13 +143,13 @@ fn has_session(prog: &str) -> Result<bool> {
 }
 
 /// The launch `up` starts a seat with: the stored absolute directory
-/// and the stored ordered words (data model: Launch).
+/// and the stored ordered words.
 struct Launch {
     cwd: String,
     cmd: Vec<String>,
 }
 
-/// Start-time checks for one target (FR-005): a non-empty command, a
+/// Start-time checks for one target: a non-empty command, a
 /// stored absolute directory, and a directory that is a directory.
 fn preflight(root: &Path, name: &str) -> Result<Launch> {
     let meta = seat::read_meta(&seat::seat_dir(root, name)).map_err(|e| match e {
@@ -175,12 +174,12 @@ fn preflight(root: &Path, name: &str) -> Result<Launch> {
     Ok(Launch { cwd, cmd })
 }
 
-/// Start one seat's stored command in its stored directory (T005).
+/// Start one seat's stored command in its stored directory.
 /// The session's first window is the `new-session` itself; every later
 /// seat is a `new-window` in it. tmux execs the words directly: `-c`
 /// names the directory and, after `--`, `/usr/bin/env --` plus the
 /// stored words — always two or more arguments, so a one-word command
-/// is never a shell line (research: Passing the command to tmux). The
+/// is never a shell line. The
 /// pane is stamped `@seat`, `@cwd` (JSON string), and `@cmd` (JSON
 /// array of the stored words only): the launch as started, not as
 /// stored now. No pin file is read; no shell is used.
@@ -229,7 +228,7 @@ fn start_seat(prog: &str, seat_name: &str, launch: &Launch, have_session: &mut b
         tmux_ok(prog, &["set-option", "-p", "-t", &pane_id, option, value])
             .map_err(|e| SeatError::StartFailed(seat_name.to_string(), e.to_string()))?;
     }
-    // FR-011: a command that exits or cannot be run while `up` is still
+    // A command that exits or cannot be run while `up` is still
     // in progress leaves that seat not running. Seats already started
     // by this `up` stay running: the caller stops at this error.
     let live = panes(prog)?
@@ -246,11 +245,11 @@ fn start_seat(prog: &str, seat_name: &str, launch: &Launch, have_session: &mut b
 
 /// `seat up [NAME...]` — start the stored command of those registered
 /// seats, or of every registered seat that has one when no name is
-/// given, inside the one `swarm` session (T005). A seat that already
+/// given, inside the one `swarm` session. A seat that already
 /// has a live pane is skipped: a second `up` opens no second session
-/// and starts no second copy (FR-006). Every not-running target is
+/// and starts no second copy. Every not-running target is
 /// preflighted before any start; one failure names the seat and starts
-/// none (FR-005). Named targets start in command-line order; a bare
+/// none. Named targets start in command-line order; a bare
 /// `up` starts them sorted by name.
 pub fn cmd_up(root: &Path, names: &[String]) -> Result<()> {
     board::ensure_board(root)?;
@@ -297,9 +296,9 @@ pub fn cmd_up(root: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `seat down [NAME...]` — kill those seats' panes (T017). No names
+/// `seat down [NAME...]` — kill those seats' panes. No names
 /// stops every registered seat. Prints no message body and drains
-/// nothing (FR-007): unread mail waits for a later `drain`. A
+/// nothing: unread mail waits for a later `drain`. A
 /// registered seat that is already stopped is success.
 pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
     board::ensure_board(root)?;
@@ -321,7 +320,7 @@ pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
         if !seen.insert(n) {
             continue;
         }
-        kill_seat_pane(n)?;
+        kill_seat_pane_if(n, None)?;
     }
     Ok(())
 }
@@ -356,22 +355,6 @@ pub fn kill_seat_pane_if(name: &str, only_if: Option<&str>) -> Result<bool> {
     Ok(false)
 }
 
-/// `cmd_down`'s one-pane kill, by seat name alone.
-pub fn kill_seat_pane(name: &str) -> Result<bool> {
-    kill_seat_pane_if(name, None)
-}
-
-/// Does this seat have a live pane in the `swarm` session right now
-/// (the same query `status` uses; a dead pane is not up)? `None` when
-/// the multiplexer cannot be asked at all — the caller leaves any
-/// idle-clock fact untouched, because unknown is never permission to
-/// sleep.
-pub fn pane_is_up(seat_name: &str) -> Option<bool> {
-    running_seats(&tmux_prog())
-        .ok()
-        .map(|running| running.contains(seat_name))
-}
-
 /// The id of this seat's live pane in the `swarm` session — the pane
 /// the idle clock times. `Some(None)`: asked, and the seat has no live
 /// pane. `None`: the multiplexer cannot be asked, which changes
@@ -386,7 +369,7 @@ pub fn live_pane_id(seat_name: &str) -> Option<Option<String>> {
 }
 
 /// `seat gallery` — print the live seat names, tile those panes into
-/// one window, then attach (T018). With SEAT_TMUX set the names are
+/// one window, then attach. With SEAT_TMUX set the names are
 /// printed and there is no tile and no attach. With no pane it reports
 /// `gallery: empty`, exits 0, and registers no seat. Awake and
 /// unattended seats are not listed and their panes are not moved.
@@ -560,7 +543,7 @@ mod tests {
     use crate::testutil::temp_root;
     use crate::verbs;
 
-    /// The fake multiplexer the quickstart pairs with SEAT_TMUX. Its
+    /// The fake multiplexer for SEAT_TMUX. Its
     /// state file doubles as the record of every call it answered.
     fn fake_tmux() -> String {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh");
@@ -635,12 +618,6 @@ mod tests {
         std::env::remove_var("SEAT_FAKE_STATE");
     }
 
-    /// Serializes the tests that own SEAT_TMUX and SEAT_FAKE_STATE
-    /// (the process-wide env lock in testutil, shared with the
-    /// dispatcher tests that stub PATH): process-wide env is safe
-    /// under the parallel test threads only one such test runs at a
-    /// time.
-
     /// Presence and the mail count are separate: a live pane is
     /// `pane`, everything else — mail or not — is `unattended` (this
     /// board has no bindings, so no seat is awake). Mail is the inbox
@@ -695,7 +672,7 @@ mod tests {
         );
     }
 
-    /// The whole session story against the fake (T015's consumer).
+    /// The whole session story against the fake.
     #[test]
     fn session_verbs_drive_the_fake_multiplexer() {
         let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -718,7 +695,7 @@ mod tests {
         std::env::set_var("SEAT_TMUX", fake_tmux());
         std::env::set_var("SEAT_FAKE_STATE", &state);
 
-        // up with no names brings every registered seat (T016).
+        // up with no names brings every registered seat.
         cmd_up(&root, &[]).unwrap();
         let expected: BTreeSet<String> = ["alpha", "beta", "gamma"]
             .iter()
@@ -730,7 +707,7 @@ mod tests {
         cmd_up(&root, &[]).unwrap();
         assert_eq!(panes(&fake_tmux()).unwrap().len(), 3, "one pane per seat");
 
-        // down kills the pane and prints nothing on stdout (T017);
+        // down kills the pane and prints nothing on stdout;
         // already-stopped is success.
         cmd_down(&root, &["beta".to_string()]).unwrap();
         let running: Vec<String> = running_seats(&fake_tmux()).unwrap().into_iter().collect();
@@ -794,7 +771,7 @@ mod tests {
         let recorded = std::fs::read_to_string(&state).unwrap();
         assert!(!recorded.contains("X|attach"), "{recorded}");
 
-        // Empty gallery reports, exits 0, registers nothing (T018).
+        // Empty gallery reports, exits 0, registers nothing.
         cmd_down(&root, &["alpha".to_string()]).unwrap();
         let registered: BTreeSet<String> = verbs::sorted_seat_names(&root)
             .unwrap()
@@ -809,7 +786,7 @@ mod tests {
         // and records the call, so this cannot hang.
         cmd_up(&root, &["alpha".to_string()]).unwrap();
         // A pane tagged with a name that is not registered must not
-        // appear: gallery's set is status's running set (FR-008).
+        // appear: gallery's set is status's running set.
         let stray = std::process::Command::new(fake_tmux())
             .args([
                 "new-window",
@@ -966,7 +943,7 @@ mod tests {
         );
     }
 
-    /// The launch story (003 US1): `up` starts the stored command in
+    /// The launch story: `up` starts the stored command in
     /// the stored directory, once; a mail-only seat is not a bare-`up`
     /// target; one bad named target starts nothing; a failure mid-`up`
     /// leaves earlier seats running and later seats unstarted.
@@ -987,15 +964,14 @@ mod tests {
         std::env::set_var("SEAT_TMUX", fake_tmux());
         std::env::set_var("SEAT_FAKE_STATE", &state);
 
-        // Bare up targets only seats that have a command (SC from
-        // spec 003 US1 scenario 5): mailbox and nocmd are not started
-        // and are not errors.
+        // Bare up targets only seats that have a command: mailbox and
+        // nocmd are not started and are not errors.
         cmd_up(&root, &[]).unwrap();
         let live: Vec<String> = running_seats(&fake_tmux()).unwrap().into_iter().collect();
         assert_eq!(live, vec!["runner".to_string()]);
 
         // The record shows the command words and the directory, once
-        // each, as the JSON the data model promises.
+        // each, as JSON.
         let listed = panes(&fake_tmux()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].seat, "runner");
@@ -1003,7 +979,7 @@ mod tests {
         assert_eq!(listed[0].cwd, serde_json::to_string(&cwd).unwrap());
         assert_eq!(listed[0].cmd, "[\"/bin/sleep\",\"30\"]");
 
-        // A second up does not start a second copy (FR-006).
+        // A second up does not start a second copy.
         cmd_up(&root, &[]).unwrap();
         assert_eq!(panes(&fake_tmux()).unwrap().len(), 1);
 
@@ -1014,7 +990,7 @@ mod tests {
         ));
         assert_eq!(panes(&fake_tmux()).unwrap().len(), 1);
 
-        // One bad named target starts none of them (FR-005): zzz is
+        // One bad named target starts none of them: zzz is
         // startable, nodir's directory is not a directory.
         reg("zzz", Some(cwd.clone()), sleep30());
         reg(
@@ -1028,7 +1004,7 @@ mod tests {
         ));
         assert_eq!(panes(&fake_tmux()).unwrap().len(), 1, "nothing started");
 
-        // Named targets start in command-line order (T005), not sorted.
+        // Named targets start in command-line order, not sorted.
         cmd_down(&root, &[]).unwrap();
         cmd_up(&root, &["zzz".to_string(), "runner".to_string()]).unwrap();
         let order: Vec<String> = panes(&fake_tmux())
@@ -1039,9 +1015,9 @@ mod tests {
         assert_eq!(order, vec!["zzz".to_string(), "runner".to_string()]);
 
         // A target that is already running is not checked and not
-        // started (FR-005): runner's launch is now unusable, but the
+        // started: runner's launch is now unusable, but the
         // named up of a running seat is a no-op, and the pane keeps
-        // the launch it was started with (FR-007).
+        // the launch it was started with.
         reg(
             "runner",
             Some(root.join("gone-dir").display().to_string()),
@@ -1057,7 +1033,7 @@ mod tests {
         assert_eq!(pane.cmd, "[\"/bin/sleep\",\"30\"]");
         reg("runner", Some(cwd.clone()), sleep30());
 
-        // A failure mid-up (FR-011): die's pane is written dead, so the
+        // A failure mid-up: die's pane is written dead, so the
         // follow-up list has no live pane for it. Seats already started
         // stay running; later targets are never started.
         reg("die", Some(cwd.clone()), vec!["seat-die".to_string()]);

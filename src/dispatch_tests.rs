@@ -1,8 +1,8 @@
 //! The dispatcher check cases against the one small fake hub on
 //! 127.0.0.1 (never the live hub): the brief's hapi contract plus the
 //! local-state cases (`awake`, the fresh-work wake), the alarm matrix
-//! and the reload, the undelivered-versus-thinking cases (0.8.1), and
-//! the sleep/wake cases (0.8.0).
+//! and the reload, the undelivered-versus-thinking cases, and
+//! the sleep/wake cases.
 use crate::alarm;
 use crate::dispatch::{self, Pass, Waits};
 use crate::error::SeatError;
@@ -700,9 +700,9 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     );
 }
 
-// ---- undelivered against a thinking session (0.8.1, BLL-124) ------
+// ---- undelivered against a thinking session -------------------------
 
-/// The BLL-124 fixture: one real message, renamed old (the file name
+/// The fixture: one real message, renamed old (the file name
 /// is what the alarm ages), already staged in `draining/`, and
 /// recorded in `dispatch.json` as in flight `Posted` under its
 /// delivery key — exactly the record a pass that POSTed it leaves
@@ -901,7 +901,7 @@ fn a_hub_error_pages_undelivered_with_the_error_named_isolated() {
     assert!(mail[0].contains("hub session read failed"));
 }
 
-/// The other hub error path (BLL-124 review): the session read
+/// The other hub error path: the session read
 /// succeeds and says idle, but the queued-state read fails. That
 /// failure is never a skip and never a bare idle page — the item's
 /// invoked fact is unknown, so the page names the queued error (the
@@ -977,7 +977,7 @@ fn a_missing_thinking_flag_does_not_skip_isolated() {
     assert!(!log.contains("session idle"), "{log}");
 }
 
-/// The pass that observes the turn end (BLL-124 review): the hub marks
+/// The pass that observes the turn end: the hub marks
 /// a queued message invoked when the turn ends — the session is no
 /// longer thinking — while the file still sits in `draining/`, because
 /// the decision runs before this pass's poll commits and archives the
@@ -1029,7 +1029,7 @@ fn the_pass_that_observes_invoked_does_not_page_isolated() {
     );
 }
 
-/// The page words match the read (BLL-124 review): `session idle`
+/// The page words match the read: `session idle`
 /// only for an explicit `thinking: false` on an active session — a
 /// missing flag pages as `thinking unknown`, a session that is not
 /// active (a 404 reads `Ok` with the flag unset) as `session not
@@ -1205,7 +1205,7 @@ fn an_alarm_seat_naming_a_missing_seat_is_a_failed_sink() {
 #[test]
 fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
     let root = crate::testutil::dispatchkit::board_with(&[]);
-    let held = seat::DispatchLock::acquire(&root).unwrap();
+    let held = seat::Flock::dispatch(&root).unwrap();
     assert!(seat::dispatch_lock_path(&root).is_file());
     let err = dispatch::cmd_dispatch(&root, true).unwrap_err();
     let line = err.to_string();
@@ -1224,7 +1224,7 @@ fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
     dispatch::cmd_dispatch(&root, true).unwrap();
 }
 
-// ---- sleep and wake (0.8.0) ------------------------------------------
+// ---- sleep and wake -------------------------------------------------
 
 /// The fake multiplexer the sleep cases bring a pane up under (the
 /// same one the session tests use).
@@ -1494,7 +1494,7 @@ fn the_idle_clock_is_the_pane_plus_the_bound_delivery() {
 }
 
 /// A thinking session is working, whatever the dispatch record says:
-/// it never sleeps (BLL-124's lesson).
+/// it never sleeps.
 #[test]
 fn a_thinking_session_never_sleeps() {
     let kit_dir = stub_kit(
@@ -3194,7 +3194,7 @@ fn a_board_the_wake_script_cannot_write_never_sleeps() {
     );
 }
 
-// ---- pending recovery and the working phase (0.8.2) -------------------
+// ---- pending recovery and the working phase -------------------------
 
 /// One `--once` scan: a worker per scheduled seat, exactly one pass
 /// each, then the scan returns.

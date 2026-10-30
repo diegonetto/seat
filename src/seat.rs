@@ -8,40 +8,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// `meta.lifecycle` — the retired `arm` waiter's durable authority.
-/// Still accepted when reading old `meta.json` files, never written:
-/// 0.4.0 deleted `seat arm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Lifecycle {
-    ExitWake,
-    Poller,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Meta {
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_drained: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<Lifecycle>,
-    /// Launch state (003): the absolute working directory `up` starts
-    /// the command in. Omitted means none stored.
+    /// The absolute working directory `up` starts the command in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Launch state (003): the ordered argv `up` starts. Omitted (or
-    /// empty) means no command: the seat is mail-only.
+    /// The argv `up` starts. Omitted or empty means the seat is mail-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
-    /// The idle threshold (0.8.0): how long the dispatcher lets this
-    /// seat's pane stand with nothing to do before sleeping it
-    /// (`--idle-after`, e.g. `30m`, `2h`). Omitted means never.
+    /// How long the dispatcher lets this seat's pane stand with nothing
+    /// to do before sleeping it (`--idle-after`). Omitted means never.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_after: Option<String>,
 }
@@ -62,9 +45,6 @@ pub fn parse_idle_after(raw: &str) -> Option<Duration> {
     Some(Duration::from_secs(n.checked_mul(per_sec)?))
 }
 
-/// 0.7.0 removed rooms: the room-cursor directory is no longer
-/// created (a leftover `cursors/` from before is never read or
-/// written).
 pub const SUBDIRS: [&str; 3] = ["inbox", "draining", "archive"];
 
 pub fn seat_dir(root: &Path, name: &str) -> PathBuf {
@@ -80,18 +60,24 @@ pub fn token_path(dir: &Path) -> PathBuf {
 }
 
 /// The drain lock file: `<seat>/lock`. One exclusive holder per seat for
-/// the whole of a drain (or, later, a dispatcher's message batch). Other
-/// seats have their own files and are never blocked.
+/// the whole of a drain or a dispatcher's message batch.
 pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join("lock")
 }
 
-/// The metadata lock file: `<seat>/meta.lock`. A short-hold lock around
-/// each read-modify-write of meta.json. Never the drain lock: a holder
-/// of the drain lock may take the metadata lock, never the reverse, so
-/// `send` and `register` never wait on a drain.
+/// The metadata lock file: `<seat>/meta.lock`, held around each
+/// read-modify-write of meta.json. A holder of the drain lock may take
+/// the metadata lock, never the reverse, so `send` and `register` never
+/// wait on a drain.
 pub fn meta_lock_path(dir: &Path) -> PathBuf {
     dir.join("meta.lock")
+}
+
+/// The dispatcher's board lock file: `<root>/dispatch.lock`, held for
+/// the whole life of `seat dispatch`, so two scanners never interleave
+/// over one board.
+pub fn dispatch_lock_path(root: &Path) -> PathBuf {
+    root.join("dispatch.lock")
 }
 
 /// How long a second drain waits for the seat lock before giving up
@@ -100,169 +86,85 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// Poll cadence between non-blocking flock attempts.
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
-/// An exclusive `flock` on `<seat>/lock`, held for the guard's lifetime.
-/// A second drain of the same seat waits (bounded) and never
-/// interleaves; the lock is per seat directory, so other seats never
-/// block. The lock is released when the guard drops (or the process
-/// dies).
+/// How long `Flock::take` waits for another holder.
+enum Wait {
+    Never,
+    For(Duration),
+    Forever,
+}
+
+/// An exclusive `flock`, held for the guard's lifetime. Closing the
+/// file releases it, and the file is opened close-on-exec, so spawned
+/// children never hold it.
 #[derive(Debug)]
-pub struct SeatLock {
-    file: File,
+pub struct Flock {
+    _file: File,
 }
 
-fn flock_exclusive_nb(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-impl SeatLock {
-    /// Acquire the drain lock, waiting up to LOCK_WAIT (30s).
-    pub fn acquire(dir: &Path, seat_name: &str) -> Result<Self> {
-        Self::acquire_with_timeout(dir, seat_name, LOCK_WAIT)
-    }
-
-    /// Acquire with a caller-supplied bound (tests use a short one; the
-    /// error wording always names the production 30s).
-    pub fn acquire_with_timeout(dir: &Path, seat_name: &str, timeout: Duration) -> Result<Self> {
+impl Flock {
+    /// `None` when another holder kept the lock past `wait`.
+    fn take(path: &Path, wait: Wait) -> Result<Option<Self>> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(lock_path(dir))?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match flock_exclusive_nb(file.as_raw_fd()) {
-                Ok(()) => return Ok(SeatLock { file }),
-                Err(e) => match e.raw_os_error() {
-                    // On Linux EWOULDBLOCK == EAGAIN; EINTR retries.
-                    Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}
-                    _ => return Err(SeatError::Io(e)),
-                },
-            }
-            if Instant::now() >= deadline {
-                return Err(SeatError::SeatBusy(seat_name.to_string()));
-            }
-            std::thread::sleep(LOCK_POLL);
-        }
-    }
-
-    /// A second, non-blocking probe: does some other holder hold the
-    /// seat right now? (Useful for tests; takes no lock.)
-    #[cfg(test)]
-    pub fn is_held(dir: &Path) -> bool {
-        let Ok(file) = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(lock_path(dir))
-        else {
-            return false;
+            .open(path)?;
+        let op = match wait {
+            Wait::Forever => libc::LOCK_EX,
+            _ => libc::LOCK_EX | libc::LOCK_NB,
         };
-        match flock_exclusive_nb(file.as_raw_fd()) {
-            Ok(()) => false, // we got it, so nobody held it
-            Err(_) => true,
-        }
-    }
-}
-
-impl Drop for SeatLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-/// The dispatcher's board lock file: `<root>/dispatch.lock`. One
-/// dispatcher per board, held for the whole life of `seat dispatch`
-/// (`--once` included), so two scanners never interleave over one
-/// board. Unlike the seat lock this one never waits.
-pub fn dispatch_lock_path(root: &Path) -> PathBuf {
-    root.join("dispatch.lock")
-}
-
-/// An exclusive, non-blocking `flock` on `<root>/dispatch.lock`, held
-/// for the guard's lifetime. A second dispatcher fails at once with
-/// the lock named; the lock is released when the guard drops (or the
-/// process dies).
-#[derive(Debug)]
-pub struct DispatchLock {
-    file: File,
-}
-
-impl DispatchLock {
-    /// Acquire without waiting: any other holder means another
-    /// dispatcher is running this board.
-    pub fn acquire(root: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(dispatch_lock_path(root))?;
+        let deadline = match wait {
+            Wait::For(d) => Some(Instant::now() + d),
+            _ => None,
+        };
         loop {
-            match flock_exclusive_nb(file.as_raw_fd()) {
-                Ok(()) => return Ok(DispatchLock { file }),
-                Err(e) => match e.raw_os_error() {
-                    // On Linux EWOULDBLOCK == EAGAIN; EINTR retries.
-                    Some(libc::EWOULDBLOCK) => {
-                        return Err(SeatError::DispatchBusy(dispatch_lock_path(root)))
-                    }
-                    Some(libc::EINTR) => {}
-                    _ => return Err(SeatError::Io(e)),
-                },
-            }
-        }
-    }
-}
-
-impl Drop for DispatchLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-/// The short metadata lock (a blocking `flock` on `<seat>/meta.lock`;
-/// holders only ever hold it for one read-modify-write).
-struct MetaLock {
-    file: File,
-}
-
-impl MetaLock {
-    fn acquire(dir: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(meta_lock_path(dir))?;
-        loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc == 0 {
-                return Ok(MetaLock { file });
+            if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+                return Ok(Some(Flock { _file: file }));
             }
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // On Linux EWOULDBLOCK == EAGAIN.
+                Some(libc::EWOULDBLOCK) => {}
+                _ => return Err(SeatError::Io(e)),
             }
-            return Err(SeatError::Io(e));
+            match deadline {
+                Some(at) if Instant::now() < at => std::thread::sleep(LOCK_POLL),
+                _ => return Ok(None),
+            }
         }
     }
-}
 
-impl Drop for MetaLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+    /// The seat's drain lock, waiting up to LOCK_WAIT (30s).
+    pub fn seat(dir: &Path, seat_name: &str) -> Result<Self> {
+        Self::seat_within(dir, seat_name, LOCK_WAIT)
+    }
+
+    /// The drain lock with a caller-supplied bound (tests use a short
+    /// one; the error wording always names the production 30s).
+    pub fn seat_within(dir: &Path, seat_name: &str, timeout: Duration) -> Result<Self> {
+        Self::take(&lock_path(dir), Wait::For(timeout))?
+            .ok_or_else(|| SeatError::SeatBusy(seat_name.to_string()))
+    }
+
+    /// The board's dispatch lock, never waiting: any other holder means
+    /// another dispatcher is running this board.
+    pub fn dispatch(root: &Path) -> Result<Self> {
+        Self::take(&dispatch_lock_path(root), Wait::Never)?
+            .ok_or_else(|| SeatError::DispatchBusy(dispatch_lock_path(root)))
+    }
+
+    /// The metadata lock, blocking until acquired.
+    fn meta(dir: &Path) -> Result<Self> {
+        Self::take(&meta_lock_path(dir), Wait::Forever)?
+            .ok_or_else(|| SeatError::Io(std::io::ErrorKind::WouldBlock.into()))
+    }
+
+    /// Does some other holder hold the seat's drain lock right now?
+    #[cfg(test)]
+    pub fn seat_is_held(dir: &Path) -> bool {
+        matches!(Self::take(&lock_path(dir), Wait::Never), Ok(None))
     }
 }
 
@@ -282,28 +184,27 @@ pub fn create(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-static META_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Write meta.json atomically: temp file in the same directory, fsync,
-/// rename over meta.json, fsync the directory. Mode 0600. A reader
-/// never sees a half-written file. (This takes no lock; the locked
-/// read-modify-write is `update_meta`. First-time seat creation may use
-/// it directly.) The retired `lifecycle` field is accepted on read and
-/// never written back.
-pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
-    let mut meta = meta.clone();
-    meta.lifecycle = None;
-    let mut json = serde_json::to_string_pretty(&meta)?.into_bytes();
-    json.push(b'\n');
-    let n = META_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".meta.json.{}-{n}.tmp", std::process::id()));
+/// Atomic private write, the board's one shape: a fresh temp file (mode
+/// 0600, O_CREAT|O_EXCL) in the same directory, fsync, rename over the
+/// target, then fsync the directory so the rename itself is durable. A
+/// reader never sees a half-written file and no scratch file is left.
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{}.{}-{n}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
     let write = (|| -> Result<()> {
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(&json)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
     })();
@@ -311,34 +212,38 @@ pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, meta_path(dir)) {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(SeatError::Io(e));
+        return Err(e.into());
     }
-    // Make the rename durable.
     File::open(dir)?.sync_all()?;
     Ok(())
 }
 
-/// Read-modify-write meta.json under the short per-seat metadata lock
-/// (`<seat>/meta.lock`, never the drain lock). Every verb that changes
-/// an existing meta.json — register's launch update, send's
-/// `last_seen`, drain's `last_drained` — goes through here, so
-/// overlapping changes to different fields both survive and a reader
-/// never sees a partial file.
+/// Write meta.json atomically. This takes no lock; the locked
+/// read-modify-write is `update_meta`.
+pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
+    let mut json = serde_json::to_string_pretty(meta)?.into_bytes();
+    json.push(b'\n');
+    atomic_write_private(&meta_path(dir), &json)
+}
+
+/// Read-modify-write meta.json under the per-seat metadata lock. Every
+/// verb that changes an existing meta.json goes through here, so
+/// overlapping changes to different fields both survive.
 pub fn update_meta<F>(dir: &Path, change: F) -> Result<Meta>
 where
     F: FnOnce(&mut Meta),
 {
-    let _guard = MetaLock::acquire(dir)?;
+    let _guard = Flock::meta(dir)?;
     let mut meta = read_meta(dir)?;
     change(&mut meta);
     write_meta(dir, &meta)?;
     Ok(meta)
 }
 
-/// Read meta.json. Corrupt JSON (including an unknown lifecycle value) is
-/// the named CorruptMeta error — never a panic, never a ghost seat.
+/// Read meta.json. Corrupt JSON is the named CorruptMeta error — never
+/// a panic, never a ghost seat.
 pub fn read_meta(dir: &Path) -> Result<Meta> {
     let raw = std::fs::read_to_string(meta_path(dir)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -376,28 +281,20 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_is_accepted_on_read_and_never_written() {
+    fn old_keys_are_ignored_on_read_and_never_written() {
         let root = temp_root("seat-meta");
         board::init(&root).unwrap();
         let dir = create(&root, "alpha").unwrap();
-        // A meta written by 0.3.0 (lifecycle in the file) parses.
+        // Keys this struct no longer has, such as the retired
+        // `lifecycle` and `session`, parse and are dropped on the next
+        // write.
         std::fs::write(
             meta_path(&dir),
-            "{\"harness\":\"h\",\"lifecycle\":\"poller\"}",
+            "{\"harness\":\"h\",\"lifecycle\":\"poller\",\"session\":\"s\"}",
         )
         .unwrap();
-        let back = read_meta(&dir).unwrap();
-        assert_eq!(back.lifecycle, Some(Lifecycle::Poller));
-        assert_eq!(back.harness, "h");
-
-        // Any later write drops the field: write_meta strips it even
-        // when the caller's struct still carries one.
-        let meta = Meta {
-            harness: "switchboard".into(),
-            model: Some("glm".into()),
-            lifecycle: Some(Lifecycle::ExitWake),
-            ..Default::default()
-        };
+        let meta = read_meta(&dir).unwrap();
+        assert_eq!(meta.harness, "h");
         write_meta(&dir, &meta).unwrap();
         let mode = std::fs::metadata(meta_path(&dir))
             .unwrap()
@@ -406,11 +303,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         let raw = std::fs::read_to_string(meta_path(&dir)).unwrap();
         assert!(!raw.contains("lifecycle"), "raw meta: {raw}");
-        assert_eq!(read_meta(&dir).unwrap().lifecycle, None);
-        // Wire format of the enum is still the kebab-case string (old
-        // files keep parsing after future schema changes).
-        let old = serde_json::to_string(&Lifecycle::ExitWake).unwrap();
-        assert_eq!(old, "\"exit-wake\"");
+        assert!(!raw.contains("session"), "raw meta: {raw}");
     }
 
     #[test]
@@ -419,7 +312,7 @@ mod tests {
         board::init(&root).unwrap();
         let dir = create(&root, "alpha").unwrap();
         // Absent launch fields are omitted from the file, and a meta
-        // written before this feature parses unchanged (T001).
+        // written without them parses unchanged.
         let old = Meta {
             harness: "h".into(),
             ..Default::default()
@@ -465,12 +358,8 @@ mod tests {
             read_meta(&dir),
             Err(SeatError::CorruptMeta { .. })
         ));
-        // Unknown lifecycle string is corrupt too.
-        std::fs::write(
-            meta_path(&dir),
-            "{\"harness\":\"h\",\"lifecycle\":\"ghost\"}",
-        )
-        .unwrap();
+        // A wrong type for a known field is corrupt too.
+        std::fs::write(meta_path(&dir), "{\"harness\":7}").unwrap();
         assert!(matches!(
             read_meta(&dir),
             Err(SeatError::CorruptMeta { .. })
@@ -498,12 +387,11 @@ mod tests {
     #[test]
     fn second_lock_holder_gives_up_with_the_named_error() {
         let (_root, dir) = locked_root("seat-lock-busy");
-        let _held = SeatLock::acquire(&dir, "alpha").unwrap();
-        assert!(SeatLock::is_held(&dir));
+        let _held = Flock::seat(&dir, "alpha").unwrap();
+        assert!(Flock::seat_is_held(&dir));
         let started = std::time::Instant::now();
         let err =
-            SeatLock::acquire_with_timeout(&dir, "alpha", std::time::Duration::from_millis(120))
-                .unwrap_err();
+            Flock::seat_within(&dir, "alpha", std::time::Duration::from_millis(120)).unwrap_err();
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         assert_eq!(
             err.to_string(),
@@ -559,7 +447,7 @@ mod tests {
         // A held drain lock must not block metadata updates: send and
         // register never wait on a drain. The bound only guards against
         // a deadlock (each update fsyncs; slow is fine, stuck is not).
-        let _drain_lock = SeatLock::acquire(&dir, "alpha").unwrap();
+        let _drain_lock = Flock::seat(&dir, "alpha").unwrap();
         let started = std::time::Instant::now();
         for i in 0..50usize {
             update_meta(&dir, |m| m.last_seen = Some(format!("ts{i}"))).unwrap();

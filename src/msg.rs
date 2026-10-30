@@ -12,9 +12,6 @@ pub type HmacSha256 = Hmac<Sha256>;
 
 /// Token files hold 16 random bytes as 32 hex chars (mode 0600, O_EXCL).
 pub const TOKEN_HEX_LEN: usize = 32;
-/// MAC is the **full** SHA-256 digest as 64 hex chars. Never truncate.
-#[allow(dead_code)] // spec constant (FR-002); asserted in the tests below
-pub const MAC_HEX_LEN: usize = 64;
 /// Message id: 4 random bytes as 8 hex chars.
 pub const ID_HEX_LEN: usize = 8;
 
@@ -348,8 +345,9 @@ mod tests {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(check_filename(name));
 
-        // Full 64-hex MAC, not truncated.
-        assert_eq!(header.hmac.len(), MAC_HEX_LEN);
+        // The MAC is the full SHA-256 digest as 64 hex chars, never
+        // truncated.
+        assert_eq!(header.hmac.len(), 64);
         assert!(header.hmac.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(verify_msg(&path, &token).unwrap());
     }
@@ -510,8 +508,7 @@ mod tests {
 
     /// The session cannot be moved into the body (or back) without
     /// breaking the MAC: it is MAC'd inside the id slot, and an id can
-    /// never contain `:`. This is the 0.4.0 framing fix — feeding the
-    /// session after the body let a body ending in `|X` collide with
+    /// never contain `:`. Feeding the session after the body let a body ending in `|X` collide with
     /// `session = X`, because a body may contain `|`.
     #[test]
     fn session_cannot_be_stripped_into_the_body_or_added_back() {

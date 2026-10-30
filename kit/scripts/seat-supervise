@@ -71,10 +71,8 @@ def spawn(argv):
         # (python ignores SIGPIPE, and an ignored disposition survives exec),
         # then wait until the parent hands the terminal over before exec.
         os.setpgid(0, 0)
-        for name in ("SIGPIPE", "SIGXFSZ", "SIGXFZ", "SIGTTIN", "SIGTTOU"):
-            number = getattr(signal, name, None)
-            if number is not None:
-                signal.signal(number, signal.SIG_DFL)
+        for number in (signal.SIGPIPE, signal.SIGXFSZ, signal.SIGTTIN, signal.SIGTTOU):
+            signal.signal(number, signal.SIG_DFL)
         for _ in range(40):
             try:
                 if os.tcgetpgrp(0) == os.getpgrp():
