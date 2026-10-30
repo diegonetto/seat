@@ -42,9 +42,4 @@ for f in $list; do
     fi
 done
 
-# No line that both removes a file and names memo.
-if grep -E '(^|[^[:alpha:]])(rm|unlink)([^[:alpha:]]|$)|remove|delet' README.md | grep -q memo; then
-    fail 'README.md has a line that removes a file and names memo'
-fi
-
 exit 0

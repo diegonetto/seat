@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 /// marker," not a proof of authorship.
 pub const MARKER: &str = "seat";
 
-/// The board root (FR-013): `--root`, else `SEAT_ROOT`, else the
-/// documented default `$HOME/.local/share/seat`. `MEMO_ROOT` is not
-/// read. A missing root is created only by `init`.
+/// The board root: `--root`, else `SEAT_ROOT`, else the documented
+/// default `$HOME/.local/share/seat`. A missing root is created only by
+/// `init`.
 pub fn resolve_root(explicit: Option<&str>) -> PathBuf {
     if let Some(p) = explicit {
         return PathBuf::from(p);
@@ -60,7 +60,7 @@ pub fn valid_name(name: &str) -> Result<()> {
 }
 
 /// A root this program did not write (or does not have) is refused by
-/// every command but `reset`, with the path in the error (FR-010).
+/// every command but `reset`, with the path in the error.
 pub fn ensure_board(root: &Path) -> Result<()> {
     if !root.exists() {
         return Err(SeatError::MissingBoard(root.to_path_buf()));
@@ -79,8 +79,6 @@ fn is_empty_dir(root: &Path) -> Result<bool> {
 /// Create the board. A missing root is created here and nowhere else.
 /// An empty directory is not refused; a non-empty root without our
 /// marker is (init included). Idempotent when the marker is `seat`.
-/// 0.7.0 removed rooms: a `rooms/` directory is no longer created (a
-/// leftover from before is never read, written, or deleted here).
 pub fn init(root: &Path) -> Result<()> {
     if root.exists() {
         if !root.is_dir() || (!is_empty_dir(root)? && !marker_ok(root)) {
@@ -96,9 +94,8 @@ pub fn init(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The burn switch (FR-010): remove `marker`, `seats/`, and `rooms/`
-/// (a leftover from before 0.7.0, so a burned board is clean) under
-/// the root. The root itself is deleted only when that leaves it
+/// The burn switch: remove `marker`, `seats/`, and a leftover `rooms/`
+/// under the root. The root itself is deleted only when that leaves it
 /// empty. Works on a root this program does not recognize.
 pub fn reset(root: &Path) -> Result<()> {
     match std::fs::remove_file(marker_path(root)) {
@@ -139,10 +136,6 @@ mod tests {
             MARKER
         );
         assert!(root.join("seats").is_dir());
-        assert!(
-            !root.join("rooms").exists(),
-            "0.7.0 creates no rooms/ (they are gone)"
-        );
         assert!(marker_ok(&root));
     }
 
@@ -214,7 +207,7 @@ mod tests {
         std::fs::create_dir_all(root.join("seats").join("ghost")).unwrap();
         reset(&root).unwrap();
         assert!(!root.join("seats").exists());
-        init(&root).unwrap(); // reset then init succeeds (quickstart step 7)
+        init(&root).unwrap(); // reset then init succeeds
     }
 
     #[test]
@@ -269,9 +262,8 @@ mod tests {
     #[test]
     fn resolve_root_prefers_explicit_then_env_over_default() {
         // One test touches the root environment; every other test
-        // passes roots in. MEMO_ROOT must not be honored anymore.
+        // passes roots in.
         let thrown = temp_root("board-env");
-        std::env::set_var("MEMO_ROOT", &thrown);
         std::env::remove_var("SEAT_ROOT");
         assert_eq!(resolve_root(None), default_root());
         assert_ne!(resolve_root(None), thrown);
@@ -283,6 +275,5 @@ mod tests {
             PathBuf::from("/elsewhere")
         );
         std::env::remove_var("SEAT_ROOT");
-        std::env::remove_var("MEMO_ROOT");
     }
 }

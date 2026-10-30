@@ -30,8 +30,3 @@ A background process the board cannot see, because it has no pane and no dispatc
 ## What this does not change
 
 - `seat gallery` prints only the pane names, joins those panes into one window, tiles it, then attaches. It does not list unattended or awake seats. It does not move a pane that is not a registered live seat.
-- The retired Python supervisor keeps its own words, including `offline-with-unread`.
-
-## Version
-
-0.2.0 defined the line; 0.4.0 deleted the waiter-derived `awake` with `seat arm`; 0.5.0 returned `awake` from the dispatcher's delivery state; 0.8.0 added `asleep` (the dispatcher's idle sleep mark) between `pane` and `awake`. This commit does not publish to crates.io.

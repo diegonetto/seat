@@ -2,6 +2,30 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.4] - 2026-10-30
+
+### Changed
+
+- An unknown verb is refused by the argument parser: it still exits 2, now
+  with `error: unrecognized subcommand '<verb>'` and a usage line instead of
+  `seat: unknown verb '<verb>'` and a `verbs:` list (BLL-210).
+- `meta.json` no longer models the retired `lifecycle` key or the unused
+  `session` key. Both are ignored on read and dropped on the next write, so a
+  seat whose `lifecycle` held an unknown value now loads instead of reading as
+  corrupt.
+- `seat-role` no longer renames a session still titled with the old
+  `{Role} · {seat}` name; it is left as a hand-set name would be.
+
+### Removed
+
+- Dead code and residue the audit proved unneeded: the three flock guards are
+  one, the duplicate atomic writers are one (in Rust and in `seat-role.py`),
+  the `ureq` agent setup is one helper, pass-through wrappers are inlined, the
+  unread `thinkingAt` field and `MAC_HEX_LEN` are gone, and tests that pinned
+  the absence of rooms, `arm`, `MEMO_ROOT` and `wait.pid` are gone. Spec tags,
+  version and ticket narration left the code comments. `seat reset` still
+  removes a leftover `rooms/`.
+
 ## [0.8.3] - 2026-10-28
 
 ### Fixed

@@ -1,21 +1,15 @@
-//! The `webhook` adapter (item 4): the Grok bots drain the board
-//! themselves, so it never runs `receive` and never archives — it
-//! rings, and re-rings (1 min doubling to 1 h) until every rung
-//! message — a file in `inbox/`/`draining/` — has been taken by the
-//! bot's drain. Two modes, byte for
-//! byte against today's scripts: **signal** (eng-grokbot,
-//! sales-grokbot; `wake-grokbot`) POSTs `{"schema_version":1,
-//! "seat":..,"ts":..,"nonce":..}` HMAC'd with `bridge.key`, never a
-//! message body; **payload mode** (kotek-grokbot; enabled by
-//! `<seat>/webhook.payload`; the contract came from the retired
-//! `grok-doorbell.py`) carries verified direct mail
-//! from the `inbox` seat in the body at most once per message id,
-//! with its attempted/delivered records; everything else gets the
-//! signal. After each successful payload delivery, a marker file
-//! `<seat>/webhook.hq-ack` turns on the doorbell's hq receipt
-//! (`report_delivery`, ported unchanged; see `hq_receipt`).
+//! The `webhook` adapter: the Grok bots drain the board themselves,
+//! so it never runs `receive` and never archives — it rings, and
+//! re-rings (1 min doubling to 1 h) until every rung message in
+//! `inbox/` or `draining/` has been taken by the bot's drain. Two
+//! modes: **signal** POSTs `{"schema_version":1,"seat":..,"ts":..,
+//! "nonce":..}` HMAC'd with `bridge.key`, never a message body;
+//! **payload mode** (enabled by `<seat>/webhook.payload`) carries
+//! verified direct mail from the `inbox` seat in the body at most once
+//! per message id; everything else gets the signal. A marker file
+//! `<seat>/webhook.hq-ack` adds the hq receipt (see `hq_receipt`).
 use crate::alarm;
-use crate::dstate::{atomic_write_private, load_state, log_line, store_state, RingState};
+use crate::dstate::{load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
 use crate::identity::Bindings;
 use crate::msg;
@@ -30,10 +24,9 @@ use std::time::Duration;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const SLICE: Duration = Duration::from_millis(100);
-const MAX_BODY: usize = 8192; // the doorbell's cap on a message it carries
+const MAX_BODY: usize = 8192; // the cap on a message payload mode carries
 const SUPPRESSED: &str = "no POST sent: an attempted hq message is still unread";
-/// The doorbell's `report_delivery`: where the hq receipt goes, and
-/// how long it may take.
+/// Where the hq receipt goes, and how long it may take.
 const HQ_INGEST_URL: &str = "https://hq.bll.dev/ingest/seat-delivery";
 const HQ_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -131,7 +124,7 @@ impl WebhookConfig {
     }
 }
 
-/// The signal body, byte for byte the shell script's string.
+/// The signal body; the receiver checks the MAC over these exact bytes.
 pub(crate) fn signal_body(seat: &str, ts: &str, nonce: &str) -> String {
     format!("{{\"schema_version\":1,\"seat\":\"{seat}\",\"ts\":\"{ts}\",\"nonce\":\"{nonce}\"}}")
 }
@@ -146,19 +139,14 @@ pub(crate) fn signature_hex(key: &str, body: &str) -> String {
 
 /// One POST with the shared headers. A signal retries 3x (the
 /// script's `2*attempt` backoff between); a payload POST is attempted
-/// exactly once (the doorbell's at-most-once rule).
+/// exactly once (at most once per message).
 pub(crate) fn post(
     cfg: &WebhookConfig,
     body: &str,
     attempts: usize,
     sleeper: &dyn Fn(Duration),
 ) -> std::result::Result<(), String> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build(),
-    );
+    let agent = crate::hub::http_agent(HTTP_TIMEOUT);
     let sig = signature_hex(&cfg.key, body);
     let mut last = String::new();
     for attempt in 1..=attempts {
@@ -185,8 +173,7 @@ pub(crate) fn post(
 }
 
 /// The Cloudflare Access service-token pair from
-/// `~/.config/bll-ingest/env`, exactly the doorbell's parse:
-/// `KEY=VALUE` lines (split at the first `=`), comment and other lines
+/// `~/.config/bll-ingest/env`: `KEY=VALUE` lines (split at the first `=`), comment and other lines
 /// skipped. Missing values are an error that names nothing secret.
 fn ingest_env() -> std::result::Result<(String, String), String> {
     let home = std::env::var_os("HOME")
@@ -212,8 +199,7 @@ fn ingest_env() -> std::result::Result<(String, String), String> {
     }
 }
 
-/// The doorbell's `report_delivery`, ported unchanged (enabled by the
-/// seat marker `webhook.hq-ack` instead of `KOTEK_HQ_ACK=1`): POST
+/// The hq receipt (enabled by the seat marker `webhook.hq-ack`): POST
 /// `{"seat", "message_id"}` to the hq ingest URL with the Access
 /// service-token headers from `~/.config/bll-ingest/env`, User-Agent
 /// `bll-seat-mail/1 (Slix)`, 5 s timeout. Best effort — the caller
@@ -225,14 +211,8 @@ pub(crate) fn hq_receipt(
     message_id: &str,
 ) -> std::result::Result<(), String> {
     let (client_id, client_secret) = ingest_env()?;
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(HQ_RECEIPT_TIMEOUT))
-            .build(),
-    );
-    // The doorbell's `json.dumps` default separators: a space after
-    // each colon.
+    let agent = crate::hub::http_agent(HQ_RECEIPT_TIMEOUT);
+    // Python `json.dumps` default separators: a space after each colon.
     let body = format!(
         "{{\"seat\": {}, \"message_id\": {}}}",
         serde_json::to_string(seat).unwrap_or_default(),
@@ -262,18 +242,6 @@ pub(crate) fn present_files(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// What this seat still owes: the mail present in `inbox/` and
-/// `draining/` — the bot's own drain takes those (it removes both).
-pub(crate) fn owed_files(root: &Path, seat_name: &str) -> BTreeSet<String> {
-    present_files(&seat::seat_dir(root, seat_name))
-}
-
-/// Would the scan give this seat a worker: anything still owed —
-/// present mail.
-pub(crate) fn has_work(root: &Path, seat_name: &str) -> bool {
-    !owed_files(root, seat_name).is_empty()
-}
-
 /// Is this seat still webhook-routed? The full routing rule, not just
 /// the hapi half: a seat in `hapi-sessions.json` is hapi (even with
 /// `webhook.url` staged), a seat whose `webhook.url` is gone is pull —
@@ -290,13 +258,9 @@ fn now_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn nonce_hex() -> Result<String> {
-    msg::rand_hex(16)
-}
-
-/// The payload body: the doorbell's
+/// The payload body: Python's
 /// `json.dumps(body, ensure_ascii=False, separators=(",", ":"))` with
-/// its exact field order.
+/// this exact field order.
 pub(crate) fn payload_body(seat: &str, ts: &str, nonce: &str, id: &str, text: &str) -> String {
     let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     format!(
@@ -312,8 +276,7 @@ pub(crate) fn payload_body(seat: &str, ts: &str, nonce: &str, id: &str, text: &s
     )
 }
 
-/// Verified direct mail from the hq `inbox` seat, the doorbell's exact
-/// rule: a real file (never a symlink) of at most 8192 bytes, a header
+/// Verified direct mail from the hq `inbox` seat: a real file (never a symlink) of at most 8192 bytes, a header
 /// with `dest` = this seat, `from` = `inbox`, an 8-lowercase-hex id,
 /// and a MAC over `dest|from|id|ts|body` (BOM stripped, no session)
 /// keyed by the inbox seat's token. Everything else is None and gets
@@ -344,8 +307,7 @@ pub(crate) fn verified_hq_mail(path: &Path, root: &Path, seat: &str) -> Option<(
 
 /// The at-most-once records (`webhook-attempted.json`,
 /// `webhook-delivered.json` in the seat directory): arrays of ids, the
-/// last 1000 kept. The whole file is valid or the list is empty (the
-/// doorbell's all()-check).
+/// last 1000 kept. The whole file is valid or the list is empty.
 pub(crate) fn id_list(path: &Path) -> Vec<String> {
     match std::fs::read_to_string(path)
         .ok()
@@ -360,10 +322,10 @@ fn save_id_list(path: &Path, ids: &[String]) -> Result<()> {
     let keep = &ids[ids.len().saturating_sub(1000)..];
     let mut json = serde_json::to_string(keep)?.into_bytes();
     json.push(b'\n');
-    atomic_write_private(path, &json)
+    seat::atomic_write_private(path, &json)
 }
 
-/// One ring: the doorbell for payload seats, the plain signal
+/// One ring: the payload for payload seats, the plain signal
 /// otherwise. `Ok(true)` — a POST went out; `Ok(false)` — mail waits
 /// but nothing was sent (payload mode's suppression); `Err` — a POST
 /// was attempted and failed.
@@ -374,7 +336,11 @@ pub(crate) fn ring_once(
     sleeper: &dyn Fn(Duration),
 ) -> std::result::Result<bool, String> {
     if !cfg.payload_mode {
-        let body = signal_body(seat, &now_utc(), &nonce_hex().map_err(|e| e.to_string())?);
+        let body = signal_body(
+            seat,
+            &now_utc(),
+            &msg::rand_hex(16).map_err(|e| e.to_string())?,
+        );
         return post(cfg, &body, 3, sleeper).map(|()| true);
     }
     let dir = seat::seat_dir(root, seat);
@@ -388,7 +354,7 @@ pub(crate) fn ring_once(
     let files = msg::list_msg_dir(&dir.join("inbox")).unwrap_or_default();
     let mut pending: Vec<(String, String)> = Vec::new();
     let mut pending_ids: BTreeSet<String> = BTreeSet::new(); // at-most-once per id
-    let mut other_mail = files.is_empty(); // the doorbell's conservative default
+    let mut other_mail = files.is_empty(); // nothing in inbox/: still signal
     let mut attempted_hq_still_unread = false;
     for path in &files {
         match verified_hq_mail(path, root, seat) {
@@ -403,7 +369,11 @@ pub(crate) fn ring_once(
         // While an attempted hq message is still unread, a signal
         // would make the bot drain and answer it twice.
         if other_mail && !attempted_hq_still_unread {
-            let body = signal_body(seat, &now_utc(), &nonce_hex().map_err(|e| e.to_string())?);
+            let body = signal_body(
+                seat,
+                &now_utc(),
+                &msg::rand_hex(16).map_err(|e| e.to_string())?,
+            );
             return post(cfg, &body, 3, sleeper).map(|()| true);
         }
         return Ok(false);
@@ -418,7 +388,7 @@ pub(crate) fn ring_once(
         let body = payload_body(
             seat,
             &now_utc(),
-            &nonce_hex().map_err(|e| e.to_string())?,
+            &msg::rand_hex(16).map_err(|e| e.to_string())?,
             &id,
             &text,
         );
@@ -495,7 +465,7 @@ pub(crate) fn ring_pass(
     let mut state = load_state(&dir);
     let mut ring = state.ring.clone().unwrap_or_default();
     let now = chrono::Utc::now();
-    let present = owed_files(root, seat);
+    let present = present_files(&seat::seat_dir(root, seat));
     let delivered: BTreeSet<String> = if cfg.payload_mode {
         id_list(&dir.join("webhook-delivered.json"))
             .into_iter()
@@ -539,7 +509,7 @@ pub(crate) fn ring_pass(
             ring.failures += 1;
             strike(root, seat, ring.failures, SUPPRESSED)?;
         }
-        Ok(false) => {} // the doorbell working: no POST, no failure
+        Ok(false) => {} // suppression working: no POST, no failure
     }
     ring.rung = present.into_iter().collect();
     let base = if ring.backoff_ms == 0 {
@@ -619,7 +589,7 @@ pub(crate) fn worker_loop(
                 .as_ref()
                 .map(|r| r.rung.iter().collect())
                 .unwrap_or_default();
-            let present = owed_files(&root, &seat);
+            let present = present_files(&seat::seat_dir(&root, &seat));
             if present.is_empty()
                 || present.iter().any(|f| !rung.contains(f))
                 || deadline.is_some_and(|d| chrono::Utc::now() >= d.with_timezone(&chrono::Utc))

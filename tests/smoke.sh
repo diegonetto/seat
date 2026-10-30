@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Smoke suite for the seat operator binary (constitution 3.0, T014).
+# Smoke suite for the seat operator binary.
 #
 # Execs "$SEAT" as a program against throwaway --root directories.
-# Never the operator's live board. Covers quickstart steps 1 through 7
-# (step 8 is --help, checked by cargo test): fresh drain, bad mark,
-# session verbs, status, foreign root. 0.4.0 deleted `seat arm` and
-# 0.7.0 deleted `seat room`: these checks pin their absence.
+# Never the operator's live board. Covers fresh drain, bad mark,
+# session verbs, status, foreign root.
 #
 #   SEAT=$PWD/target/debug/seat tests/smoke.sh
 #
@@ -63,17 +61,6 @@ R="$ROOT"
 "$S" --root "$R" send --from A B "hello seat" >/dev/null 2>&1
                                                       note $? "send A -> B"
 
-## arm is gone (0.4.0) --------------------------------------------------
-# The verb exits 2 and is told the keep-list (which no longer names it).
-out="$("$S" --root "$R" arm --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 2 ];                                     note $? "arm exits 2 (unknown verb)"
-printf '%s\n' "$out" | grep -qF "unknown verb 'arm'"; note $? "arm is named unknown"
-printf '%s\n' "$out" | grep '^verbs:' | grep -qF "arm" && rc=1 || rc=0
-                                                      note $rc "the keep-list has no arm"
-# register takes no --lifecycle anymore.
-out="$("$S" --root "$R" register --seat D --harness sb --lifecycle poller 2>&1)"; rc=$?
-[ "$rc" -ne 0 ];                                     note $? "register refuses --lifecycle"
-
 out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "hello seat"
                                                       note $? "drain B returns the body"
@@ -86,25 +73,6 @@ printf '%s\n' "$out" | grep -qF "hello seat" && [ "$(printf '%s\n' "$out" | grep
 out="$("$S" --root "$R" drain --seat A 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "reply seat"
                                                       note $? "drain A returns the reply"
-
-## rooms are gone (0.7.0) ----------------------------------------------
-# The verb exits 2 and is told the keep-list (which no longer names it).
-out="$("$S" --root "$R" room create ops 2>&1)"; rc=$?
-[ "$rc" -eq 2 ];                                     note $? "room exits 2 (unknown verb)"
-printf '%s\n' "$out" | grep -qF "unknown verb 'room'"; note $? "room is named unknown"
-printf '%s\n' "$out" | grep '^verbs:' | grep -qF "room" && rc=1 || rc=0
-                                                      note $rc "the keep-list has no room"
-# A 0.6.0 board's leftover rooms/ and cursors/ never break a drain,
-# and nothing deletes them.
-mkdir -p "$R/rooms/ops" "$R/seats/B/cursors"
-echo 0 > "$R/seats/B/cursors/ops"
-"$S" --root "$R" send --from A B "over the leftovers" >/dev/null 2>&1
-                                                      note $? "send over leftover room dirs"
-out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "over the leftovers"
-                                                      note $? "drain works with leftover room dirs"
-[ -d "$R/rooms/ops" ] && [ -f "$R/seats/B/cursors/ops" ]
-                                                      note $? "leftover rooms/ and cursors/ untouched"
 
 ## quickstart step 4: bad mark (FR-012) -------------------------------
 "$S" --root "$R" send --from A B "tamper target" >/dev/null 2>&1
@@ -231,9 +199,6 @@ r2="$(tm5 gallery)"
 # not (no bindings on this board, so nothing is awake).
 tm5 status | grep -qx "fresh unattended mail=0";     note $? "a seat with no pane is unattended"
 tm5 status | grep -qx "parked unattended mail=1";    note $? "mail does not change presence"
-# A leftover wait.pid (from a 0.3.0 waiter) never affects presence.
-printf '%s\n' "$$" > "$R5/seats/fresh/wait.pid"
-tm5 status | grep -qx "fresh unattended mail=0";     note $? "presence never reads wait.pid"
 
 ## 0.8.0: status prints asleep from a prepared record --------------
 # Smoke has no hub and makes no sleep claim of its own: this checks
@@ -265,8 +230,8 @@ out="$("$S" --root "$R5" dispatch --once 2>&1)"; rc=$?
   && [ ! -e "$R5/dispatch.log" ]
                                                 note $? "pull: --once is quiet, untouched, unlogged"
 [ -z "$(ls "$R5/seats/parked/draining")" ];    note $? "pull: nothing staged (no receive)"
-"$S" --root "$R5" no-such-verb 2>&1 | grep '^verbs:' | grep -qF dispatch
-                                                note $? "the keep-list names dispatch"
+"$S" --root "$R5" no-such-verb >/dev/null 2>&1; [ "$?" -eq 2 ]
+                                                note $? "an unknown verb exits 2"
 
 ## seat-launch quickstart (003) steps 1, 2, 3, 6, 7 ---------------------
 # The session record, read without attaching: tab-separated session,

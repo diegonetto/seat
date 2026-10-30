@@ -35,8 +35,7 @@ pub struct Received {
 /// codes, quarantine behaviour and stderr wording are unchanged: good
 /// mail is archived and `last_drained` is stamped exactly as before
 /// even when `receive` recorded failures — then the command exits
-/// nonzero, so a bad message never wedges the next drain (T012, T013,
-/// FR-012).
+/// nonzero, so a bad message never wedges the next drain.
 pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -44,7 +43,7 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 
     // One drain of this seat at a time: a second drain waits (bounded),
     // never interleaves; other seats have their own locks.
-    let _lock = seat::SeatLock::acquire(&dir, seat_name)?;
+    let _lock = seat::Flock::seat(&dir, seat_name)?;
 
     let received = receive(root, seat_name)?;
 
@@ -80,8 +79,7 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 /// crashed drain ride along), then each staged message is checked
 /// exactly as `drain` always has: the sender name, the sender's token,
 /// the HMAC, the destination. What fails is quarantined — never
-/// delivered. Directories left over from before 0.7.0 (`<root>/rooms`,
-/// `<seat>/cursors`) are neither read nor written.
+/// delivered.
 pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -244,52 +242,12 @@ mod tests {
             1
         );
 
-        // T012: a second, empty drain prints NOTHING and exits 0.
+        // A second, empty drain prints NOTHING and exits 0.
         let (r2, text2) = drain_str(&root, "beta");
         r2.unwrap();
         assert_eq!(text2, "", "empty drain prints nothing");
         let meta = seat::read_meta(&seat::seat_dir(&root, "beta")).unwrap();
         assert!(meta.last_drained.is_some());
-    }
-
-    /// A board still carrying `rooms/` and `seats/*/cursors/` from
-    /// before 0.7.0 drains direct mail exactly as a fresh one: the
-    /// leftovers are neither read nor written, and their presence is
-    /// never an error.
-    #[test]
-    fn leftover_room_directories_never_touch_a_drain() {
-        let root = setup();
-        std::fs::create_dir_all(root.join("rooms").join("ops")).unwrap();
-        std::fs::write(
-            root.join("rooms")
-                .join("ops")
-                .join("20260101T000000.000000-deadbeef.msg"),
-            "old post",
-        )
-        .unwrap();
-        let cursors = seat::seat_dir(&root, "beta").join("cursors");
-        std::fs::create_dir_all(&cursors).unwrap();
-        std::fs::write(cursors.join("ops"), "0").unwrap();
-
-        verbs::cmd_send(&root, Some("alpha"), "beta", "plain mail", None).unwrap();
-        let (r, text) = drain_str(&root, "beta");
-        r.unwrap();
-        assert!(text.contains("plain mail"));
-        assert!(
-            !text.contains("[room"),
-            "no room lines on a 0.7.0 board: {text}"
-        );
-
-        // Untouched on disk.
-        assert_eq!(
-            std::fs::read_to_string(cursors.join("ops")).unwrap(),
-            "0",
-            "the leftover cursor was not written"
-        );
-        assert!(root.join("rooms/ops").is_dir());
-        let (r2, text2) = drain_str(&root, "beta");
-        r2.unwrap();
-        assert_eq!(text2, "");
     }
 
     #[test]
@@ -451,7 +409,7 @@ mod tests {
         let root = setup();
         verbs::cmd_send(&root, Some("alpha"), "beta", "held seat", None).unwrap();
         let dir = seat::seat_dir(&root, "beta");
-        let held = seat::SeatLock::acquire(&dir, "beta").unwrap();
+        let held = seat::Flock::seat(&dir, "beta").unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<(Result<()>, String)>();
         let root2 = root.clone();
         let waiter = std::thread::spawn(move || {
@@ -556,8 +514,7 @@ mod tests {
         let root = setup();
         verbs::cmd_register(&root, "gamma", "sb", None, None, Vec::new(), None).unwrap();
         verbs::cmd_send(&root, Some("alpha"), "beta", "other seat", None).unwrap();
-        let _gamma_lock =
-            seat::SeatLock::acquire(&seat::seat_dir(&root, "gamma"), "gamma").unwrap();
+        let _gamma_lock = seat::Flock::seat(&seat::seat_dir(&root, "gamma"), "gamma").unwrap();
         let started = std::time::Instant::now();
         let (r, text) = drain_str(&root, "beta");
         r.unwrap();

@@ -28,7 +28,6 @@ if [ -z "${TMUX_PANE:-}" ] || [ -z "${TMUX:-}" ]; then
   exit 1
 fi
 
-mkdir -p "$RUNTIME"
 printf '%s\n' "$$" >"$RUNTIME/pane.pid"
 
 mapfile -d '' -t LAUNCH < <(python3 - "$SEAT" "$RUNTIME" "$HARNESS" "$$" "${TMUX_PANE}" "${TMUX%%,*}" <<'PY'

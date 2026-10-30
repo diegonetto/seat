@@ -3,7 +3,7 @@
 //! `hapi-sessions.json` is `hapi` (its pass body below, client in
 //! `hub`), else a seat directory holding `webhook.url` is `webhook`
 //! (`webhook` — no hub needed), else pull — no push, the seat drains
-//! when it chooses. The alarm hooks (item 6) live in the hapi pass
+//! when it chooses. The alarm hooks live in the hapi pass
 //! where it is.
 use crate::alarm;
 use crate::board;
@@ -16,7 +16,7 @@ use crate::error::{Result, SeatError};
 use crate::hub::{Hub, HubConfig};
 use crate::identity::Bindings;
 use crate::msg;
-use crate::seat::{self, SeatLock};
+use crate::seat::{self, Flock};
 use crate::sleep::{self, WakeOutcome};
 use crate::verbs::sorted_seat_names;
 use crate::webhook;
@@ -107,7 +107,9 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
         // stop calling — and only a pane that is verifiably gone
         // re-arms it. `busy`, `refused`, and `failed` stay next-pass
         // retries (the failure line was written when the hold was).
-        if state.wake_hold.is_some() && crate::session::pane_is_up(seat) != Some(false) {
+        if state.wake_hold.is_some()
+            && crate::session::live_pane_id(seat).map(|id| id.is_some()) != Some(false)
+        {
             return Ok(Pass::Blocked);
         }
         if state.wake_hold.is_some() {
@@ -175,7 +177,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // payload-delivered record; committed mail is archived away): mail
     // sitting in `inbox/` or `draining/` — the seat's own files —
     // older than 15 minutes by its verified header `ts`. The bound
-    // session is read before the decision (BLL-124): a posted item on
+    // session is read before the decision: a posted item on
     // a session that is thinking is `working` — the record gets the
     // phase with the time of the read, and the next pass re-reads —
     // and an item the hub reports invoked on an active session is
@@ -209,7 +211,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     // The lock covers receive only; a manual drain can run between
     // receive and commit.
     let received = {
-        let _lock = SeatLock::acquire(&dir, seat)?;
+        let _lock = Flock::seat(&dir, seat)?;
         drain::receive(root, seat)?
     };
     if !received.bad_marks.is_empty() || received.unreadable {
@@ -452,7 +454,7 @@ pub(crate) fn commit_invoked(
     invoked: &BTreeSet<String>,
 ) -> Result<()> {
     let dir = seat::seat_dir(root, seat);
-    let _lock = SeatLock::acquire(&dir, seat)?;
+    let _lock = Flock::seat(&dir, seat)?;
     for d in &received.directs {
         let base = direct_key(seat, &d.file_name);
         if !invoked.iter().any(|k| key_base(k) == base) {
@@ -511,7 +513,7 @@ extern "C" fn on_term(_sig: libc::c_int) {
 /// exits nonzero with the lock named.
 pub fn cmd_dispatch(root: &Path, once: bool) -> Result<()> {
     board::ensure_board(root)?;
-    let _guard = seat::DispatchLock::acquire(root)?;
+    let _guard = seat::Flock::dispatch(root)?;
     let stop = SHUTDOWN
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
         .clone();
@@ -576,7 +578,9 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
             }
         }
         for seat in webhook_seats {
-            if !live.lock().unwrap().contains_key(&seat) && webhook::has_work(root, &seat) {
+            if !live.lock().unwrap().contains_key(&seat)
+                && !webhook::present_files(&seat::seat_dir(root, &seat)).is_empty()
+            {
                 let (r, name, s) = (root.to_path_buf(), seat.clone(), Arc::clone(stop));
                 let h = std::thread::spawn(move || {
                     webhook::worker_loop(r, name, s, webhook::PROD_RING_WAITS, None)

@@ -9,7 +9,6 @@ use crate::seat;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const STATE_FILE: &str = "dispatch.json";
@@ -23,7 +22,7 @@ pub(crate) enum Phase {
     #[default]
     Staged,
     Posted,
-    /// The bound session is on it (BLL-124): recorded while the
+    /// The bound session is on it: recorded while the
     /// session read says `thinking` exactly `true`, returned to
     /// `Posted` by the first read that does not.
     Working,
@@ -35,7 +34,7 @@ pub(crate) struct ItemState {
     pub(crate) phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) accepted_at: Option<String>,
-    /// When the read that recorded `working` ran (BLL-124).
+    /// When the read that recorded `working` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) working_at: Option<String>,
 }
@@ -47,7 +46,7 @@ pub struct LastDelivery {
     pub invoked_at: String,
 }
 
-/// The dispatcher's sleep mark (0.8.0): the seat's pane was stopped
+/// The dispatcher's sleep mark: the seat's pane was stopped
 /// for idleness. Kept until a successful wake clears it; `status`
 /// prints `asleep` for it while the pane is gone.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -56,7 +55,7 @@ pub struct Asleep {
     pub reason: String,
 }
 
-/// A successful wake's record (0.8.0): the delivery key of the mail
+/// A successful wake's record: the delivery key of the mail
 /// that woke the seat.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Woken {
@@ -64,7 +63,7 @@ pub struct Woken {
     pub key: String,
 }
 
-/// The script's `up` answer held against further wakes (0.8.0): a pane
+/// The script's `up` answer held against further wakes: a pane
 /// runs with no phone session, and the script answers `up` precisely
 /// so the caller stops calling — the wake is not retried until that
 /// pane is verifiably gone.
@@ -102,7 +101,7 @@ pub struct DispatchState {
     pub(crate) items: BTreeMap<String, ItemState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ring: Option<RingState>,
-    /// The idle clock's pane fact (0.8.0): when the timed pane was
+    /// The idle clock's pane fact: when the timed pane was
     /// first seen, and (`pane_id`) which pane that is. A live pane with
     /// a different id — `seat up`, the gallery, or a down-and-up that
     /// landed inside one 2 s scan — starts the clock over; a gone pane
@@ -117,7 +116,7 @@ pub struct DispatchState {
     pub(crate) asleep: Option<Asleep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) woken: Option<Woken>,
-    /// The held wake above (0.8.0): set when seat-role answers `up`.
+    /// The held wake above: set when seat-role answers `up`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) wake_hold: Option<WakeHold>,
 }
@@ -129,50 +128,11 @@ pub fn load_state(dir: &Path) -> DispatchState {
         .unwrap_or_default()
 }
 
-static STATE_TMP: AtomicU64 = AtomicU64::new(0);
-
-/// Atomic private write, the board's standard shape (`seat.rs`
-/// `write_meta`): a fresh temp file (mode 0600, O_CREAT|O_EXCL) in the
-/// same directory, fsync, rename over the target, then fsync the
-/// directory so the rename itself is durable. Errors are returned,
-/// never ignored, and no scratch file is left behind.
-pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let n = STATE_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(
-        ".{}.{}-{n}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    let write = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    std::fs::File::open(dir)?.sync_all()?; // make the rename durable
-    Ok(())
-}
-
-/// Atomic state write (see `atomic_write_private`).
+/// Atomic state write (see `seat::atomic_write_private`).
 pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
     let mut json = serde_json::to_string_pretty(state)?.into_bytes();
     json.push(b'\n');
-    atomic_write_private(&dir.join(STATE_FILE), &json)
+    seat::atomic_write_private(&dir.join(STATE_FILE), &json)
 }
 
 /// Status's `awake`: dispatch.json records a delivery to this seat's

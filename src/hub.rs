@@ -98,20 +98,30 @@ pub struct QueuedState {
 }
 
 /// The session flags `GET /api/sessions/<id>` reports (`session`
-/// nested, top level still accepted): `thinking` and `thinkingAt`
-/// are `None` when the key is missing or not the right type, so a
-/// missing fact can never read as a quiet session.
+/// nested, top level still accepted): `thinking` is `None` when the
+/// key is missing or not a bool, so a missing fact can never read as a
+/// quiet session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionState {
     pub active: bool,
     pub thinking: Option<bool>,
-    pub thinking_at: Option<u64>,
 }
 
 type Response = ureq::http::Response<ureq::Body>;
 
 fn hub_err(e: ureq::Error) -> SeatError {
     SeatError::Hub(e.to_string())
+}
+
+/// An HTTP agent that answers every status as a response, never an
+/// error, and gives up after `timeout`.
+pub(crate) fn http_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build(),
+    )
 }
 
 /// One authenticated hub connection. A worker owns its Hub (never
@@ -125,14 +135,8 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(cfg: HubConfig) -> Hub {
-        let agent = ureq::Agent::new_with_config(
-            ureq::config::Config::builder()
-                .http_status_as_error(false)
-                .timeout_global(Some(REQUEST_TIMEOUT))
-                .build(),
-        );
         Hub {
-            agent,
+            agent: http_agent(REQUEST_TIMEOUT),
             cfg,
             jwt: None,
         }
@@ -228,10 +232,10 @@ impl Hub {
 
     /// `GET /api/sessions/<id>` as the sleep rule needs it: the
     /// session's flags from the body already fetched (`session`
-    /// nested, top level still accepted). `thinking` and
-    /// `thinkingAt` are `None` when the key is missing or not the
-    /// right type — never a silent `false` — and a 404 (no session)
-    /// leaves them `None` while `active` reads false, so the sleep
+    /// nested, top level still accepted). `thinking` is `None` when
+    /// the key is missing or not the right type — never a silent
+    /// `false` — and a 404 (no session) leaves it `None` while
+    /// `active` reads false, so the sleep
     /// rule can never feed a missing session's answer in as
     /// permission to sleep.
     pub fn session_state(&mut self, session_id: &str) -> Result<SessionState> {
@@ -248,13 +252,11 @@ impl Hub {
                 Ok(SessionState {
                     active: flag("active").and_then(|a| a.as_bool()).unwrap_or(false),
                     thinking: flag("thinking").and_then(|t| t.as_bool()),
-                    thinking_at: flag("thinkingAt").and_then(|t| t.as_u64()),
                 })
             }
             404 => Ok(SessionState {
                 active: false,
                 thinking: None,
-                thinking_at: None,
             }),
             c => Err(SeatError::Hub(format!(
                 "GET session {session_id}: status {c}"
@@ -263,8 +265,6 @@ impl Hub {
     }
 
     /// `GET /api/sessions/<id>`: false on 404 or `active` not true.
-    /// Kept on top of `session_state`, with its old meaning, for the
-    /// delivery gate.
     pub fn session_active(&mut self, session_id: &str) -> Result<bool> {
         Ok(self.session_state(session_id)?.active)
     }
@@ -327,7 +327,7 @@ mod tests {
         home
     }
 
-    /// Finding 3c: address and token each come from their own override
+    /// Address and token each come from their own override
     /// or field, independently — a file holding only one half never
     /// discards the other.
     #[test]
@@ -399,16 +399,14 @@ mod tests {
             client.session_state("thinking").unwrap(),
             SessionState {
                 active: true,
-                thinking: Some(true),
-                thinking_at: Some(123)
+                thinking: Some(true)
             }
         );
         assert_eq!(
             client.session_state("quiet").unwrap(),
             SessionState {
                 active: true,
-                thinking: Some(false),
-                thinking_at: Some(0)
+                thinking: Some(false)
             }
         );
         for session in ["not-bool", "no-key"] {
@@ -420,8 +418,7 @@ mod tests {
             client.session_state("absent").unwrap(),
             SessionState {
                 active: false,
-                thinking: None,
-                thinking_at: None
+                thinking: None
             },
             "a 404 is no session, never a quiet one"
         );

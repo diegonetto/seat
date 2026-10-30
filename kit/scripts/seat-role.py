@@ -116,19 +116,11 @@ def command(argv, *, data=None, timeout=5, cwd=None, deadline=None):
     return done.stdout
 
 
-def atomic_json(path, value):
+def atomic_write(path, value):
+    """Replace path in one step: bytes as given, anything else as one JSON document and a newline."""
     # Callers hold the role-wake lock; unique temporary names also avoid clobbers.
-    fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(value, handle)
-            handle.write("\n")
-        os.replace(name, path)
-    finally:
-        Path(name).unlink(missing_ok=True)
-
-
-def atomic_bytes(path, value):
+    if not isinstance(value, bytes):
+        value = (json.dumps(value) + "\n").encode()
     fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -138,17 +130,11 @@ def atomic_bytes(path, value):
         Path(name).unlink(missing_ok=True)
 
 
-_SEAT_MAP = None
-
-
-def seat_map(home=None):
-    """The kernel's seat map: `sb seats --json` (the kernel reads $SWITCHBOARD_HOME), once per process.
+def seat_map():
+    """The kernel's seat map: `sb seats --json` (the kernel reads $SWITCHBOARD_HOME).
 
     The kernel's own stderr words refuse an absent or malformed map.
     """
-    global _SEAT_MAP
-    if _SEAT_MAP is not None:
-        return _SEAT_MAP
     try:
         done = subprocess.run(["sb", "seats", "--json"], text=True, capture_output=True, timeout=15)
     except FileNotFoundError:
@@ -163,22 +149,21 @@ def seat_map(home=None):
         fail("the seat map gave an answer that could not be read")
     if not isinstance(seats, dict):
         fail("the seat map gave an answer that could not be read")
-    _SEAT_MAP = seats
     return seats
 
 
-def map_roles(home=None):
+def map_roles():
     """The map's roles in its file order; the map says which roles exist."""
-    return [str(row["role"]) for row in seat_map(home).values()
+    return [str(row["role"]) for row in seat_map().values()
             if isinstance(row, dict) and isinstance(row.get("role"), str)]
 
 
-def role_row(role, home=None):
+def role_row(role):
     """(seat, record) for the map record whose role matches."""
-    for seat, row in seat_map(home).items():
+    for seat, row in seat_map().items():
         if isinstance(row, dict) and row.get("role") == role:
             return seat, row
-    fail("role " + role + " is not in the seat map; use " + ", ".join(map_roles(home)))
+    fail("role " + role + " is not in the seat map; use " + ", ".join(map_roles()))
 
 
 class Wake:
@@ -187,7 +172,7 @@ class Wake:
         self.home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
         self.projects = self.home / "Projects"
         # One seat list: the kernel's map names the seat, kind, label and account (the tables and roles.json are gone).
-        self.seat, record = role_row(role, self.home)
+        self.seat, record = role_row(role)
         kind, account, label = record.get("harness"), record.get("account"), record.get("name")
         if (not isinstance(kind, str) or not kind
                 or not isinstance(account, str)
@@ -389,11 +374,10 @@ class Wake:
         """
         # Seats are named for their lab (the map's name: GLM, Claude, GPT, Grok, Gemini, Flight), never a job.
         name = self.label + " · " + self.seat
-        # Name only a session that has no real name yet: blank, the folder name HAPI falls back to, or the name this
-        # code used to give it ("Lander · codex-main"). A name Diego set by hand is never overwritten.
+        # Name only a session that has no real name yet: blank, or the folder name HAPI falls back to. A name Diego set
+        # by hand is never overwritten.
         current = (self.session_name or "").strip()
-        ours_before = current == self.role.capitalize() + " · " + self.seat
-        if current == name or (current and current != self.projects.name and not ours_before):
+        if current == name or (current and current != self.projects.name):
             return
         try:
             self.hub("/sessions/" + URL.fullmatch(url).group(1), deadline, patch={"name": name})
@@ -409,7 +393,7 @@ class Wake:
         state = self.read_map()
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         state["seats"][self.seat] = {"url": url, "moved_at": stamp}
-        atomic_json(self.map_path, state)
+        atomic_write(self.map_path, state)
         raise Result("awake", url=url)
 
     def read_map(self):
@@ -458,7 +442,7 @@ class Wake:
             time.sleep(min(1, max(0, deadline - time.monotonic())))
         if backup:
             # No session to show for the cutover: the next start uses the old command.
-            atomic_bytes(self.harness_path, backup.read_bytes())
+            atomic_write(self.harness_path, backup.read_bytes())
         fail(reason)
 
     def start_down(self, wrapped, preflight_deadline):
@@ -474,7 +458,7 @@ class Wake:
         # The saved URL died with the pane; awake() writes the new one.
         state = self.read_map()
         if state["seats"].pop(self.seat, None) is not None:
-            atomic_json(self.map_path, state)
+            atomic_write(self.map_path, state)
         backup = None
         if not wrapped and blocker is None:
             self.harness, backup = self.cutover()
@@ -482,7 +466,7 @@ class Wake:
             command(["seat", "up", self.seat], cwd=self.projects, timeout=30)
         except Result:
             if backup:
-                atomic_bytes(self.harness_path, backup.read_bytes())
+                atomic_write(self.harness_path, backup.read_bytes())
             fail(f"the swarm was not running and the seat command could not start {self.role}")
         if blocker:
             # The seat is up; it just has no phone session. Say so ("up"), never "failed": the board shows it awake
@@ -506,7 +490,7 @@ class Wake:
         # Preserve the exact previous bytes for host recovery.
         backup = self.harness_path.with_name("harness.json.pre-hapi." + str(time.time_ns()))
         backup.write_bytes(self.harness_path.read_bytes())
-        atomic_json(self.harness_path, changed)
+        atomic_write(self.harness_path, changed)
         return changed, backup
 
     def run(self):
@@ -580,18 +564,18 @@ class Wake:
                 self.tmux(target, "send-keys", "-t", target["pane"],
                           "/quit" if self.kind == "codex" else "/exit", "Enter")
             except Result:
-                atomic_bytes(self.harness_path, backup.read_bytes())
+                atomic_write(self.harness_path, backup.read_bytes())
                 raise
             exit_deadline = time.monotonic() + 30
             while target["pane"] in self.tmux(target, "list-panes", "-a", "-F", "#{pane_id}").splitlines():
                 if time.monotonic() >= exit_deadline:
-                    atomic_bytes(self.harness_path, backup.read_bytes())
+                    atomic_write(self.harness_path, backup.read_bytes())
                     fail("the seat's CLI did not exit; inspect the pane before retrying")
                 time.sleep(1)
             try:
                 command(["seat", "up", self.seat], cwd=self.projects, timeout=15)
             except Result:
-                atomic_bytes(self.harness_path, backup.read_bytes())
+                atomic_write(self.harness_path, backup.read_bytes())
                 raise
             self.harness = changed
             self.await_session(target, "the seat restarted, but no phone session appeared within 60 seconds", backup)
@@ -652,7 +636,7 @@ def pins():
     home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
     runtimes = Path(os.environ.get("SEAT_RUNTIMES", str(home / "Projects/.seat-runtimes")))
     report = {}
-    for seat, row in seat_map(home).items():
+    for seat, row in seat_map().items():
         try:
             argv = json.loads((runtimes / seat / "harness.json").read_text()).get("argv")
         except (OSError, ValueError):

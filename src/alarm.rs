@@ -1,4 +1,4 @@
-//! Alarms (item 6, the frozen contract): one line to
+//! Alarms: one line to
 //! `<root>/dispatch.log` and one direct message from seat `sb-watch`
 //! to the seat named in `<root>/alarm-seat`, **once per cause** (not
 //! per retry). When that file is absent or empty the alarm is the log
@@ -8,9 +8,7 @@
 //! worker and the next scan stay silent until the condition clears
 //! and returns. No deduplication beyond the listed causes.
 use crate::dispatch::QUEUED_CHUNK;
-use crate::dstate::{
-    atomic_write_private, direct_key, key_base, log_line, store_state, DispatchState, Phase,
-};
+use crate::dstate::{direct_key, key_base, log_line, store_state, DispatchState, Phase};
 use crate::error::Result;
 use crate::hub::Hub;
 use crate::seat;
@@ -59,7 +57,7 @@ fn load(root: &Path) -> Fired {
 fn store(root: &Path, fired: &Fired) -> Result<()> {
     let mut json = serde_json::to_string(fired)?.into_bytes();
     json.push(b'\n');
-    atomic_write_private(&root.join(STATE_FILE), &json)
+    seat::atomic_write_private(&root.join(STATE_FILE), &json)
 }
 
 /// The seat alarms are mailed to: the first line of
@@ -189,36 +187,21 @@ fn item_state(seat: &str, state: &DispatchState, file: &str) -> Option<(String, 
         .map(|(key, item)| (key.clone(), item.phase))
 }
 
-/// The hapi pass's `undelivered` (BLL-124): the same file-age rule
-/// with the exceptions the session read decides, per old file. The
-/// bound session is read first — asked only when something is old or
-/// an item is stored `working` — and an in-flight `posted` item on an
-/// active session reporting `thinking` exactly `true` is `working`:
-/// the record gets that phase with the time of the read, and every
-/// pass re-reads while any item is stored `working`, old files or
-/// not (a read that does not say thinking — a missing flag, a quiet
-/// or inactive session, a GET error — returns the item to `posted`,
-/// so no page is silenced by a stale fact and no new timer is
-/// needed). The hub
-/// marks a queued message invoked only when the turn ends, and this
-/// decision runs before the pass's poll commits that mark (the file
-/// is still in `draining/`), so an old `posted` item the hub reports
-/// invoked on an active session is delivered, not undelivered — the
-/// page waits for a pass that reads the item still not invoked. Every
-/// other old file still pages, never-posted mail included; only an
-/// explicit `true` or an active session's invoked mark skips (a
-/// missing or non-boolean flag never does, an inactive session's
-/// invoked mark never does — the ending session made it), and a hub
-/// error never skips — today's page happens with the error named
-/// (a failed queued read too: the latched page cannot be amended by
-/// the pass's later poll).
-/// The page text names what the pass saw (`posted, session idle for
-/// N min`, N the file's own age — `idle` only for an explicit
-/// `false`, the words `thinking unknown` or `session not active` when
-/// that is the read), so a dead delivery reads apart from a long
-/// turn. When every old file is skipped the latch clears: `fire` is
-/// once per cause, and a latch left set would not page when the turn
-/// ends.
+/// The hapi pass's `undelivered`: the same file-age rule, with the
+/// exceptions the bound session decides, per old file. The session is
+/// read only when something is old or an item is stored `working`.
+///
+/// Invariant: only an explicit signal skips a page. A `posted` item on
+/// an active session reporting `thinking` exactly `true` becomes
+/// `working`; a `posted` item the hub reports invoked on an active
+/// session is delivered (the hub marks invoked only when the turn
+/// ends, and this runs before the pass's poll commits that mark).
+/// Anything else old pages: a missing or non-boolean flag, an inactive
+/// session, a hub error, never-posted mail. Any read that does not say
+/// thinking returns a `working` item to `posted`, so a stale fact never
+/// silences a page. The page text names the read (`session idle for N
+/// min`, `thinking unknown`, `session not active`). When every old file
+/// is skipped the latch clears, so the page fires when the turn ends.
 pub(crate) fn undelivered_hapi(
     root: &Path,
     seat: &str,
