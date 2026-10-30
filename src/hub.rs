@@ -232,10 +232,10 @@ impl Hub {
 
     /// `GET /api/sessions/<id>` as the sleep rule needs it: the
     /// session's flags from the body already fetched (`session`
-    /// nested, top level still accepted). `thinking` and
-    /// `thinkingAt` are `None` when the key is missing or not the
-    /// right type — never a silent `false` — and a 404 (no session)
-    /// leaves them `None` while `active` reads false, so the sleep
+    /// nested, top level still accepted). `thinking` is `None` when
+    /// the key is missing or not the right type — never a silent
+    /// `false` — and a 404 (no session) leaves it `None` while
+    /// `active` reads false, so the sleep
     /// rule can never feed a missing session's answer in as
     /// permission to sleep.
     pub fn session_state(&mut self, session_id: &str) -> Result<SessionState> {
