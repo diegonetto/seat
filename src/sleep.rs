@@ -496,26 +496,20 @@ mod tests {
     /// PATH.
     #[test]
     fn seat_role_program_prefers_kit_then_binary_then_path() {
-        let _guard = crate::testutil::env_lock();
         let kit = crate::testutil::temp_root("sleep-kit");
         std::fs::create_dir_all(kit.join("scripts")).unwrap();
         std::fs::write(kit.join("scripts").join("seat-role"), "#!/bin/sh\n").unwrap();
-        let prev = std::env::var_os("SEAT_KIT");
-        std::env::set_var("SEAT_KIT", &kit);
+        let mut env = crate::testutil::lock_env(&[("SEAT_KIT", kit.as_os_str().to_os_string())]);
         assert_eq!(
             seat_role_program(),
             kit.join("scripts").join("seat-role"),
             "$SEAT_KIT wins"
         );
-        std::env::set_var("SEAT_KIT", "");
+        env.set("SEAT_KIT", std::ffi::OsString::new());
         assert_eq!(
             seat_role_program(),
             PathBuf::from("seat-role"),
             "empty SEAT_KIT and no kit beside the binary: PATH"
         );
-        match prev {
-            Some(v) => std::env::set_var("SEAT_KIT", v),
-            None => std::env::remove_var("SEAT_KIT"),
-        }
     }
 }

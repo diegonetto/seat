@@ -131,7 +131,7 @@ pub fn reset(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::temp_root;
+    use crate::testutil::{lock_env, temp_root};
 
     #[test]
     fn init_creates_marker_and_layout() {
@@ -268,19 +268,20 @@ mod tests {
     #[test]
     fn resolve_root_prefers_explicit_then_env_over_default() {
         // One test touches the root environment; every other test
-        // passes roots in.
+        // passes roots in. The guard holds ENV_LOCK and restores the
+        // inherited value (or absence) on drop, even on panic.
         let thrown = temp_root("board-env");
-        std::env::remove_var("SEAT_ROOT");
+        let mut env = lock_env(&[]);
+        env.unset("SEAT_ROOT");
         assert_eq!(resolve_root(None), default_root());
         assert_ne!(resolve_root(None), thrown);
 
-        std::env::set_var("SEAT_ROOT", &thrown);
+        env.set("SEAT_ROOT", thrown.clone().into_os_string());
         assert_eq!(resolve_root(None), thrown);
         assert_eq!(
             resolve_root(Some("/elsewhere")),
             PathBuf::from("/elsewhere")
         );
-        std::env::remove_var("SEAT_ROOT");
     }
 
     /// The documented default, pinned: `$HOME/.local/share/seat`. A

@@ -10,7 +10,7 @@ use crate::hub::Hub;
 use crate::testutil::dispatchkit::{board_with, kit, log_text, mark, n_files, n_posts, only_key, send};
 use crate::testutil::fakehub::FakeHub;
 use crate::testutil::fakewebhook::FakeWebhook;
-use crate::testutil::{fake_tmux, wait_for, write_bindings};
+use crate::testutil::{fake_tmux, lock_env, wait_for, write_bindings};
 use crate::webhook::{self, RingWaits, WebhookConfig};
 use crate::{drain, dstate, msg, seat, verbs};
 use std::ffi::OsString;
@@ -1568,34 +1568,87 @@ fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
 
 // ---- sleep and wake -------------------------------------------------
 
-/// Hold the process-wide env lock and set variables for the body,
-/// restoring the previous values on drop (even on panic). The stubs
-/// these tests install are visible to every subprocess this process
-/// spawns, so they never run beside a test that reads them.
-struct Env {
-    saved: Vec<(&'static str, Option<OsString>)>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+// lock_env — the one RAII env guard, in testutil beside ENV_LOCK —
+// holds the process-wide lock and restores on drop every variable it
+// touched, even on panic; the lock_env_* characterizations below pin
+// that restoration.
+
+/// `lock_env` restores what it borrowed on a plain return: a variable
+/// that had a value reads as that value again, one that was absent is
+/// absent again. The probe names are read by no other test (each
+/// characterization owns its own), so the unguarded setup races no
+/// one.
+#[test]
+fn lock_env_restores_the_environment_on_return() {
+    std::env::set_var("SEAT_GUARD_PROBE_RET_PRESENT", "original");
+    std::env::remove_var("SEAT_GUARD_PROBE_RET_ABSENT");
+    {
+        let _env = lock_env(&[
+            ("SEAT_GUARD_PROBE_RET_PRESENT", OsString::from("stub")),
+            ("SEAT_GUARD_PROBE_RET_ABSENT", OsString::from("stub")),
+        ]);
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_PROBE_RET_PRESENT"),
+            Some(OsString::from("stub"))
+        );
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_PROBE_RET_ABSENT"),
+            Some(OsString::from("stub"))
+        );
+    }
+    assert_eq!(
+        std::env::var_os("SEAT_GUARD_PROBE_RET_PRESENT"),
+        Some(OsString::from("original")),
+        "the previous value is back"
+    );
+    assert_eq!(std::env::var_os("SEAT_GUARD_PROBE_RET_ABSENT"), None);
+    std::env::remove_var("SEAT_GUARD_PROBE_RET_PRESENT");
 }
 
-fn lock_env(vars: &[(&'static str, OsString)]) -> Env {
-    let lock = crate::testutil::env_lock();
-    let mut saved = Vec::new();
-    for (name, value) in vars {
-        saved.push((*name, std::env::var_os(name)));
-        std::env::set_var(name, value);
-    }
-    Env { saved, _lock: lock }
+/// The same restoration holds when the scope unwinds: the guard's
+/// Drop runs during the panic, before any later test reads the env.
+#[test]
+fn lock_env_restores_the_environment_on_panic() {
+    std::env::set_var("SEAT_GUARD_PROBE_PANIC_PRESENT", "original");
+    std::env::remove_var("SEAT_GUARD_PROBE_PANIC_ABSENT");
+    let unwound = std::panic::catch_unwind(|| {
+        let _env = lock_env(&[
+            ("SEAT_GUARD_PROBE_PANIC_PRESENT", OsString::from("stub")),
+            ("SEAT_GUARD_PROBE_PANIC_ABSENT", OsString::from("stub")),
+        ]);
+        panic!("unwind under the guard");
+    });
+    assert!(unwound.is_err(), "the body must have unwound");
+    assert_eq!(
+        std::env::var_os("SEAT_GUARD_PROBE_PANIC_PRESENT"),
+        Some(OsString::from("original"))
+    );
+    assert_eq!(std::env::var_os("SEAT_GUARD_PROBE_PANIC_ABSENT"), None);
+    std::env::remove_var("SEAT_GUARD_PROBE_PANIC_PRESENT");
 }
 
-impl Drop for Env {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
+/// A later direct mutation of a guarded variable never survives the
+/// scope: drop restores the value saved at construction, not the last
+/// one written (the mid-test overrides at the swap and gone-socket
+/// cases lean on exactly this).
+#[test]
+fn lock_env_discards_later_mutations_of_a_guarded_variable() {
+    std::env::set_var("SEAT_GUARD_PROBE_MUT", "original");
+    {
+        let _env = lock_env(&[("SEAT_GUARD_PROBE_MUT", OsString::from("first"))]);
+        std::env::set_var("SEAT_GUARD_PROBE_MUT", "second");
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_PROBE_MUT"),
+            Some(OsString::from("second")),
+            "the override is live inside the scope"
+        );
     }
+    assert_eq!(
+        std::env::var_os("SEAT_GUARD_PROBE_MUT"),
+        Some(OsString::from("original")),
+        "the first saved value is what drop restores"
+    );
+    std::env::remove_var("SEAT_GUARD_PROBE_MUT");
 }
 
 /// `dir` first on PATH (the rest kept: the stubs shadow `sb` and
@@ -1658,9 +1711,11 @@ printf '%s' '{"status":"awake","url":"https://hapi.bll.dev/sessions/SESSION"}'
 /// with `--idle-after 30m`, its pane first seen `minutes_ago`. The
 /// board sits behind a fake `SEAT_ROLE_HOME` whose
 /// `.local/share/seat` resolves to it — the supported configuration,
-/// since the real wake script writes exactly that path. The caller
-/// holds ENV_LOCK, PATH holds the stub kit, SEAT_TMUX is set.
+/// since the real wake script writes exactly that path. The caller's
+/// env guard (`env`) holds ENV_LOCK, PATH holds the stub kit, SEAT_TMUX
+/// is set; this helper's own variables go through the same guard.
 fn up_and_seen(
+    env: &mut crate::testutil::EnvGuard,
     seat: &str,
     session: &str,
     minutes_ago: i64,
@@ -1670,7 +1725,7 @@ fn up_and_seen(
     let home = root.join("role-home");
     std::fs::create_dir_all(home.join(".local").join("share")).unwrap();
     std::os::unix::fs::symlink(&root, home.join(".local").join("share").join("seat")).unwrap();
-    std::env::set_var("SEAT_ROLE_HOME", &home);
+    env.set("SEAT_ROLE_HOME", home.into_os_string());
     hub.ctl
         .lock()
         .unwrap()
@@ -1686,7 +1741,7 @@ fn up_and_seen(
         Some("30m".into()),
     )
     .unwrap();
-    std::env::set_var("SEAT_FAKE_STATE", root.join("tmux.state"));
+    env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     crate::session::cmd_up(&root, &[seat.to_string()]).unwrap();
     let live = crate::session::live_pane_id(seat)
         .expect("the fake multiplexer answers")
@@ -1715,12 +1770,12 @@ fn idle_seat_sleeps_once_and_only_once() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     assert!(
         crate::session::running_seats(&fake_tmux())
             .unwrap()
@@ -1777,14 +1832,14 @@ fn the_idle_clock_is_the_pane_plus_the_bound_delivery() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
 
     // A delivery to the bound session just now: the clock is recent.
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let mut state = dstate::load_state(&dir);
     state.last_delivery = Some(dstate::LastDelivery {
@@ -1810,7 +1865,7 @@ fn the_idle_clock_is_the_pane_plus_the_bound_delivery() {
 
     // A just-now delivery to a session that is not the binding does
     // not count: the clock is the pane fact alone.
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let mut state = dstate::load_state(&dir);
     state.last_delivery = Some(dstate::LastDelivery {
@@ -1834,12 +1889,13 @@ fn a_thinking_session_never_sleeps() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
     let (root, hub, mut client) = up_and_seen(
+        &mut env,
         "opus",
         "s1",
         31,
@@ -1871,7 +1927,7 @@ fn a_bad_thinking_answer_never_sleeps() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
@@ -1886,7 +1942,7 @@ fn a_bad_thinking_answer_never_sleeps() {
         ("GET error", None), // fail_get below answers 500
     ];
     for (name, body) in cases {
-        let (root, hub, mut client) = up_and_seen("opus", "s1", 31, "");
+        let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, "");
         let mut ctl = hub.ctl.lock().unwrap();
         ctl.get_bodies.remove("s1"); // up_and_seen stored the empty body
         if let Some(body) = body {
@@ -1921,12 +1977,12 @@ fn an_in_flight_item_never_sleeps() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     hub.ctl.lock().unwrap().sessions.insert("s1".into(), true);
     send(&root, "opus", "still working");
     let key = only_key(&root, "opus");
@@ -1957,7 +2013,7 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
         Some(r#"{"seats":{"opus":{"role":"opus"},"drowsy":{"role":"drowsy"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
@@ -1969,7 +2025,7 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
     let home = root.join("role-home");
     std::fs::create_dir_all(home.join(".local").join("share")).unwrap();
     std::os::unix::fs::symlink(&root, home.join(".local").join("share").join("seat")).unwrap();
-    std::env::set_var("SEAT_ROLE_HOME", &home);
+    env.set("SEAT_ROLE_HOME", home.into_os_string());
     hub.ctl
         .lock()
         .unwrap()
@@ -2002,7 +2058,7 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
         Some("30m".into()),
     )
     .unwrap();
-    std::env::set_var("SEAT_FAKE_STATE", root.join("tmux.state"));
+    env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     // opus's pane is up and its clock is 31 minutes old: without the
     // stored threshold this seat would sleep on this pass.
     crate::session::cmd_up(&root, &["opus".to_string()]).unwrap();
@@ -2050,12 +2106,12 @@ fn idle_after_without_a_role_never_sleeps() {
     let no_role = stub_kit("sleep-norole", Some(r#"{"seats":{"other":{"role":"x"}}}"#), None);
     let map_fails = stub_kit("sleep-nomap", None, None);
     for (name, kit_dir) in [("no role in the map", no_role), ("map read fails", map_fails)] {
-        let _env = lock_env(&[
+        let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
             ("SEAT_TMUX", OsString::from(fake_tmux())),
         ]);
-        let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
         dispatch::pass_seat(&root, "opus", &mut client).unwrap();
         assert!(
             dstate::load_state(&seat::seat_dir(&root, "opus"))
@@ -2378,12 +2434,12 @@ fn a_pass_finishes_a_sleep_whose_kill_never_landed() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     // Exactly what the record store leaves: the mark beside a standing
     // pane fact, the pane still up, the inbox empty.
@@ -2561,12 +2617,12 @@ fn a_new_pane_resets_the_idle_clock() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     // The fact names a pane that is no longer the live one, with an
     // old timestamp: before the fix this pass would sleep the seat.
@@ -2619,12 +2675,12 @@ fn a_pending_sleep_never_kills_a_replacement_pane() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     // A second seat's pane keeps the id counter above opus's, so the
     // replacement really is a different pane id.
     verbs::cmd_register(
@@ -2707,12 +2763,12 @@ fn a_replacement_between_recovery_pane_queries_cancels_the_sleep() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let mut state = dstate::load_state(&dir);
     let old_pane = state.pane_id.clone().unwrap();
@@ -2747,7 +2803,7 @@ exit $status
     .replace("COUNT", &root.join("swap.count").display().to_string())
     .replace("OLD", &old_pane);
     stub(&root, "swap-tmux.sh", &script);
-    std::env::set_var("SEAT_TMUX", root.join("swap-tmux.sh"));
+    env.set("SEAT_TMUX", root.join("swap-tmux.sh").into_os_string());
 
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
@@ -2812,12 +2868,12 @@ fn a_pending_sleep_whose_pane_already_died_completes() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let mut state = dstate::load_state(&dir);
     state.asleep = Some(dstate::Asleep {
@@ -2852,12 +2908,12 @@ fn a_pending_sleep_survives_an_unanswerable_multiplexer() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let before = {
         let mut state = dstate::load_state(&dir);
@@ -2869,7 +2925,10 @@ fn a_pending_sleep_survives_an_unanswerable_multiplexer() {
         state
     };
     // The multiplexer goes away between passes (the socket died).
-    std::env::set_var("SEAT_TMUX", root.join("no-such-multiplexer"));
+    env.set(
+        "SEAT_TMUX",
+        root.join("no-such-multiplexer").into_os_string(),
+    );
 
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
@@ -2904,12 +2963,13 @@ fn a_pending_sleep_on_a_session_that_resumed_work_is_cancelled() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
     let (root, hub, mut client) = up_and_seen(
+        &mut env,
         "opus",
         "s1",
         31,
@@ -2963,7 +3023,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
@@ -2972,7 +3032,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
     let home = root.join("role-home");
     std::fs::create_dir_all(home.join(".local").join("share")).unwrap();
     std::os::unix::fs::symlink(&root, home.join(".local").join("share").join("seat")).unwrap();
-    std::env::set_var("SEAT_ROLE_HOME", &home);
+    env.set("SEAT_ROLE_HOME", home.into_os_string());
     hub.ctl
         .lock()
         .unwrap()
@@ -2991,7 +3051,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
         Some("30m".into()),
     )
     .unwrap();
-    std::env::set_var("SEAT_FAKE_STATE", root.join("tmux.state"));
+    env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     assert!(crate::session::cmd_up(&root, &["opus".to_string()]).is_err());
     // The real launch joins it under the same seat name, live.
     verbs::cmd_register(
@@ -3065,12 +3125,12 @@ fn a_sleep_is_cancelled_when_a_different_live_pane_remains() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     // The fact names a pane that is no longer live; another live pane
     // holds the seat.
@@ -3109,12 +3169,12 @@ fn a_sleep_re_checks_owed_mail_before_storing_the_mark() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
 
     // Mail in the inbox: no sleep.
@@ -3166,12 +3226,12 @@ fn a_pending_sleep_survives_a_get_error_and_cancels_on_mail() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     let dir = seat::seat_dir(&root, "opus");
     let before = dstate::load_state(&dir);
     let mut pending = before.clone();
@@ -3279,12 +3339,12 @@ fn a_pending_sleep_on_a_missing_session_or_binding_cancels() {
             Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
             None,
         );
-        let _env = lock_env(&[
+        let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
             ("SEAT_TMUX", OsString::from(fake_tmux())),
         ]);
-        let (root, hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+        let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
         hub.ctl.lock().unwrap().get_bodies.remove("s1"); // no body, no session: 404
         let dir = seat::seat_dir(&root, "opus");
         let mut state = dstate::load_state(&dir);
@@ -3322,12 +3382,12 @@ fn a_pending_sleep_on_a_missing_session_or_binding_cancels() {
             Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
             None,
         );
-        let _env = lock_env(&[
+        let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
             ("SEAT_TMUX", OsString::from(fake_tmux())),
         ]);
-        let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
         crate::testutil::write_bindings(&root, &[]);
         let dir = seat::seat_dir(&root, "opus");
         let mut state = dstate::load_state(&dir);
@@ -3486,16 +3546,16 @@ fn a_board_the_wake_script_cannot_write_never_sleeps() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         None,
     );
-    let _env = lock_env(&[
+    let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
         ("SEAT_TMUX", OsString::from(fake_tmux())),
     ]);
-    let (root, _hub, mut client) = up_and_seen("opus", "s1", 31, QUIET);
+    let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
     // Point the script's home at a different board.
     let other = crate::testutil::temp_root("other-board-home");
     std::fs::create_dir_all(other.join(".local").join("share").join("seat")).unwrap();
-    std::env::set_var("SEAT_ROLE_HOME", &other);
+    env.set("SEAT_ROLE_HOME", other.into_os_string());
     let dir = seat::seat_dir(&root, "opus");
 
     dispatch::pass_seat(&root, "opus", &mut client).unwrap();
@@ -3512,7 +3572,7 @@ fn a_board_the_wake_script_cannot_write_never_sleeps() {
     assert!(!log_text(&root).contains("sleep seat="));
 
     // The same seat on the board the script writes still sleeps.
-    std::env::set_var("SEAT_ROLE_HOME", root.join("role-home"));
+    env.set("SEAT_ROLE_HOME", root.join("role-home").into_os_string());
     dispatch::pass_seat(&root, "opus", &mut client).unwrap();
     assert!(
         dstate::load_state(&dir).asleep.is_some(),

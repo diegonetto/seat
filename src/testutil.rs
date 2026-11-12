@@ -1,6 +1,7 @@
 // Test-only helpers. Tests never touch the operator's live board: every
 // helper returns a throwaway directory under the system temp dir and
 // refuses to hand out the documented default root.
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -8,9 +9,9 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// One process-wide lock for every test that sets process-wide
 /// environment (SEAT_TMUX, SEAT_FAKE_STATE, PATH, SEAT_KIT,
-/// HAPI_API_URL, CLI_API_TOKEN): env is shared by all parallel test
-/// threads, and the stubs these tests install are visible to every
-/// subprocess this process spawns.
+/// HAPI_API_URL, CLI_API_TOKEN, SEAT_ROLE_HOME, SEAT_ROOT): env is
+/// shared by all parallel test threads, and the stubs these tests
+/// install are visible to every subprocess this process spawns.
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lock a process-wide test mutex, treating poison as acquired: the
@@ -26,6 +27,78 @@ pub fn lock_despite_poison(
 /// lock_despite_poison above).
 pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     lock_despite_poison(&ENV_LOCK)
+}
+
+/// The one RAII guard for a test that sets process-wide environment:
+/// `lock_env` constructs it holding ENV_LOCK, and drop restores every
+/// variable it touched to the value (or absence) saved when the name
+/// was first touched — on return and on unwind, before the lock is
+/// released.
+///
+/// Composition: one guard per scope. ENV_LOCK does not reenter, so
+/// never construct a second guard (or call `env_lock`) while one is
+/// live — a helper that must touch more variables takes `&mut
+/// EnvGuard` instead. A guard holder may call `with_throwaway_home`
+/// (HOME_LOCK nests inside ENV_LOCK, never the other way: a
+/// `with_throwaway_home` body must not take ENV_LOCK, and HOME inside
+/// a body is with_throwaway_home's own restoration, never the
+/// guard's).
+pub struct EnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    /// Set one more variable under the held lock. The previous value
+    /// (or absence) is saved the first time a name is touched, so a
+    /// later reset never loses the original.
+    pub fn set(&mut self, name: &'static str, value: OsString) {
+        self.save(name);
+        std::env::set_var(name, value);
+    }
+
+    /// Remove one variable under the held lock, its previous value
+    /// (or absence) saved for drop.
+    pub fn unset(&mut self, name: &'static str) {
+        self.save(name);
+        std::env::remove_var(name);
+    }
+
+    fn save(&mut self, name: &'static str) {
+        if !self.saved.iter().any(|(n, _)| *n == name) {
+            self.saved.push((name, std::env::var_os(name)));
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // Runs before the _lock field drops, so the environment is
+        // whole again before another test can take ENV_LOCK.
+        for (name, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// Hold ENV_LOCK for the caller's scope and set each variable,
+/// restoring the previous value (or absence) of every one on drop,
+/// even on panic. The stubs a test installs are visible to every
+/// subprocess this process spawns, so they never run beside a test
+/// that reads them.
+pub fn lock_env(vars: &[(&'static str, OsString)]) -> EnvGuard {
+    let lock = env_lock();
+    let mut env = EnvGuard {
+        saved: Vec::new(),
+        _lock: lock,
+    };
+    for (name, value) in vars {
+        env.set(name, value.clone());
+    }
+    env
 }
 
 pub fn temp_root(tag: &str) -> PathBuf {
@@ -63,8 +136,11 @@ pub fn assert_throwaway(root: &std::path::Path) {
 /// even a path that discovers hub settings mid-test finds the
 /// throwaway, never the operator's. Tests run on parallel threads in
 /// one process and HOME is process-global, so the swap takes one
-/// process-wide lock, and the previous value is always restored, even
-/// on panic.
+/// process-wide lock (HOME_LOCK, which nests inside ENV_LOCK — a
+/// guard holder may call this; a body must not take ENV_LOCK), and
+/// the previous value is always restored, even on panic. HOME a body
+/// sets or removes itself is this function's own restoration, never
+/// the guard's.
 pub fn with_throwaway_home<T>(body: impl FnOnce() -> T) -> T {
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = lock_despite_poison(&HOME_LOCK);
@@ -515,6 +591,92 @@ mod tests {
             panic!("poison ENV_LOCK for the characterization");
         });
         let _recovered = env_lock();
+    }
+
+    /// `unset` removes a set variable and restores it on drop — the
+    /// present and the absent pre-value both — and the same holds
+    /// when the scope unwinds. The probe names are read by no other
+    /// test, so the unguarded setup races no one.
+    #[test]
+    fn env_guard_unset_removes_and_restores_on_return() {
+        std::env::set_var("SEAT_GUARD_TEST_UNSET_PRESENT", "original");
+        std::env::remove_var("SEAT_GUARD_TEST_UNSET_ABSENT");
+        {
+            let mut env = lock_env(&[]);
+            env.unset("SEAT_GUARD_TEST_UNSET_PRESENT");
+            env.unset("SEAT_GUARD_TEST_UNSET_ABSENT");
+            assert_eq!(std::env::var_os("SEAT_GUARD_TEST_UNSET_PRESENT"), None);
+            assert_eq!(std::env::var_os("SEAT_GUARD_TEST_UNSET_ABSENT"), None);
+        }
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_TEST_UNSET_PRESENT"),
+            Some(OsString::from("original"))
+        );
+        assert_eq!(std::env::var_os("SEAT_GUARD_TEST_UNSET_ABSENT"), None);
+        std::env::remove_var("SEAT_GUARD_TEST_UNSET_PRESENT");
+    }
+
+    /// The unset restoration also holds when the scope unwinds: the
+    /// guard's Drop runs during the panic, before any later test
+    /// reads the env.
+    #[test]
+    fn env_guard_unset_restores_on_panic() {
+        std::env::set_var("SEAT_GUARD_TEST_UNWIND_PRESENT", "original");
+        std::env::remove_var("SEAT_GUARD_TEST_UNWIND_ABSENT");
+        let unwound = std::panic::catch_unwind(|| {
+            let mut env = lock_env(&[]);
+            env.unset("SEAT_GUARD_TEST_UNWIND_PRESENT");
+            env.unset("SEAT_GUARD_TEST_UNWIND_ABSENT");
+            panic!("unwind under the guard");
+        });
+        assert!(unwound.is_err(), "the body must have unwound");
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_TEST_UNWIND_PRESENT"),
+            Some(OsString::from("original"))
+        );
+        assert_eq!(std::env::var_os("SEAT_GUARD_TEST_UNWIND_ABSENT"), None);
+        std::env::remove_var("SEAT_GUARD_TEST_UNWIND_PRESENT");
+    }
+
+    /// Resetting a variable through the guard keeps the first saved
+    /// value: drop restores what the scope started with, not the
+    /// last value the guard itself wrote.
+    #[test]
+    fn env_guard_reset_keeps_the_first_saved_value() {
+        std::env::set_var("SEAT_GUARD_TEST_RESET", "original");
+        {
+            let mut env = lock_env(&[("SEAT_GUARD_TEST_RESET", OsString::from("first"))]);
+            env.set("SEAT_GUARD_TEST_RESET", OsString::from("second"));
+            assert_eq!(
+                std::env::var_os("SEAT_GUARD_TEST_RESET"),
+                Some(OsString::from("second")),
+                "the reset is live inside the scope"
+            );
+        }
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_TEST_RESET"),
+            Some(OsString::from("original")),
+            "drop restores the value saved when the name was first touched"
+        );
+        std::env::remove_var("SEAT_GUARD_TEST_RESET");
+    }
+
+    /// Restoration happens before ENV_LOCK is released: the next lock
+    /// holder — here this same thread, re-taking the lock the guard
+    /// just dropped — already reads the restored environment.
+    #[test]
+    fn env_guard_restores_before_releasing_the_lock() {
+        std::env::set_var("SEAT_GUARD_TEST_ORDER", "original");
+        {
+            let _env = lock_env(&[("SEAT_GUARD_TEST_ORDER", OsString::from("stub"))]);
+        }
+        let _next_holder = env_lock();
+        assert_eq!(
+            std::env::var_os("SEAT_GUARD_TEST_ORDER"),
+            Some(OsString::from("original")),
+            "the lock changed hands only after the restoration"
+        );
+        std::env::remove_var("SEAT_GUARD_TEST_ORDER");
     }
 
     /// The shared fake multiplexer is exactly the committed script

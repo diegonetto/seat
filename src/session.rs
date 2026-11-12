@@ -542,7 +542,7 @@ pub fn cmd_status(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::board;
-    use crate::testutil::{fake_tmux, temp_root};
+    use crate::testutil::{fake_tmux, lock_env, temp_root};
     use crate::verbs;
 
     #[test]
@@ -563,7 +563,6 @@ mod tests {
     /// record (the wake or a manual `up` happened first).
     #[test]
     fn status_prints_asleep_from_the_record() {
-        let _guard = crate::testutil::env_lock();
         let root = temp_root("status-asleep");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -578,8 +577,10 @@ mod tests {
         )
         .unwrap();
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.into_os_string()),
+        ]);
 
         std::fs::write(
             seat::seat_dir(&root, "snorlax").join("dispatch.json"),
@@ -605,9 +606,6 @@ mod tests {
         );
         cmd_down(&root, &["snorlax".to_string()]).unwrap();
         assert_eq!(status_rows(&root, &fake_tmux()).unwrap()[0].presence, "asleep");
-
-        std::env::remove_var("SEAT_TMUX");
-        std::env::remove_var("SEAT_FAKE_STATE");
     }
 
     /// Presence and the mail count are separate: a live pane is
@@ -616,7 +614,6 @@ mod tests {
     /// file count and does not change presence.
     #[test]
     fn status_presence_and_mail_are_separate() {
-        let _guard = crate::testutil::env_lock();
         let root = temp_root("status-presence");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -633,8 +630,10 @@ mod tests {
         verbs::cmd_register(&root, "quiet", "sb", None, None, vec![], None).unwrap();
         verbs::cmd_register(&root, "stocked", "sb", None, None, vec![], None).unwrap();
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.into_os_string()),
+        ]);
 
         cmd_up(&root, &["paned".to_string()]).unwrap();
         verbs::cmd_send(&root, Some("quiet"), "paned", "while up", None).unwrap();
@@ -667,7 +666,6 @@ mod tests {
     /// The whole session story against the fake.
     #[test]
     fn session_verbs_drive_the_fake_multiplexer() {
-        let _guard = crate::testutil::env_lock();
         let root = temp_root("session");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -684,8 +682,10 @@ mod tests {
             .unwrap();
         }
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.as_os_str().to_os_string()),
+        ]);
 
         // up with no names brings every registered seat.
         cmd_up(&root, &[]).unwrap();
@@ -839,9 +839,6 @@ mod tests {
         cmd_up(&root, &[]).unwrap();
         cmd_down(&root, &[]).unwrap();
         assert!(running_seats(&fake_tmux()).unwrap().is_empty());
-
-        std::env::remove_var("SEAT_TMUX");
-        std::env::remove_var("SEAT_FAKE_STATE");
     }
 
     /// `gallery` used to capture tmux's stdout, so attach failed with
@@ -941,7 +938,6 @@ mod tests {
     /// leaves earlier seats running and later seats unstarted.
     #[test]
     fn up_starts_the_stored_command() {
-        let _guard = crate::testutil::env_lock();
         let root = temp_root("session-launch");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -953,8 +949,10 @@ mod tests {
         reg("mailbox", None, Vec::new());
         reg("nocmd", Some(cwd.clone()), Vec::new());
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.into_os_string()),
+        ]);
 
         // Bare up targets only seats that have a command: mailbox and
         // nocmd are not started and are not errors.
@@ -1064,9 +1062,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.seat == "nope"));
-
-        std::env::remove_var("SEAT_TMUX");
-        std::env::remove_var("SEAT_FAKE_STATE");
     }
 
     /// A refused multiplexer call inside `up` names the seat and the
@@ -1074,9 +1069,6 @@ mod tests {
     /// byte for byte (the spawn refusal in start_seat).
     #[test]
     fn up_failure_message_pins_the_start_seat_refusal() {
-        let _guard = crate::testutil::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("session-fail-line");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -1091,8 +1083,10 @@ mod tests {
         )
         .unwrap();
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.into_os_string()),
+        ]);
 
         let prog = fake_tmux();
         let err = cmd_up(&root, &["nope".to_string()]).unwrap_err();
@@ -1104,9 +1098,6 @@ mod tests {
                  fake-tmux: launch refused: seat-fail"
             )
         );
-
-        std::env::remove_var("SEAT_TMUX");
-        std::env::remove_var("SEAT_FAKE_STATE");
     }
 
     /// The same refusal wording, in its other wrapper: a tmux call
@@ -1114,13 +1105,12 @@ mod tests {
     /// byte for byte (the check in tmux_ok).
     #[test]
     fn up_failure_message_pins_the_tmux_ok_refusal() {
-        let _guard = crate::testutil::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("session-fail-line-ok");
         let state = root.join("tmux.state");
-        std::env::set_var("SEAT_TMUX", fake_tmux());
-        std::env::set_var("SEAT_FAKE_STATE", &state);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", fake_tmux().into()),
+            ("SEAT_FAKE_STATE", state.into_os_string()),
+        ]);
 
         let prog = fake_tmux();
         let err = tmux_ok(&prog, &["kill-pane", "-t", "%999"]).unwrap_err();
@@ -1128,8 +1118,5 @@ mod tests {
             err.to_string(),
             format!("tmux: `{prog} kill-pane -t %999` failed: fake-tmux: no such pane: %999")
         );
-
-        std::env::remove_var("SEAT_TMUX");
-        std::env::remove_var("SEAT_FAKE_STATE");
     }
 }
