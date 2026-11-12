@@ -136,30 +136,41 @@ pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
 /// Status's `awake`: dispatch.json records a delivery to this seat's
 /// currently bound session within AWAKE_WINDOW (a local read; status
 /// never asks the hub).
+#[cfg(test)]
 pub fn awake(root: &Path, seat_name: &str) -> bool {
-    let Some(last) = load_state(&seat::seat_dir(root, seat_name)).last_delivery else {
-        return false;
-    };
-    if Bindings::load(root).session_id(seat_name) != Some(last.session.as_str()) {
-        return false;
-    }
-    chrono::DateTime::parse_from_rfc3339(&last.invoked_at)
-        .map(|t| {
-            chrono::Utc::now()
-                .signed_duration_since(t.with_timezone(&chrono::Utc))
-                .to_std()
-                .is_ok_and(|a| a <= AWAKE_WINDOW)
-        })
-        .unwrap_or(false)
+    load_state(&seat::seat_dir(root, seat_name)).awake(root, seat_name)
 }
 
 /// Status's `asleep` and the scan's wake rule: dispatch.json holds
 /// the dispatcher's own sleep mark. A local read; the live pane is a
 /// separate fact (presence checks both — the record plus no pane).
 pub fn is_asleep(root: &Path, seat_name: &str) -> bool {
-    load_state(&seat::seat_dir(root, seat_name))
-        .asleep
-        .is_some()
+    load_state(&seat::seat_dir(root, seat_name)).is_asleep()
+}
+
+impl DispatchState {
+    /// Evaluate the delivery from this snapshot against the current binding.
+    pub fn awake(&self, root: &Path, seat_name: &str) -> bool {
+        let Some(last) = &self.last_delivery else {
+            return false;
+        };
+        if Bindings::load(root).session_id(seat_name) != Some(last.session.as_str()) {
+            return false;
+        }
+        chrono::DateTime::parse_from_rfc3339(&last.invoked_at)
+            .map(|t| {
+                chrono::Utc::now()
+                    .signed_duration_since(t.with_timezone(&chrono::Utc))
+                    .to_std()
+                    .is_ok_and(|a| a <= AWAKE_WINDOW)
+            })
+            .unwrap_or(false)
+    }
+
+    /// The snapshot's sleep mark; pane presence remains a separate fact.
+    pub fn is_asleep(&self) -> bool {
+        self.asleep.is_some()
+    }
 }
 
 /// The scan's recovery rule: the sleep mark beside a pane fact — a
@@ -224,5 +235,45 @@ pub(crate) fn log_line(root: &Path, kind: &str, seat: &str, rest: &str) {
         .open(root.join(LOG_FILE))
     {
         let _ = writeln!(f, "{} {kind} seat={seat} {rest}", seat::now_ts());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{temp_root, write_bindings};
+
+    #[test]
+    fn presence_predicates_use_the_loaded_snapshot() {
+        let root = temp_root("presence-snapshot");
+        let dir = seat::seat_dir(&root, "opus");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_bindings(&root, &[("opus", "s1")]);
+        let state = DispatchState {
+            asleep: Some(Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            last_delivery: Some(LastDelivery {
+                session: "s1".into(),
+                invoked_at: seat::now_ts(),
+            }),
+            ..Default::default()
+        };
+        store_state(&dir, &state).unwrap();
+        let snapshot = load_state(&dir);
+        store_state(&dir, &DispatchState::default()).unwrap();
+        let before = std::fs::read(dir.join(STATE_FILE)).unwrap();
+
+        assert_eq!(
+            (snapshot.is_asleep(), snapshot.awake(&root, "opus")),
+            (true, true)
+        );
+        assert_eq!(
+            (is_asleep(&root, "opus"), awake(&root, "opus")),
+            (false, false)
+        );
+        assert_eq!(std::fs::read(dir.join(STATE_FILE)).unwrap(), before);
+        assert!(!root.join(LOG_FILE).exists());
     }
 }

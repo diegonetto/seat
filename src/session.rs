@@ -515,8 +515,9 @@ fn status_rows(root: &Path, prog: &str) -> Result<Vec<StatusRow>> {
         let dir = seat::seat_dir(root, &name);
         let mail = msg::list_msg_dir(&dir.join("inbox"))?.len();
         let in_pane = running.contains(&name);
-        let asleep = crate::dstate::is_asleep(root, &name); // a local read
-        let awake = crate::dstate::awake(root, &name); // a local read
+        let state = crate::dstate::load_state(&dir);
+        let asleep = state.is_asleep();
+        let awake = state.awake(root, &name);
         rows.push(StatusRow {
             name,
             presence: presence(in_pane, asleep, awake),
