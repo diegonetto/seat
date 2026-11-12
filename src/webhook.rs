@@ -320,7 +320,7 @@ pub(crate) fn id_list(path: &Path) -> Vec<String> {
 
 fn save_id_list(path: &Path, ids: &[String]) -> Result<()> {
     let keep = &ids[ids.len().saturating_sub(1000)..];
-    seat::atomic_write_json(path, &serde_json::to_string(keep)?)
+    seat::atomic_write_json(path, serde_json::to_string(keep)?)
 }
 
 /// One ring: the payload for payload seats, the plain signal

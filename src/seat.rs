@@ -226,16 +226,15 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// newline. Every JSON state file on the board goes through here:
 /// `write_meta` and `dstate::store_state` pretty, `alarm::store` and
 /// `webhook::save_id_list` compact.
-pub(crate) fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
-    let mut bytes = json.as_bytes().to_vec();
-    bytes.push(b'\n');
-    atomic_write_private(path, &bytes)
+pub(crate) fn atomic_write_json(path: &Path, mut json: String) -> Result<()> {
+    json.push('\n');
+    atomic_write_private(path, json.as_bytes())
 }
 
 /// Write meta.json atomically. This takes no lock; the locked
 /// read-modify-write is `update_meta`.
 pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
-    atomic_write_json(&meta_path(dir), &serde_json::to_string_pretty(meta)?)
+    atomic_write_json(&meta_path(dir), serde_json::to_string_pretty(meta)?)
 }
 
 /// Read-modify-write meta.json under the per-seat metadata lock. Every

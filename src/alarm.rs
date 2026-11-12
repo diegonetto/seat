@@ -55,7 +55,7 @@ fn load(root: &Path) -> Fired {
 }
 
 fn store(root: &Path, fired: &Fired) -> Result<()> {
-    seat::atomic_write_json(&root.join(STATE_FILE), &serde_json::to_string(fired)?)
+    seat::atomic_write_json(&root.join(STATE_FILE), serde_json::to_string(fired)?)
 }
 
 /// The seat alarms are mailed to: the first line of

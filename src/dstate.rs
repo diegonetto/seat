@@ -130,7 +130,7 @@ pub fn load_state(dir: &Path) -> DispatchState {
 
 /// Atomic state write (see `seat::atomic_write_json`).
 pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
-    seat::atomic_write_json(&dir.join(STATE_FILE), &serde_json::to_string_pretty(state)?)
+    seat::atomic_write_json(&dir.join(STATE_FILE), serde_json::to_string_pretty(state)?)
 }
 
 /// Status's `awake`: dispatch.json records a delivery to this seat's
