@@ -51,17 +51,7 @@ pub fn cmd_register(
             return Ok(());
         }
         let launch_changed = cwd.is_some() || !cmd.is_empty();
-        seat::update_meta(&dir, |m| {
-            if let Some(c) = cwd {
-                m.cwd = Some(c);
-            }
-            if !cmd.is_empty() {
-                m.cmd = Some(cmd);
-            }
-            if let Some(d) = idle_after {
-                m.idle_after = Some(d);
-            }
-        })?;
+        seat::update_meta(&dir, |m| apply_launch_fields(m, cwd, cmd, idle_after))?;
         println!("seat '{name}' already registered (token and mail kept)");
         if launch_changed {
             println!("seat '{name}' launch updated");
@@ -76,6 +66,24 @@ pub fn cmd_register(
         last_seen: Some(seat::now_ts()),
         ..Default::default()
     };
+    apply_launch_fields(&mut meta, cwd, cmd, idle_after);
+    seat::write_meta(&dir, &meta)?;
+    println!("registered seat '{name}' (harness={harness})");
+    println!("token: {}", seat::token_path(&dir).display());
+    Ok(())
+}
+
+/// Register's one rule, stated once: a launch field the call omitted
+/// keeps the meta's stored value; a field it passed updates it
+/// (`--cwd`, the command words after `--`, `--idle-after`). Both of
+/// register's paths apply it — a duplicate's read-modify-write and a
+/// new seat's first meta.
+fn apply_launch_fields(
+    meta: &mut seat::Meta,
+    cwd: Option<String>,
+    cmd: Vec<String>,
+    idle_after: Option<String>,
+) {
     if let Some(c) = cwd {
         meta.cwd = Some(c);
     }
@@ -85,10 +93,6 @@ pub fn cmd_register(
     if let Some(d) = idle_after {
         meta.idle_after = Some(d);
     }
-    seat::write_meta(&dir, &meta)?;
-    println!("registered seat '{name}' (harness={harness})");
-    println!("token: {}", seat::token_path(&dir).display());
-    Ok(())
 }
 
 /// Read a seat's token; a missing token is the named GhostSeat error.
@@ -633,6 +637,140 @@ mod tests {
             before,
             "a refused register wrote no meta.json"
         );
+    }
+
+    /// Characterization of the new-seat path, written before the
+    /// launch-field applicator was extracted and unchanged across
+    /// it: for every combination of passed launch fields, the
+    /// complete meta.json a first register writes — every field
+    /// against a fully expected record, and the raw bytes on disk
+    /// against that record's exact serialization.
+    #[test]
+    fn first_register_pins_complete_meta_on_every_combination() {
+        let root = setup();
+        let cwd = root.display().to_string();
+        let cmd = vec!["/bin/sleep".to_string(), "5".to_string()];
+        let cases: [(&str, bool, bool, bool); 8] = [
+            ("none", false, false, false),
+            ("cwd", true, false, false),
+            ("cmd", false, true, false),
+            ("idle", false, false, true),
+            ("cwd-cmd", true, true, false),
+            ("cwd-idle", true, false, true),
+            ("cmd-idle", false, true, true),
+            ("all", true, true, true),
+        ];
+        for (tag, pass_cwd, pass_cmd, pass_idle) in cases {
+            let name = format!("fresh-{tag}");
+            cmd_register(
+                &root,
+                &name,
+                "sb",
+                Some("glm".into()),
+                pass_cwd.then(|| cwd.clone()),
+                if pass_cmd { cmd.clone() } else { Vec::new() },
+                pass_idle.then(|| "30m".to_string()),
+            )
+            .unwrap();
+            let dir = seat::seat_dir(&root, &name);
+            let meta = seat::read_meta(&dir).unwrap();
+            assert!(meta.last_seen.is_some(), "{tag}: stamped at birth");
+            let expected = seat::Meta {
+                harness: "sb".into(),
+                model: Some("glm".into()),
+                last_seen: meta.last_seen.clone(),
+                last_drained: None,
+                cwd: pass_cwd.then(|| cwd.clone()),
+                cmd: pass_cmd.then(|| cmd.clone()),
+                idle_after: pass_idle.then(|| "30m".to_string()),
+            };
+            let canon = serde_json::to_string_pretty(&expected).unwrap();
+            assert_eq!(
+                serde_json::to_string_pretty(&meta).unwrap(),
+                canon,
+                "{tag}: the complete record, every field"
+            );
+            let raw = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
+            assert_eq!(raw, format!("{canon}\n"), "{tag}: the exact bytes");
+        }
+    }
+
+    /// Characterization of the duplicate path, likewise written
+    /// before the extraction and unchanged across it: every
+    /// combination of passed launch fields against a fully expected
+    /// record — kept values for the omitted fields, updates for the
+    /// passed ones, the stored harness, model and last_seen
+    /// untouched by the duplicate's own harness and model — and the
+    /// raw bytes on disk exactly that record's serialization.
+    #[test]
+    fn duplicate_register_pins_the_complete_rewrite_on_every_combination() {
+        let root = setup();
+        let cwd0 = root.display().to_string();
+        let cwd1 = root.join("elsewhere").display().to_string();
+        let cmd0 = vec!["/bin/sleep".to_string(), "5".to_string()];
+        let cmd1 = vec!["/bin/sleep".to_string(), "9".to_string()];
+        let cases: [(&str, bool, bool, bool); 8] = [
+            ("none", false, false, false),
+            ("cwd", true, false, false),
+            ("cmd", false, true, false),
+            ("idle", false, false, true),
+            ("cwd-cmd", true, true, false),
+            ("cwd-idle", true, false, true),
+            ("cmd-idle", false, true, true),
+            ("all", true, true, true),
+        ];
+        for (tag, pass_cwd, pass_cmd, pass_idle) in cases {
+            let name = format!("dup-{tag}");
+            cmd_register(
+                &root,
+                &name,
+                "sb",
+                Some("glm".into()),
+                Some(cwd0.clone()),
+                cmd0.clone(),
+                Some("30m".to_string()),
+            )
+            .unwrap();
+            let dir = seat::seat_dir(&root, &name);
+            let meta0 = seat::read_meta(&dir).unwrap();
+            let raw0 = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
+
+            // The duplicate: its harness and model are ignored; only
+            // the launch fields it passes change anything.
+            cmd_register(
+                &root,
+                &name,
+                "other-harness",
+                Some("other-model".into()),
+                pass_cwd.then(|| cwd1.clone()),
+                if pass_cmd { cmd1.clone() } else { Vec::new() },
+                pass_idle.then(|| "2h".to_string()),
+            )
+            .unwrap();
+            let meta1 = seat::read_meta(&dir).unwrap();
+            let expected = seat::Meta {
+                harness: "sb".into(),
+                model: Some("glm".into()),
+                last_seen: meta0.last_seen.clone(),
+                last_drained: None,
+                cwd: Some(if pass_cwd { cwd1.clone() } else { cwd0.clone() }),
+                cmd: Some(if pass_cmd { cmd1.clone() } else { cmd0.clone() }),
+                idle_after: Some(
+                    if pass_idle { "2h" } else { "30m" }.to_string(),
+                ),
+            };
+            let canon = serde_json::to_string_pretty(&expected).unwrap();
+            assert_eq!(
+                serde_json::to_string_pretty(&meta1).unwrap(),
+                canon,
+                "{tag}: the complete record, every field"
+            );
+            let raw1 = std::fs::read_to_string(seat::meta_path(&dir)).unwrap();
+            assert_eq!(raw1, format!("{canon}\n"), "{tag}: the exact bytes");
+            if !pass_cwd && !pass_cmd && !pass_idle {
+                assert_eq!(raw1, raw0, "{tag}: nothing passed wrote nothing");
+            }
+        }
     }
 
     /// The identity-rule board: inbox, a bound seat, and an ordinary
