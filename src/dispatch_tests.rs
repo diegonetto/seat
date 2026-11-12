@@ -539,6 +539,175 @@ fn watch_board(root: &std::path::Path, watcher: &str) {
     std::fs::write(root.join("alarm-seat"), format!("{watcher}\n")).unwrap();
 }
 
+/// Compare all alarm output, normalizing only generated timestamps,
+/// message ids and MACs; the latter still verify against the token.
+fn assert_undelivered_output(root: &Path, details: &[&str], latched: bool) {
+    let log: String = log_text(root)
+        .split_inclusive('\n')
+        .map(|line| {
+            let (ts, rest) = line.split_once(' ').unwrap();
+            chrono::DateTime::parse_from_rfc3339(ts).unwrap();
+            rest
+        })
+        .collect();
+    let expected_log: String = details
+        .iter()
+        .map(|detail| format!("alarm seat=opus cause=undelivered {detail}\n"))
+        .collect();
+    assert_eq!(log, expected_log);
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        if latched {
+            "{\"causes\":[\"undelivered:opus\"]}\n"
+        } else {
+            "{\"causes\":[]}\n"
+        }
+    );
+    let files = msg::list_msg_dir(&seat::seat_dir(root, "diego").join("inbox")).unwrap();
+    assert_eq!(files.len(), details.len());
+    let token = verbs::sender_token(root, alarm::SEAT).unwrap();
+    for (path, detail) in files.iter().zip(details) {
+        let (header, _) = msg::read_msg(path).unwrap();
+        chrono::NaiveDateTime::parse_from_str(&header.ts, "%Y%m%dT%H%M%S%.6f").unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            msg::filename_for(&header.ts, &header.id)
+        );
+        assert!(msg::verify_msg(path, &token).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!(
+                "{{\"dest\":\"diego\",\"from\":\"sb-watch\",\"id\":\"{}\",\"ts\":\"{}\",\"hmac\":\"{}\"}}\n\nseat opus: undelivered: {detail}",
+                header.id, header.ts, header.hmac
+            )
+        );
+    }
+}
+
+#[test]
+fn undelivered_complete_output_through_recovery() {
+    let root = board_with(&[]);
+    watch_board(&root, "diego");
+    let present = [
+        "20260101T000000.000000-deadbeef.msg",
+        "99990101T000000.000000-future.msg",
+        "invalid-id.msg",
+    ]
+    .map(str::to_string)
+    .into_iter()
+    .collect();
+    let delivered = ["deadbeef".to_string()].into_iter().collect();
+    let empty = Default::default();
+    alarm::undelivered(&root, "opus", &delivered, &present).unwrap();
+    assert_eq!(log_text(&root), "");
+    assert_eq!(alarm_mail(&root), Vec::<String>::new());
+    assert!(!root.join("dispatch-alarms.json").exists());
+
+    let detail = "an item has waited over 15 minutes undelivered";
+    alarm::undelivered(&root, "opus", &empty, &present).unwrap();
+    assert_undelivered_output(&root, &[detail], true);
+    alarm::undelivered(&root, "opus", &empty, &present).unwrap();
+    assert_undelivered_output(&root, &[detail], true);
+    alarm::undelivered(&root, "opus", &delivered, &present).unwrap();
+    assert_undelivered_output(&root, &[detail], false);
+    alarm::undelivered(&root, "opus", &empty, &present).unwrap();
+    assert_undelivered_output(&root, &[detail, detail], true);
+}
+
+/// Each session fact keeps its full page wording and error text.
+/// A file aged 42m30s avoids crossing a whole-minute boundary; the
+/// elapsed-time assertion makes that assumption explicit.
+#[test]
+fn undelivered_hapi_complete_page_outputs() {
+    crate::testutil::with_throwaway_home(|| {
+        for (body, fail_get, fail_queued, suffix) in [
+            (
+                r#"{"session":{"active":true,"thinking":false}}"#,
+                false,
+                false,
+                " (posted, session idle for 42 min)",
+            ),
+            (
+                r#"{"session":{"active":true}}"#,
+                false,
+                false,
+                " (posted, waited 42 min, session thinking unknown)",
+            ),
+            (
+                r#"{"session":{"active":false}}"#,
+                false,
+                false,
+                " (posted, waited 42 min, session not active)",
+            ),
+            (
+                "{}",
+                true,
+                false,
+                " (posted, hub session read failed: hub: GET session s1: status 500)",
+            ),
+            (
+                r#"{"session":{"active":true,"thinking":false}}"#,
+                false,
+                true,
+                " (posted, waited 42 min, hub queued read failed: hub: queued-state: status 500 Internal Server Error)",
+            ),
+        ] {
+            let (root, hub, mut client) = kit(&[("opus", "s1")], &[]);
+            watch_board(&root, "diego");
+            {
+                let mut ctl = hub.ctl.lock().unwrap();
+                ctl.get_bodies.insert("s1".into(), body.into());
+                if fail_get {
+                    ctl.fail_get.insert("s1".into());
+                }
+                if fail_queued {
+                    ctl.fail_queued_state.insert("s1".into());
+                }
+            }
+            let now = chrono::Utc::now();
+            let old = now - chrono::TimeDelta::seconds(2550);
+            let name = format!("{}-deadbeef.msg", old.format("%Y%m%dT%H%M%S%.6f"));
+            let key = dstate::direct_key("opus", &name);
+            mark(&hub, &key, "queued");
+            let dir = seat::seat_dir(&root, "opus");
+            let mail = dir.join("draining").join(&name);
+            std::fs::write(&mail, "unchanged mail bytes\n").unwrap();
+            let mut state = dstate::DispatchState {
+                session: Some("s1".into()),
+                ..Default::default()
+            };
+            state.items.insert(
+                key,
+                dstate::ItemState {
+                    phase: dstate::Phase::Posted,
+                    accepted_at: Some("2026-01-01T00:00:00Z".into()),
+                    working_at: None,
+                },
+            );
+            dstate::store_state(&dir, &state).unwrap();
+            let stored = std::fs::read(dir.join("dispatch.json")).unwrap();
+            let in_memory = serde_json::to_string(&state).unwrap();
+            let present = [name].into_iter().collect();
+            alarm::undelivered_hapi(
+                &root,
+                "opus",
+                &dir,
+                &mut state,
+                &present,
+                &mut client,
+                "s1",
+            )
+            .unwrap();
+            assert!(chrono::Utc::now() - now < chrono::TimeDelta::seconds(30));
+            let detail = format!("an item has waited over 15 minutes undelivered{suffix}");
+            assert_undelivered_output(&root, &[&detail], true);
+            assert_eq!(std::fs::read(dir.join("dispatch.json")).unwrap(), stored);
+            assert_eq!(serde_json::to_string(&state).unwrap(), in_memory);
+            assert_eq!(std::fs::read_to_string(&mail).unwrap(), "unchanged mail bytes\n");
+        }
+    });
+}
+
 /// The frozen alarm contract, one matrix: each cause fires once (one
 /// log line, one direct message from `sb-watch` to the seat named in
 /// `<root>/alarm-seat`), retries stay silent,
