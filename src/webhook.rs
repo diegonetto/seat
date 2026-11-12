@@ -432,13 +432,34 @@ fn strike(root: &Path, seat: &str, n: u32, detail: &str) -> Result<()> {
     }
 }
 
+/// The re-ring deadline of a burst, `ring.next_at` parsed as rfc3339
+/// and normalized to UTC: None when the timestamp is absent or
+/// malformed. The two waiters read a None differently, so each keeps
+/// its own reading at its call site: `due_at` treats it as due (an
+/// open burst must not fall silent on a deadline it cannot read), the
+/// worker's wait loop as not yet due (it never rings on its own over
+/// a deadline it could not read).
+fn ring_deadline(next_at: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    next_at
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+}
+
 fn due_at(ring: &RingState, now: chrono::DateTime<chrono::Utc>) -> bool {
-    !ring.rung.is_empty()
-        && ring
-            .next_at
-            .as_deref()
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .is_none_or(|at| now >= at.with_timezone(&chrono::Utc))
+    !ring.rung.is_empty() && ring_deadline(ring.next_at.as_deref()).is_none_or(|at| now >= at)
+}
+
+/// Should this worker stop waiting and run a pass? The one spelling of
+/// the rule both waiters share: a present file the burst has not rung
+/// is new mail, and a deadline already read as up makes the pass due.
+/// What the two spellings disagree on stays at their call sites:
+/// `ring_pass` prunes its rung before this and reads an unreadable
+/// deadline as due (`due_at`); the worker's wait loop caches its
+/// deadline for the whole wait, treats an unreadable one as not yet
+/// due, and wakes when nothing is present (the burst closed externally
+/// while it slept).
+fn wake_condition(rung: &BTreeSet<&String>, present: &BTreeSet<String>, deadline_up: bool) -> bool {
+    present.iter().any(|f| !rung.contains(f)) || deadline_up
 }
 
 /// One pass for one webhook seat: ring on a burst of new mail, re-ring
@@ -474,8 +495,7 @@ pub(crate) fn ring_pass(
         ring = RingState::default();
     }
     let rung: BTreeSet<&String> = ring.rung.iter().collect();
-    let has_new = present.iter().any(|f| !rung.contains(f));
-    if !has_new && !due_at(&ring, now) {
+    if !wake_condition(&rung, &present, due_at(&ring, now)) {
         if state.ring != Some(ring.clone()) {
             state.ring = (!ring.rung.is_empty()).then_some(ring);
             store_state(&dir, &state)?;
@@ -566,12 +586,16 @@ pub(crate) fn worker_loop(
         // A pass completed: stop may end the loop from here on.
         first = false;
         // Sleep to the next re-ring, woken early by new mail, a route
-        // change or stop; the burst closing externally also wakes.
-        let deadline = load_state(&dir)
-            .ring
-            .as_ref()
-            .and_then(|r| r.next_at.as_deref())
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        // change or stop; the burst closing externally also wakes. The
+        // deadline is the one cached here for the whole wait: a
+        // `next_at` rewritten on disk while the worker sleeps does not
+        // move it.
+        let deadline = ring_deadline(
+            load_state(&dir)
+                .ring
+                .as_ref()
+                .and_then(|r| r.next_at.as_deref()),
+        );
         loop {
             if stop.load(Ordering::SeqCst) || !still_webhook(&root, &seat) {
                 return;
@@ -584,8 +608,11 @@ pub(crate) fn worker_loop(
                 .unwrap_or_default();
             let present = present_files(&seat::seat_dir(&root, &seat));
             if present.is_empty()
-                || present.iter().any(|f| !rung.contains(f))
-                || deadline.is_some_and(|d| chrono::Utc::now() >= d.with_timezone(&chrono::Utc))
+                || wake_condition(
+                    &rung,
+                    &present,
+                    deadline.is_some_and(|d| chrono::Utc::now() >= d),
+                )
             {
                 break;
             }
@@ -624,5 +651,63 @@ mod tests {
             format!("[{}]\n", kept.join(",")),
             "the oldest ids beyond 1000 are dropped"
         );
+    }
+
+    fn ring_state(rung: &[&str], next_at: Option<&str>) -> RingState {
+        RingState {
+            rung: rung.iter().map(|s| s.to_string()).collect(),
+            next_at: next_at.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// `due_at`'s whole truth table, the ring-pass half of the wake
+    /// rule: only an open burst (a nonempty rung) can be due; inside
+    /// an open burst a missing or malformed `next_at` reads as due (the
+    /// burst must not fall silent on a deadline it cannot read), a
+    /// readable one is due at the exact boundary `now == at` and after
+    /// but not before, and a non-UTC offset names the same instant.
+    #[test]
+    fn due_at_pins_missing_invalid_and_boundary_deadlines() {
+        let now = chrono::Utc::now();
+        // An open burst: a missing or malformed deadline is due.
+        assert!(due_at(&ring_state(&["a"], None), now));
+        assert!(due_at(&ring_state(&["a"], Some("not-a-timestamp")), now));
+        // The boundary is inclusive: due at `now == at`, not before.
+        assert!(due_at(
+            &ring_state(&["a"], Some(now.to_rfc3339().as_str())),
+            now
+        ));
+        assert!(!due_at(
+            &ring_state(
+                &["a"],
+                Some((now + chrono::TimeDelta::seconds(60)).to_rfc3339().as_str())
+            ),
+            now
+        ));
+        assert!(due_at(
+            &ring_state(
+                &["a"],
+                Some((now - chrono::TimeDelta::seconds(60)).to_rfc3339().as_str())
+            ),
+            now
+        ));
+        // A +02:00 offset is the same instant, not the same wall time.
+        let offset = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        assert!(due_at(
+            &ring_state(
+                &["a"],
+                Some(
+                    (now - chrono::TimeDelta::hours(2))
+                        .with_timezone(&offset)
+                        .to_rfc3339()
+                        .as_str()
+                )
+            ),
+            now
+        ));
+        // No burst (an empty rung): never due, whatever the deadline.
+        assert!(!due_at(&ring_state(&[], None), now));
+        assert!(!due_at(&ring_state(&[], Some("2000-01-01T00:00:00Z")), now));
     }
 }
