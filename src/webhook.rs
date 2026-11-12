@@ -320,9 +320,7 @@ pub(crate) fn id_list(path: &Path) -> Vec<String> {
 
 fn save_id_list(path: &Path, ids: &[String]) -> Result<()> {
     let keep = &ids[ids.len().saturating_sub(1000)..];
-    let mut json = serde_json::to_string(keep)?.into_bytes();
-    json.push(b'\n');
-    seat::atomic_write_private(path, &json)
+    seat::atomic_write_json(path, &serde_json::to_string(keep)?)
 }
 
 /// One ring: the payload for payload seats, the plain signal
@@ -598,5 +596,38 @@ pub(crate) fn worker_loop(
             }
             std::thread::sleep(SLICE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::temp_root;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The full bytes `save_id_list` writes: compact JSON, exactly one
+    /// trailing newline, mode 0600 — and only the last 1000 ids kept.
+    #[test]
+    fn save_id_list_pins_full_bytes_and_the_last_1000() {
+        let dir = temp_root("webhook-id-list");
+        let path = dir.join("webhook-attempted.json");
+        save_id_list(&path, &["abcdef12".into(), "feedface".into()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[\"abcdef12\",\"feedface\"]\n",
+            "compact JSON, exactly one trailing newline"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let many: Vec<String> = (0..1002).map(|i| format!("{i:08x}")).collect();
+        save_id_list(&path, &many).unwrap();
+        let kept: Vec<String> = (2..1002).map(|i| format!("\"{i:08x}\"")).collect();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("[{}]\n", kept.join(",")),
+            "the oldest ids beyond 1000 are dropped"
+        );
     }
 }

@@ -1126,6 +1126,119 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
     assert!(scratch.is_empty(), "scratch left: {scratch:?}");
 }
 
+/// The full bytes `store_state` writes: pretty JSON, every field in
+/// order, exactly one trailing newline.
+#[test]
+fn dispatch_json_full_bytes_are_pinned() {
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+    let dir = seat::seat_dir(&root, "alpha");
+    let mut state = dstate::DispatchState {
+        session: Some("s1".into()),
+        last_delivery: Some(dstate::LastDelivery {
+            session: "s1".into(),
+            invoked_at: "t0".into(),
+        }),
+        ..Default::default()
+    };
+    state.items.insert(
+        "seat:alpha:a.msg".into(),
+        dstate::ItemState {
+            phase: dstate::Phase::Posted,
+            accepted_at: Some("t1".into()),
+            working_at: None,
+        },
+    );
+    state.ring = Some(dstate::RingState {
+        rung: vec!["a.msg".into()],
+        next_at: Some("t2".into()),
+        backoff_ms: 120000,
+        failures: 1,
+    });
+    state.pane_seen_at = Some("t3".into());
+    state.pane_id = Some("%1".into());
+    state.asleep = Some(dstate::Asleep {
+        at: "t4".into(),
+        reason: "idle".into(),
+    });
+    state.woken = Some(dstate::Woken {
+        at: "t5".into(),
+        key: "seat:alpha:a.msg".into(),
+    });
+    state.wake_hold = Some(dstate::WakeHold {
+        at: "t6".into(),
+        reason: "script answered up".into(),
+    });
+    dstate::store_state(&dir, &state).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        concat!(
+            "{\n",
+            "  \"session\": \"s1\",\n",
+            "  \"last_delivery\": {\n",
+            "    \"session\": \"s1\",\n",
+            "    \"invoked_at\": \"t0\"\n",
+            "  },\n",
+            "  \"items\": {\n",
+            "    \"seat:alpha:a.msg\": {\n",
+            "      \"phase\": \"posted\",\n",
+            "      \"accepted_at\": \"t1\"\n",
+            "    }\n",
+            "  },\n",
+            "  \"ring\": {\n",
+            "    \"rung\": [\n",
+            "      \"a.msg\"\n",
+            "    ],\n",
+            "    \"next_at\": \"t2\",\n",
+            "    \"backoff_ms\": 120000,\n",
+            "    \"failures\": 1\n",
+            "  },\n",
+            "  \"pane_seen_at\": \"t3\",\n",
+            "  \"pane_id\": \"%1\",\n",
+            "  \"asleep\": {\n",
+            "    \"at\": \"t4\",\n",
+            "    \"reason\": \"idle\"\n",
+            "  },\n",
+            "  \"woken\": {\n",
+            "    \"at\": \"t5\",\n",
+            "    \"key\": \"seat:alpha:a.msg\"\n",
+            "  },\n",
+            "  \"wake_hold\": {\n",
+            "    \"at\": \"t6\",\n",
+            "    \"reason\": \"script answered up\"\n",
+            "  }\n",
+            "}\n",
+        ),
+        "pretty JSON, every field in order, exactly one trailing newline"
+    );
+}
+
+/// The full bytes the alarm latch writes: compact JSON, the causes
+/// sorted, exactly one trailing newline.
+#[test]
+fn dispatch_alarms_json_full_bytes_are_pinned() {
+    let root = crate::testutil::dispatchkit::board_with(&[]);
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
+    alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"session-inactive:alpha\"]}\n",
+        "once per cause"
+    );
+    alarm::fire(&root, None, alarm::HUB_AUTH, "rejected").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"hub-auth:board\",\"session-inactive:alpha\"]}\n",
+        "board-wide and per-seat causes, sorted"
+    );
+    alarm::clear(&root, None, alarm::HUB_AUTH).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"session-inactive:alpha\"]}\n",
+        "a cleared cause is dropped from the file"
+    );
+}
+
 /// Without `<root>/alarm-seat` the alarm is the log line only: the
 /// cause still latches, and no message is sent anywhere.
 #[test]
