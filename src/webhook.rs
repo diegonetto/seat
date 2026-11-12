@@ -287,18 +287,11 @@ pub(crate) fn verified_hq_mail(path: &Path, root: &Path, seat: &str) -> Option<(
         return None;
     }
     let token = msg::read_token(&seat::token_path(&seat::seat_dir(root, "inbox"))).ok()?;
-    msg::verify_hmac(
-        &token,
-        &header.dest,
-        &header.from,
-        &header.id,
-        &header.ts,
-        body.as_bytes(),
-        None,
-        &header.hmac,
-    )
-    .ok()?
-    .then(|| (header.id, body))
+    // No session in the MAC's id slot, even when the header carries
+    // one: hq mail is signed over the legacy sessionless form.
+    msg::verify_hmac(&token, &header, body.as_bytes(), None)
+        .ok()?
+        .then(|| (header.id, body))
 }
 
 /// The at-most-once records (`webhook-attempted.json`,
