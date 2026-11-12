@@ -8,7 +8,7 @@
 //! receiver.
 use crate::dstate::load_state;
 use crate::testutil::fakewebhook::FakeWebhook;
-use crate::testutil::{temp_root, write_bindings};
+use crate::testutil::{temp_root, wait_for, write_bindings};
 use crate::webhook::{self, RingOutcome, RingWaits, WebhookConfig};
 use crate::{board, msg, seat, verbs};
 use std::path::{Path, PathBuf};
@@ -35,14 +35,6 @@ fn fixture(name: &str) -> String {
         .unwrap()
         .trim_end()
         .to_string()
-}
-
-fn wait_for(pred: impl Fn() -> bool, what: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !pred() {
-        assert!(std::time::Instant::now() < deadline, "{what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 /// The signal body and headers, byte for byte the committed fixture,

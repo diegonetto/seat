@@ -496,9 +496,7 @@ mod tests {
     /// PATH.
     #[test]
     fn seat_role_program_prefers_kit_then_binary_then_path() {
-        let _guard = crate::testutil::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
         let kit = crate::testutil::temp_root("sleep-kit");
         std::fs::create_dir_all(kit.join("scripts")).unwrap();
         std::fs::write(kit.join("scripts").join("seat-role"), "#!/bin/sh\n").unwrap();

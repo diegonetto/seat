@@ -10,7 +10,7 @@ use crate::hub::Hub;
 use crate::testutil::dispatchkit::{board_with, kit, log_text, mark, n_files, n_posts, only_key, send};
 use crate::testutil::fakehub::FakeHub;
 use crate::testutil::fakewebhook::FakeWebhook;
-use crate::testutil::write_bindings;
+use crate::testutil::{fake_tmux, wait_for, write_bindings};
 use crate::webhook::{self, RingWaits, WebhookConfig};
 use crate::{drain, dstate, msg, seat, verbs};
 use std::ffi::OsString;
@@ -18,14 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-fn wait_for(pred: impl Fn() -> bool, msg: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !pred() {
-        assert!(std::time::Instant::now() < deadline, "{msg}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 
 /// Auth happens once; after the hub retires that JWT, the next pass
 /// meets a 401, re-authenticates, and still delivers.
@@ -1339,14 +1331,6 @@ fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
 
 // ---- sleep and wake -------------------------------------------------
 
-/// The fake multiplexer the sleep cases bring a pane up under (the
-/// same one the session tests use).
-fn fake_tmux() -> String {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh");
-    assert!(Path::new(p).is_file(), "fake-tmux.sh must exist at {p}");
-    p.to_string()
-}
-
 /// Hold the process-wide env lock and set variables for the body,
 /// restoring the previous values on drop (even on panic). The stubs
 /// these tests install are visible to every subprocess this process
@@ -1357,9 +1341,7 @@ struct Env {
 }
 
 fn lock_env(vars: &[(&'static str, OsString)]) -> Env {
-    let lock = crate::testutil::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = crate::testutil::env_lock();
     let mut saved = Vec::new();
     for (name, value) in vars {
         saved.push((*name, std::env::var_os(name)));
