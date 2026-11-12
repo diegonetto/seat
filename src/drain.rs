@@ -1,4 +1,5 @@
 use crate::board::{self};
+use crate::dstate;
 use crate::error::{Result, SeatError};
 use crate::msg;
 use crate::seat;
@@ -31,7 +32,7 @@ pub struct Received {
     pub unreadable: bool,
 }
 
-/// The digest verb. Lock, receive, print, commit, unlock. Output, exit
+/// The drain verb. Lock, receive, print, commit, unlock. Output, exit
 /// codes, quarantine behaviour and stderr wording are unchanged: good
 /// mail is archived and `last_drained` is stamped exactly as before
 /// even when `receive` recorded failures — then the command exits
@@ -48,13 +49,7 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     let received = receive(root, seat_name)?;
 
     for d in &received.directs {
-        writeln!(
-            out,
-            "[direct] id={} from={} dest={} ts={}",
-            d.header.id, d.header.from, d.header.dest, d.header.ts
-        )?;
-        writeln!(out, "{}", d.body)?;
-        writeln!(out)?;
+        write!(out, "{}", dstate::direct_text(d))?;
     }
 
     commit(root, seat_name, &received)?;
@@ -248,6 +243,31 @@ mod tests {
         assert_eq!(text2, "", "empty drain prints nothing");
         let meta = seat::read_meta(&seat::seat_dir(&root, "beta")).unwrap();
         assert!(meta.last_drained.is_some());
+    }
+
+    /// drain's output for a delivered direct message is exactly the
+    /// header line, the body, a blank line — pinned byte for byte
+    /// against the archived message's own header fields, built here
+    /// independently of the printing code under test.
+    #[test]
+    fn drain_prints_the_full_direct_text() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "full body line", None).unwrap();
+
+        let (r, text) = drain_str(&root, "beta");
+        r.unwrap();
+
+        let archived = msg::list_msg_dir(&seat::seat_dir(&root, "beta").join("archive"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let (header, body) = msg::read_msg(&archived).unwrap();
+        let expected = format!(
+            "[direct] id={} from={} dest={} ts={}\n{}\n\n",
+            header.id, header.from, header.dest, header.ts, body
+        );
+        assert_eq!(text, expected, "drain's output is the direct text");
     }
 
     #[test]
