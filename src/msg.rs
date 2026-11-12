@@ -192,11 +192,13 @@ pub fn write_msg(
             "session id {s:?} is not 1-64 characters of [A-Za-z0-9-]"
         )));
     }
+    let ts = now_ts();
+    let id = new_id()?;
     let mut header = Header {
         dest: dest.to_string(),
         from: from.to_string(),
-        id: new_id()?,
-        ts: now_ts(),
+        id,
+        ts,
         hmac: String::new(),
         session: session.map(str::to_string),
     };
