@@ -9,9 +9,10 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// One process-wide lock for every test that sets process-wide
 /// environment (SEAT_TMUX, SEAT_FAKE_STATE, PATH, SEAT_KIT,
-/// HAPI_API_URL, CLI_API_TOKEN, SEAT_ROLE_HOME, SEAT_ROOT): env is
-/// shared by all parallel test threads, and the stubs these tests
-/// install are visible to every subprocess this process spawns.
+/// HAPI_API_URL, CLI_API_TOKEN, SEAT_ROLE_HOME, SEAT_ROOT,
+/// HOME): env is shared by all parallel test threads, and the
+/// stubs these tests install are visible to every subprocess this
+/// process spawns.
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lock a process-wide test mutex, treating poison as acquired: the
@@ -38,11 +39,8 @@ pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Composition: one guard per scope. ENV_LOCK does not reenter, so
 /// never construct a second guard (or call `env_lock`) while one is
 /// live — a helper that must touch more variables takes `&mut
-/// EnvGuard` instead. A guard holder may call `with_throwaway_home`
-/// (HOME_LOCK nests inside ENV_LOCK, never the other way: a
-/// `with_throwaway_home` body must not take ENV_LOCK, and HOME inside
-/// a body is with_throwaway_home's own restoration, never the
-/// guard's).
+/// EnvGuard` instead (`with_throwaway_home` composes exactly that
+/// way, HOME being one more guarded variable).
 pub struct EnvGuard {
     saved: Vec<(&'static str, Option<OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -62,6 +60,19 @@ impl EnvGuard {
     pub fn unset(&mut self, name: &'static str) {
         self.save(name);
         std::env::remove_var(name);
+    }
+
+    /// Restore one variable now to the value (or absence) saved when
+    /// it was first touched, and forget it: drop will not restore it
+    /// again.
+    pub fn restore(&mut self, name: &'static str) {
+        if let Some(i) = self.saved.iter().position(|(n, _)| *n == name) {
+            let (_, value) = self.saved.remove(i);
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     fn save(&mut self, name: &'static str) {
@@ -134,24 +145,18 @@ pub fn assert_throwaway(root: &std::path::Path) {
 /// so nothing the test runs can read the operator's
 /// `~/.hapi/settings.json` — the frozen alarm contract's requirement:
 /// even a path that discovers hub settings mid-test finds the
-/// throwaway, never the operator's. Tests run on parallel threads in
-/// one process and HOME is process-global, so the swap takes one
-/// process-wide lock (HOME_LOCK, which nests inside ENV_LOCK — a
-/// guard holder may call this; a body must not take ENV_LOCK), and
-/// the previous value is always restored, even on panic. HOME a body
-/// sets or removes itself is this function's own restoration, never
-/// the guard's.
-pub fn with_throwaway_home<T>(body: impl FnOnce() -> T) -> T {
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = lock_despite_poison(&HOME_LOCK);
+/// throwaway, never the operator's. HOME is one more variable of the
+/// caller's `EnvGuard` (one ENV_LOCK acquisition per scope: a caller
+/// with no guard constructs one and passes it in). The helper sets
+/// HOME through the guard, `body` may change it again through the
+/// `&mut EnvGuard` it receives, and the previous value (or absence)
+/// is back when the body returns or unwinds — the helper's own
+/// `restore` first, the guard's drop behind it.
+pub fn with_throwaway_home<T>(env: &mut EnvGuard, body: impl FnOnce(&mut EnvGuard) -> T) -> T {
     let home = temp_root("home");
-    let prev = std::env::var_os("HOME");
-    std::env::set_var("HOME", &home);
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-    match prev {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
+    env.set("HOME", home.into_os_string());
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(env)));
+    env.restore("HOME");
     match out {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -688,6 +693,39 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh")
         );
         assert!(Path::new(&fake_tmux()).is_file());
+    }
+
+    /// `with_throwaway_home` composes with the caller's guard — one
+    /// ENV_LOCK acquisition for the scope — and HOME is the guard's:
+    /// a body that unsets HOME itself still leaves the pre-call value
+    /// (or absence) once the body returns.
+    #[test]
+    fn with_throwaway_home_restores_home_through_the_guard() {
+        let mut env = lock_env(&[]);
+        let prev = std::env::var_os("HOME");
+        with_throwaway_home(&mut env, |env| {
+            assert_ne!(std::env::var_os("HOME"), prev, "HOME is the throwaway");
+            env.unset("HOME");
+            assert_eq!(std::env::var_os("HOME"), None);
+        });
+        assert_eq!(
+            std::env::var_os("HOME"),
+            prev,
+            "the body's changes do not outlive it"
+        );
+    }
+
+    /// The same restoration holds when the body unwinds: the helper
+    /// restores HOME before the panic leaves it.
+    #[test]
+    fn with_throwaway_home_restores_home_when_the_body_unwinds() {
+        let mut env = lock_env(&[]);
+        let prev = std::env::var_os("HOME");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_throwaway_home(&mut env, |_| panic!("unwind inside the throwaway home"))
+        }));
+        assert!(unwound.is_err(), "the body must have unwound");
+        assert_eq!(std::env::var_os("HOME"), prev);
     }
 
     /// wait_for polls a predicate that starts false, then returns

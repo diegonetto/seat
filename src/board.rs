@@ -289,15 +289,16 @@ mod tests {
     /// joins onto the empty path, a different PathBuf than `.` gives).
     #[test]
     fn default_root_pins_the_home_idiom() {
-        crate::testutil::with_throwaway_home(|| {
+        let mut env = lock_env(&[]);
+        crate::testutil::with_throwaway_home(&mut env, |env| {
             let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
             assert_eq!(
                 default_root(),
                 home.join(".local").join("share").join("seat")
             );
-            std::env::remove_var("HOME");
+            env.unset("HOME");
             assert_eq!(default_root(), PathBuf::from("./.local/share/seat"));
-            std::env::set_var("HOME", "");
+            env.set("HOME", "".into());
             assert_eq!(default_root(), PathBuf::from(".local/share/seat"));
         });
     }

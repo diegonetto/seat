@@ -355,7 +355,7 @@ mod tests {
         let mut env = crate::testutil::lock_env(&[]);
         env.unset("HAPI_API_URL");
         env.unset("CLI_API_TOKEN");
-        crate::testutil::with_throwaway_home(|| {
+        crate::testutil::with_throwaway_home(&mut env, |_| {
             let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
             std::fs::create_dir_all(home.join(".hapi")).unwrap();
             std::fs::write(

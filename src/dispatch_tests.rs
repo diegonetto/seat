@@ -679,7 +679,8 @@ fn undelivered_complete_output_through_recovery() {
 /// elapsed-time assertion makes that assumption explicit.
 #[test]
 fn undelivered_hapi_complete_page_outputs() {
-    crate::testutil::with_throwaway_home(|| {
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
         for (body, fail_get, fail_queued, suffix) in [
             (
                 r#"{"session":{"active":true,"thinking":false}}"#,
@@ -777,7 +778,10 @@ fn undelivered_hapi_complete_page_outputs() {
 /// can read the operator's `~/.hapi/settings.json`.
 #[test]
 fn alarm_matrix_once_per_cause_and_recovery() {
-    crate::testutil::with_throwaway_home(alarm_matrix_once_per_cause_and_recovery_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        alarm_matrix_once_per_cause_and_recovery_isolated()
+    });
 }
 
 fn alarm_matrix_once_per_cause_and_recovery_isolated() {
@@ -973,7 +977,10 @@ fn old_posted_item(root: &std::path::Path, seat_name: &str, session: &str) -> St
 /// the whole case, like the alarm matrix.
 #[test]
 fn a_thinking_session_is_working_not_undelivered() {
-    crate::testutil::with_throwaway_home(a_thinking_session_is_working_not_undelivered_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        a_thinking_session_is_working_not_undelivered_isolated()
+    });
 }
 
 fn a_thinking_session_is_working_not_undelivered_isolated() {
@@ -1090,7 +1097,10 @@ fn a_thinking_session_is_working_not_undelivered_isolated() {
 /// already did.
 #[test]
 fn a_hub_error_pages_undelivered_with_the_error_named() {
-    crate::testutil::with_throwaway_home(a_hub_error_pages_undelivered_with_the_error_named_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        a_hub_error_pages_undelivered_with_the_error_named_isolated()
+    });
 }
 
 fn a_hub_error_pages_undelivered_with_the_error_named_isolated() {
@@ -1138,7 +1148,10 @@ fn a_hub_error_pages_undelivered_with_the_error_named_isolated() {
 /// the message already latched here).
 #[test]
 fn a_queued_read_failure_pages_with_the_error_named() {
-    crate::testutil::with_throwaway_home(a_queued_read_failure_pages_with_the_error_named_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        a_queued_read_failure_pages_with_the_error_named_isolated()
+    });
 }
 
 fn a_queued_read_failure_pages_with_the_error_named_isolated() {
@@ -1180,7 +1193,10 @@ fn a_queued_read_failure_pages_with_the_error_named_isolated() {
 /// explicit `false`, as ever).
 #[test]
 fn a_missing_thinking_flag_does_not_skip() {
-    crate::testutil::with_throwaway_home(a_missing_thinking_flag_does_not_skip_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        a_missing_thinking_flag_does_not_skip_isolated()
+    });
 }
 
 fn a_missing_thinking_flag_does_not_skip_isolated() {
@@ -1215,7 +1231,10 @@ fn a_missing_thinking_flag_does_not_skip_isolated() {
 /// invoked, session not thinking, past the threshold, pages.
 #[test]
 fn the_pass_that_observes_invoked_does_not_page() {
-    crate::testutil::with_throwaway_home(the_pass_that_observes_invoked_does_not_page_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        the_pass_that_observes_invoked_does_not_page_isolated()
+    });
 }
 
 fn the_pass_that_observes_invoked_does_not_page_isolated() {
@@ -1266,7 +1285,10 @@ fn the_pass_that_observes_invoked_does_not_page_isolated() {
 /// file-age page beside its `session-inactive`.
 #[test]
 fn the_page_names_the_session_fact_it_actually_read() {
-    crate::testutil::with_throwaway_home(the_page_names_the_session_fact_it_actually_read_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        the_page_names_the_session_fact_it_actually_read_isolated()
+    });
 }
 
 fn the_page_names_the_session_fact_it_actually_read_isolated() {
@@ -1308,7 +1330,10 @@ fn the_page_names_the_session_fact_it_actually_read_isolated() {
 /// read the operator's `~/.hapi/settings.json`.
 #[test]
 fn dispatch_state_and_alarms_survive_a_reload() {
-    crate::testutil::with_throwaway_home(dispatch_state_and_alarms_survive_a_reload_isolated);
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        dispatch_state_and_alarms_survive_a_reload_isolated()
+    });
 }
 
 fn dispatch_state_and_alarms_survive_a_reload_isolated() {
@@ -1629,8 +1654,9 @@ fn lock_env_restores_the_environment_on_panic() {
 
 /// A later direct mutation of a guarded variable never survives the
 /// scope: drop restores the value saved at construction, not the last
-/// one written (the mid-test overrides at the swap and gone-socket
-/// cases lean on exactly this).
+/// one written (the mid-test `env.set` overrides at the swap and
+/// gone-socket cases lean on exactly this: the first saved value is
+/// what drop restores).
 #[test]
 fn lock_env_discards_later_mutations_of_a_guarded_variable() {
     std::env::set_var("SEAT_GUARD_PROBE_MUT", "original");
