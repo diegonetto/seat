@@ -7,6 +7,7 @@
 //! where it is.
 use crate::alarm;
 pub(crate) use crate::backoff::Waits;
+use crate::backoff::SLICE;
 use crate::board;
 use crate::drain::{self, Received};
 use crate::dstate::{
@@ -30,7 +31,6 @@ use std::time::Duration;
 const SCAN_EVERY: Duration = Duration::from_secs(2);
 /// localIds per queued-state call (hub limit).
 pub(crate) const QUEUED_CHUNK: usize = 1000;
-const SLICE: Duration = Duration::from_millis(100);
 
 /// The worker's queued-state poll backoff (5 s doubling to 5 min in
 /// production; tests pass something tiny).

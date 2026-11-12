@@ -10,6 +10,7 @@
 //! `<seat>/webhook.hq-ack` adds the hq receipt (see `hq_receipt`).
 use crate::alarm;
 pub(crate) use crate::backoff::Waits as RingWaits;
+use crate::backoff::SLICE;
 use crate::board;
 use crate::dstate::{load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
@@ -25,7 +26,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const SLICE: Duration = Duration::from_millis(100);
 const MAX_BODY: usize = 8192; // the cap on a message payload mode carries
 const SUPPRESSED: &str = "no POST sent: an attempted hq message is still unread";
 /// Where the hq receipt goes, and how long it may take.
