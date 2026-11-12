@@ -493,6 +493,175 @@ fn a_worker_spawned_with_stop_set_still_completes_its_first_pass() {
     assert_eq!(hook.hits().len(), 1, "exactly the first pass, then stop");
 }
 
+/// The re-ring wait's new-mail arm: a file the burst has not rung that
+/// appears while the worker sleeps out an hour-long backoff wakes it
+/// at once, and the next pass rings the new mail.
+#[test]
+fn new_mail_wakes_the_re_ring_wait() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    hq_mail(&root, "second note", "99999999", "inbox", false);
+    wait_for(|| hook.hits().len() == 2, "new mail did not wake the wait");
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 2);
+}
+
+/// The re-ring wait's empty-inbox arm: when the bot's drain takes every
+/// file while the worker sleeps, nothing is present and the wait ends
+/// at once — the next pass prunes the burst closed and the worker
+/// returns Idle instead of sleeping the backoff out.
+#[test]
+fn an_emptied_inbox_ends_the_re_ring_wait() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    let done = Arc::new(AtomicBool::new(false));
+    let (r, d) = (root.clone(), Arc::clone(&done));
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), stop, hour_waits(), Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    std::fs::remove_file(
+        kotek_dir(&root)
+            .join("inbox")
+            .join(format!("{MAIL_TS}-abcdef12.msg")),
+    )
+    .unwrap();
+    wait_for(
+        || done.load(Ordering::SeqCst),
+        "an emptied inbox did not end the wait",
+    );
+    assert_eq!(hook.hits().len(), 1);
+    assert!(
+        load_state(&kotek_dir(&root)).ring.is_none(),
+        "the burst closed"
+    );
+}
+
+/// The re-ring wait re-reads the persisted state every slice: a burst
+/// record cleared on disk while the worker sleeps makes the
+/// still-present mail new again and wakes the wait. The woken pass
+/// sends no POST (the id is already delivered, so suppression holds)
+/// — the wake is observable only in the burst record coming back.
+#[test]
+fn a_persisted_state_change_wakes_the_re_ring_wait() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(
+        || load_state(&kotek_dir(&root)).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    let mut state = load_state(&kotek_dir(&root));
+    state.ring = None;
+    crate::dstate::store_state(&kotek_dir(&root), &state).unwrap();
+    wait_for(
+        || load_state(&kotek_dir(&root)).ring.is_some(),
+        "a persisted state change did not wake the wait",
+    );
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 1, "the delivered id never rides twice");
+}
+
+/// The re-ring wait's deadline arm: with nothing new on disk at all,
+/// the deadline the worker cached after its pass (50 ms out) alone
+/// wakes the wait, and the woken pass doubles the backoff to 100 ms.
+#[test]
+fn the_cached_deadline_wakes_the_re_ring_wait() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    let waits = RingWaits {
+        first: Duration::from_millis(50),
+        max: HOUR,
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, waits, Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(
+        || {
+            load_state(&kotek_dir(&root))
+                .ring
+                .as_ref()
+                .is_some_and(|r| r.backoff_ms == 100)
+        },
+        "the cached deadline did not wake the wait",
+    );
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 1, "the delivered id never rides twice");
+}
+
+/// The wait keeps its deadline from the pass that opened it: a
+/// malformed `next_at` rewritten into `dispatch.json` while the worker
+/// sleeps never wakes it (the cached instant, an hour out, is the only
+/// one that counts) — the caller difference `due_at` does not share,
+/// where an unreadable deadline in an open burst is due.
+#[test]
+fn an_unreadable_deadline_rewritten_on_disk_never_wakes_the_wait() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(
+        || load_state(&kotek_dir(&root)).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    // Readable JSON, unreadable timestamp.
+    let mut state = load_state(&kotek_dir(&root));
+    state.ring.as_mut().unwrap().next_at = Some("not-a-timestamp".into());
+    crate::dstate::store_state(&kotek_dir(&root), &state).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let after = load_state(&kotek_dir(&root)).ring.unwrap();
+    assert_eq!(
+        after.next_at.as_deref(),
+        Some("not-a-timestamp"),
+        "a pass ran over the unreadable deadline: {:?}",
+        after
+    );
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 1);
+}
+
 /// Write the ingest env file (`KEY=VALUE` lines) into the current
 /// (throwaway) HOME.
 fn ingest_env_file() {
