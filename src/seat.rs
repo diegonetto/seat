@@ -262,6 +262,17 @@ pub fn read_meta(dir: &Path) -> Result<Meta> {
     })
 }
 
+/// Read the meta.json of the seat named `name` under `root`. A missing
+/// meta.json becomes the named UnknownSeat error — the name a caller
+/// handed in, not the storage-level GhostSeat — while corrupt meta and
+/// io errors pass through unchanged.
+pub fn read_meta_named(root: &Path, name: &str) -> Result<Meta> {
+    read_meta(&seat_dir(root, name)).map_err(|e| match e {
+        SeatError::GhostSeat(_) => SeatError::UnknownSeat(name.to_string()),
+        other => other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

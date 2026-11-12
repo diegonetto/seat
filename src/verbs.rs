@@ -123,10 +123,7 @@ pub fn send(
     let from = who.from.as_str();
     valid_name(from)?;
     valid_name(to)?;
-    seat::read_meta(&seat::seat_dir(root, to)).map_err(|e| match e {
-        SeatError::GhostSeat(_) => SeatError::UnknownSeat(to.to_string()),
-        other => other,
-    })?;
+    seat::read_meta_named(root, to)?;
     let token = sender_token(root, from)?;
     let (_, header) = msg::write_msg(
         &seat::seat_dir(root, to).join("inbox"),
@@ -279,6 +276,27 @@ mod tests {
         assert_eq!(msg::list_msg_dir(&inbox).unwrap().len(), 1);
         let meta = seat::read_meta(&seat::seat_dir(&root, "alpha")).unwrap();
         assert!(meta.last_seen.is_some());
+    }
+
+    /// The send error wordings, pinned in full: a sender whose token
+    /// is missing is GhostSeat; a destination whose meta is missing is
+    /// UnknownSeat — the same name, two different named errors.
+    #[test]
+    fn send_names_a_ghost_sender_and_an_unknown_destination_in_full() {
+        let root = setup();
+        cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+        assert_eq!(
+            cmd_send(&root, Some("ghost"), "alpha", "hi", None)
+                .unwrap_err()
+                .to_string(),
+            "seat ghost has no token on this board"
+        );
+        assert_eq!(
+            cmd_send(&root, Some("alpha"), "ghost", "hi", None)
+                .unwrap_err()
+                .to_string(),
+            "seat ghost is not registered on this board"
+        );
     }
 
     #[test]
