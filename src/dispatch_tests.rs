@@ -3527,7 +3527,7 @@ fn masked_state(dir: &Path, times: &[&str]) -> String {
     raw
 }
 
-/// The awake preamble's complete outputs on a successful wake: the
+/// The asleep preamble's complete outputs on a successful wake: the
 /// pass verdict, every log line (times masked), the full final
 /// dispatch.json, the full hub journal, and the file layout — the
 /// full-output pin for the block `sleep::asleep_preamble` now owns.
@@ -3614,7 +3614,7 @@ fn a_successful_wake_pass_full_outputs_are_pinned() {
         vec![
             "POST /api/auth".to_string(),
             "GET /api/sessions/s2".to_string(),
-            format!("POST /api/sessions/s2/messages"),
+            "POST /api/sessions/s2/messages".to_string(),
             format!("POST-MSG s2 {key}"),
             "POST /api/sessions/s2/messages/queued-state".to_string(),
             "GET /api/sessions/s2".to_string(),

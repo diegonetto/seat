@@ -58,8 +58,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     let mut state = load_state(&dir);
     // Everything an asleep seat does before the pass's awake work —
     // settle, complete, hold, or wake — lives in sleep.rs with the
-    // state it moves; `None` means the seat is awake, and the rest
-    // of the pass runs.
+    // state it moves.
     if let Some(pass) = sleep::asleep_preamble(root, seat, &mut state, hub)? {
         return Ok(pass);
     }
