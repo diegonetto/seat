@@ -349,8 +349,8 @@ mod tests {
     fn drain_of_unknown_or_corrupt_seat_refuses() {
         let root = setup();
         let (r, _) = drain_str(&root, "ghost");
-        // Drain keeps the storage-level GhostSeat wording; only the
-        // verbs handed a seat name translate it to UnknownSeat.
+        // Drain reads meta at the storage level, so it keeps the
+        // GhostSeat wording; read_meta_named callers get UnknownSeat.
         assert_eq!(
             r.unwrap_err().to_string(),
             "seat ghost has no token on this board"
