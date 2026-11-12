@@ -104,6 +104,115 @@ fn pin_signal_post(hook: &FakeWebhook, hit: usize) {
     );
 }
 
+/// Pin one payload POST whole — the complete body and the complete
+/// header block the receiver records — the payload twin of
+/// `pin_signal_post`, normalizing the same nondeterministic bytes: the
+/// UTC `ts` and the 32-lowercase-hex `nonce` are read out of the
+/// captured body, validated for shape, and substituted back so every
+/// other byte stays pinned; the signature is recomputed over the exact
+/// captured body; the receiver's ephemeral `host:port` comes from the
+/// hook itself.
+fn pin_payload_post(hook: &FakeWebhook, hit: usize, id: &str, text: &str) {
+    let (headers, body) = hook.hits()[hit].clone();
+    let quoted_text = serde_json::to_string(text).unwrap();
+    let (ts, rest) = body
+        .strip_prefix("{\"schema_version\":1,\"seat\":\"kotek-grokbot\",\"ts\":\"")
+        .and_then(|r| r.split_once("\",\"nonce\":\""))
+        .unwrap_or_else(|| panic!("payload body does not parse: {body}"));
+    let tail = format!(
+        "\",\"from\":\"inbox\",\"id\":\"{id}\",\"text\":{quoted_text},\"thread\":\"inbox\"}}"
+    );
+    let nonce = rest
+        .strip_suffix(&tail)
+        .unwrap_or_else(|| panic!("payload body does not parse: {body}"));
+    assert_eq!(ts.len(), 20, "second-resolution UTC ts: {ts}");
+    chrono::DateTime::parse_from_rfc3339(ts).expect("RFC 3339 ts");
+    assert_eq!(nonce.len(), 32, "16 bytes as 32 hex chars: {nonce}");
+    assert!(
+        nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "lowercase hex nonce: {nonce}"
+    );
+    assert_eq!(
+        body,
+        format!(
+            "{{\"schema_version\":1,\"seat\":\"kotek-grokbot\",\"ts\":\"{ts}\",\"nonce\":\"{nonce}\",\"from\":\"inbox\",\"id\":\"{id}\",\"text\":{quoted_text},\"thread\":\"inbox\"}}"
+        ),
+        "the complete body, byte for byte"
+    );
+    let sig = webhook::signature_hex(KEY, &body);
+    let url = hook.url();
+    let host = url.strip_prefix("http://").unwrap_or_default();
+    assert_eq!(
+        headers,
+        format!(
+            "accept-encoding: gzip\ncontent-length: {}\nuser-agent: ureq/3.4.2\naccept: */*\nhost: {host}\ncontent-type: application/json\nx-memo-signature: sha256={sig}\n",
+            body.len()
+        ),
+        "the complete header block, line for line"
+    );
+}
+
+/// Pin the complete persisted ring state — every byte of
+/// `dispatch.json` after a pass — with its one nondeterministic field,
+/// `next_at`, read out, parsed as rfc3339, and bounded by the pass's
+/// own window (`before` through `after`, taken around the pass) shifted
+/// by the backoff, then substituted back so every other byte stays
+/// pinned.
+fn pin_ring_state(
+    dir: &Path,
+    rung: &[String],
+    backoff_ms: u64,
+    before: chrono::DateTime<chrono::Utc>,
+    after: chrono::DateTime<chrono::Utc>,
+) {
+    let delay = chrono::TimeDelta::from_std(Duration::from_millis(backoff_ms)).unwrap();
+    let next = load_state(dir).ring.unwrap().next_at.unwrap();
+    let at = chrono::DateTime::parse_from_rfc3339(&next)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        at >= before + delay && at <= after + delay,
+        "next_at {next} is not {backoff_ms} ms out inside the pass's window"
+    );
+    let entries = rung.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        format!(
+            "{{\n  \"items\": {{}},\n  \"ring\": {{\n    \"rung\": [\n      {}\n    ],\n    \"next_at\": \"{next}\",\n    \"backoff_ms\": {backoff_ms},\n    \"failures\": 0\n  }}\n}}\n",
+            entries.join(",\n      ")
+        ),
+        "the complete dispatch.json, byte for byte"
+    );
+}
+
+/// Pin the complete `dispatch.log` — exactly this many lines — with
+/// each line's one nondeterministic field, the rfc3339 stamp `log_line`
+/// writes, read out, validated, and substituted back so every other
+/// byte stays pinned. An absent log is the empty list.
+fn pin_log(root: &Path, expected: &[&str]) {
+    let raw = std::fs::read_to_string(root.join("dispatch.log")).unwrap_or_default();
+    let lines: Vec<&str> = if raw.is_empty() {
+        Vec::new()
+    } else {
+        assert!(
+            raw.ends_with('\n'),
+            "a log line without its newline: {raw:?}"
+        );
+        raw.strip_suffix('\n').unwrap().split('\n').collect()
+    };
+    assert_eq!(lines.len(), expected.len(), "the complete log: {raw:?}");
+    for (line, rest) in lines.iter().zip(expected) {
+        let (stamp, tail) = line
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("a log line without its stamp: {line}"));
+        chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|e| panic!("the stamp is not rfc3339 ({stamp}): {e}"));
+        assert_eq!(tail, *rest, "the complete line minus its stamp");
+    }
+}
+
 /// The signal ring `ring_once` sends in signal mode (no payload
 /// marker): exactly one POST, its complete body and complete header
 /// block pinned whole by `pin_signal_post`.
@@ -495,60 +604,164 @@ fn a_worker_spawned_with_stop_set_still_completes_its_first_pass() {
 
 /// The re-ring wait's new-mail arm: a file the burst has not rung that
 /// appears while the worker sleeps out an hour-long backoff wakes it
-/// at once, and the next pass rings the new mail.
+/// at once, and the next pass rings the new mail. Every output of both
+/// passes is pinned whole: both POSTs by `pin_payload_post`, the
+/// persisted state after each pass by `pin_ring_state` (the hour cap
+/// doubling holds at the hour), the id records' exact
+/// bytes, and the complete log: the undelivered alarm the first pass
+/// fires (the month-old fixture mail was undelivered when that pass
+/// started), one `delivered` line per POST. The alarm latch stays set,
+/// because the second pass's new mail was still undelivered when it
+/// started.
 #[test]
 fn new_mail_wakes_the_re_ring_wait() {
     let hook = FakeWebhook::start();
     let root = kotek_board(&hook.url());
     hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
     let cfg = payload_cfg(&hook.url());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let start = chrono::Utc::now();
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
         d.store(true, Ordering::SeqCst);
     });
-    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
+    wait_for(
+        || load_state(&dir).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        start,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    let second = chrono::Utc::now();
     hq_mail(&root, "second note", "99999999", "inbox", false);
     wait_for(|| hook.hits().len() == 2, "new mail did not wake the wait");
     stop.store(true, Ordering::SeqCst);
     wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
-    assert_eq!(hook.hits().len(), 2);
+    pin_payload_post(&hook, 1, "99999999", "second note");
+    pin_ring_state(
+        &dir,
+        &[
+            format!("{MAIL_TS}-99999999.msg"),
+            format!("{MAIL_TS}-abcdef12.msg"),
+        ],
+        3_600_000,
+        second,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\",\"99999999\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\",\"99999999\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+            "delivered seat=kotek-grokbot id=99999999 mode=payload",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"undelivered:kotek-grokbot\"]}\n"
+    );
 }
 
 /// The re-ring wait's empty-inbox arm: when the bot's drain takes every
 /// file while the worker sleeps, nothing is present and the wait ends
 /// at once — the next pass prunes the burst closed and the worker
-/// returns Idle instead of sleeping the backoff out.
+/// returns Idle instead of sleeping the backoff out. The first pass's
+/// POST is pinned whole, its persisted state by `pin_ring_state`, and
+/// after the close `dispatch.json` is pinned to its exact no-ring
+/// bytes. The alarm the first pass fired (the month-old fixture mail,
+/// undelivered when that pass started) is pinned cleared by the
+/// closing pass, which found nothing old and undelivered.
 #[test]
 fn an_emptied_inbox_ends_the_re_ring_wait() {
     let hook = FakeWebhook::start();
     let root = kotek_board(&hook.url());
     hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
     let cfg = payload_cfg(&hook.url());
     let done = Arc::new(AtomicBool::new(false));
     let (r, d) = (root.clone(), Arc::clone(&done));
     let stop = Arc::new(AtomicBool::new(false));
+    let start = chrono::Utc::now();
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), stop, hour_waits(), Some(cfg));
         d.store(true, Ordering::SeqCst);
     });
-    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
-    std::fs::remove_file(
-        kotek_dir(&root)
-            .join("inbox")
-            .join(format!("{MAIL_TS}-abcdef12.msg")),
-    )
-    .unwrap();
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
+    wait_for(
+        || load_state(&dir).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        start,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    std::fs::remove_file(dir.join("inbox").join(format!("{MAIL_TS}-abcdef12.msg"))).unwrap();
     wait_for(
         || done.load(Ordering::SeqCst),
         "an emptied inbox did not end the wait",
     );
     assert_eq!(hook.hits().len(), 1);
-    assert!(
-        load_state(&kotek_dir(&root)).ring.is_none(),
-        "the burst closed"
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        "{\n  \"items\": {}\n}\n",
+        "the burst closed: no ring at all in the state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[]}\n",
+        "the closing pass cleared the latch"
     );
 }
 
@@ -556,61 +769,122 @@ fn an_emptied_inbox_ends_the_re_ring_wait() {
 /// record cleared on disk while the worker sleeps makes the
 /// still-present mail new again and wakes the wait. The woken pass
 /// sends no POST (the id is already delivered, so suppression holds)
-/// — the wake is observable only in the burst record coming back.
+/// — the wake is observable only in the burst record coming back, a
+/// fresh burst at the first backoff again. The first pass's POST is
+/// pinned whole, the state after each pass by `pin_ring_state`, the id
+/// records' exact bytes, and the alarm the first pass fired pinned
+/// cleared by the woken pass (its mail is delivered, so nothing old is
+/// owed).
 #[test]
 fn a_persisted_state_change_wakes_the_re_ring_wait() {
     let hook = FakeWebhook::start();
     let root = kotek_board(&hook.url());
     hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
     let cfg = payload_cfg(&hook.url());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let start = chrono::Utc::now();
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
         d.store(true, Ordering::SeqCst);
     });
-    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
     wait_for(
-        || load_state(&kotek_dir(&root)).ring.is_some(),
+        || load_state(&dir).ring.is_some(),
         "the first pass never recorded its burst",
     );
-    let mut state = load_state(&kotek_dir(&root));
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        start,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    let cleared = chrono::Utc::now();
+    let mut state = load_state(&dir);
     state.ring = None;
-    crate::dstate::store_state(&kotek_dir(&root), &state).unwrap();
+    crate::dstate::store_state(&dir, &state).unwrap();
     wait_for(
-        || load_state(&kotek_dir(&root)).ring.is_some(),
+        || load_state(&dir).ring.is_some(),
         "a persisted state change did not wake the wait",
     );
     stop.store(true, Ordering::SeqCst);
     wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
     assert_eq!(hook.hits().len(), 1, "the delivered id never rides twice");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        cleared,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[]}\n",
+        "the woken pass cleared the latch"
+    );
 }
 
 /// The re-ring wait's deadline arm: with nothing new on disk at all,
 /// the deadline the worker cached after its pass (50 ms out) alone
-/// wakes the wait, and the woken pass doubles the backoff to 100 ms.
+/// wakes the wait, and the woken pass doubles the backoff into the
+/// 100 ms cap — where every suppressed pass after it stays, so the
+/// final state is stable however late the stop lands. (The first
+/// pass's own complete outputs are the sibling cases' to pin: same
+/// setup, and this one's second pass follows in ~100 ms.) The one
+/// POST is pinned whole, the final state by `pin_ring_state`, the id
+/// records' exact bytes, and the alarm the first pass fired pinned
+/// cleared by every later pass (the mail is delivered, nothing old is
+/// owed).
 #[test]
 fn the_cached_deadline_wakes_the_re_ring_wait() {
     let hook = FakeWebhook::start();
     let root = kotek_board(&hook.url());
     hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
     let cfg = payload_cfg(&hook.url());
     let waits = RingWaits {
         first: Duration::from_millis(50),
-        max: HOUR,
+        max: Duration::from_millis(100),
     };
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let start = chrono::Utc::now();
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), s, waits, Some(cfg));
         d.store(true, Ordering::SeqCst);
     });
-    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
     wait_for(
         || {
-            load_state(&kotek_dir(&root))
+            load_state(&dir)
                 .ring
                 .as_ref()
                 .is_some_and(|r| r.backoff_ms == 100)
@@ -620,46 +894,221 @@ fn the_cached_deadline_wakes_the_re_ring_wait() {
     stop.store(true, Ordering::SeqCst);
     wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
     assert_eq!(hook.hits().len(), 1, "the delivered id never rides twice");
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        100,
+        start + chrono::TimeDelta::from_std(Duration::from_millis(50)).unwrap(),
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[]}\n",
+        "every pass after the first cleared the latch"
+    );
 }
 
-/// The wait keeps its deadline from the pass that opened it: a
-/// malformed `next_at` rewritten into `dispatch.json` while the worker
-/// sleeps never wakes it (the cached instant, an hour out, is the only
-/// one that counts) — the caller difference `due_at` does not share,
-/// where an unreadable deadline in an open burst is due.
+/// The wait reads an unreadable deadline as not yet due — the caller
+/// difference `due_at` does not share, where an unreadable deadline in
+/// an open burst is due: a malformed `next_at` rewritten into
+/// `dispatch.json` while the worker sleeps never wakes it, awake or
+/// asleep, cached or reloaded (none of those read an instant out of
+/// it). Whether the wait caches its deadline at all is the sibling
+/// readable case below; this one pins that the rewritten bytes stand
+/// exactly, with the first pass's POST, state, id records, the complete
+/// log (the undelivered alarm and the first pass's `delivered` line)
+/// and its still-latched cause (no second pass runs to clear it) all
+/// pinned whole.
 #[test]
 fn an_unreadable_deadline_rewritten_on_disk_never_wakes_the_wait() {
     let hook = FakeWebhook::start();
     let root = kotek_board(&hook.url());
     hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
     let cfg = payload_cfg(&hook.url());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let start = chrono::Utc::now();
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
         d.store(true, Ordering::SeqCst);
     });
-    wait_for(|| !hook.hits().is_empty(), "the first ring never happened");
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
     wait_for(
-        || load_state(&kotek_dir(&root)).ring.is_some(),
+        || load_state(&dir).ring.is_some(),
         "the first pass never recorded its burst",
     );
-    // Readable JSON, unreadable timestamp.
-    let mut state = load_state(&kotek_dir(&root));
-    state.ring.as_mut().unwrap().next_at = Some("not-a-timestamp".into());
-    crate::dstate::store_state(&kotek_dir(&root), &state).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    let after = load_state(&kotek_dir(&root)).ring.unwrap();
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        start,
+        chrono::Utc::now(),
+    );
     assert_eq!(
-        after.next_at.as_deref(),
-        Some("not-a-timestamp"),
-        "a pass ran over the unreadable deadline: {:?}",
-        after
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    // Readable JSON, unreadable timestamp.
+    let mut state = load_state(&dir);
+    state.ring.as_mut().unwrap().next_at = Some("not-a-timestamp".into());
+    crate::dstate::store_state(&dir, &state).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        format!(
+            "{{\n  \"items\": {{}},\n  \"ring\": {{\n    \"rung\": [\n      \"{MAIL_TS}-abcdef12.msg\"\n    ],\n    \"next_at\": \"not-a-timestamp\",\n    \"backoff_ms\": 3600000,\n    \"failures\": 0\n  }}\n}}\n"
+        ),
+        "no pass ran over the unreadable rewrite: the bytes stand exactly"
     );
     stop.store(true, Ordering::SeqCst);
     wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
     assert_eq!(hook.hits().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"undelivered:kotek-grokbot\"]}\n",
+        "no second pass ran: the first ring's latch stands"
+    );
+}
+
+/// The wait caches its deadline from the pass that opened it: a
+/// readable, long-expired `next_at` rewritten into `dispatch.json`
+/// while the worker sleeps never wakes it — the cached hour is the
+/// only instant that counts. A worker that reloaded its deadline every
+/// slice would read the expired instant, wake within a slice or two
+/// and run a pass (rewriting `next_at` to the future), so the expired
+/// bytes surviving is exactly what distinguishes caching from
+/// reloading. One startup race exists — the rewrite can land between
+/// the pass's `store_state` and the worker's deadline read, which also
+/// runs a single pass — so on finding the rewrite overwritten the test
+/// lets the worker settle into its new hour and rewrites once more:
+/// only a real reload wakes twice. Every output is
+/// pinned whole (the POST, the state after the first pass, the id
+/// records, the complete log — the undelivered alarm and the first
+/// pass's `delivered` line); the alarm latch is the one bit the race
+/// pass moves (it clears it), so both its values are accepted.
+#[test]
+fn a_readable_expired_deadline_rewritten_on_disk_never_wakes_the_wait() {
+    const EXPIRED: &str = "2000-01-01T00:00:00Z";
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "ring me", "abcdef12", "inbox", false);
+    let dir = kotek_dir(&root);
+    let cfg = payload_cfg(&hook.url());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let start = chrono::Utc::now();
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, hour_waits(), Some(cfg));
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
+    wait_for(
+        || load_state(&dir).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    pin_payload_post(&hook, 0, "abcdef12", "ring me");
+    pin_ring_state(
+        &dir,
+        &[format!("{MAIL_TS}-abcdef12.msg")],
+        3_600_000,
+        start,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    for round in 0..2 {
+        let mut state = load_state(&dir);
+        state.ring.as_mut().unwrap().next_at = Some(EXPIRED.into());
+        crate::dstate::store_state(&dir, &state).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        if load_state(&dir).ring.and_then(|r| r.next_at) == Some(EXPIRED.to_string()) {
+            break; // no pass ran over the expired rewrite
+        }
+        assert!(
+            round == 0,
+            "passes ran over the rewritten expired deadline twice: \
+             the wait reloads its deadline instead of caching it"
+        );
+        // The pass was the startup race: the rewrite landed between
+        // the pass's store and the worker's deadline read. The worker
+        // has long since cached a fresh hour — rewrite into that wait.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 1, "the delivered id never rides twice");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        format!(
+            "{{\n  \"items\": {{}},\n  \"ring\": {{\n    \"rung\": [\n      \"{MAIL_TS}-abcdef12.msg\"\n    ],\n    \"next_at\": \"{EXPIRED}\",\n    \"backoff_ms\": 3600000,\n    \"failures\": 0\n  }}\n}}\n"
+        ),
+        "no pass ran over the expired rewrite: the bytes stand exactly"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("webhook-attempted.json")).unwrap(),
+        "[\"abcdef12\"]\n"
+    );
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
+    let alarms = std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap();
+    assert!(
+        alarms == "{\"causes\":[\"undelivered:kotek-grokbot\"]}\n" || alarms == "{\"causes\":[]}\n",
+        "the first ring's latch, or cleared by the race pass: {alarms}"
+    );
 }
 
 /// Write the ingest env file (`KEY=VALUE` lines) into the current
