@@ -8,7 +8,7 @@
 //! receiver.
 use crate::dstate::load_state;
 use crate::testutil::fakewebhook::FakeWebhook;
-use crate::testutil::{temp_root, wait_for, write_bindings};
+use crate::testutil::{lock_env, temp_root, wait_for, write_bindings};
 use crate::webhook::{self, RingOutcome, RingWaits, WebhookConfig};
 use crate::{board, msg, seat, verbs};
 use std::path::{Path, PathBuf};
@@ -1205,9 +1205,10 @@ fn ack_cfg(hook_url: &str, ack_url: &str) -> WebhookConfig {
 /// the log.
 #[test]
 fn hq_receipt_follows_each_payload_delivery_when_marked() {
-    crate::testutil::with_throwaway_home(
-        hq_receipt_follows_each_payload_delivery_when_marked_isolated,
-    );
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        hq_receipt_follows_each_payload_delivery_when_marked_isolated()
+    });
 }
 
 fn hq_receipt_follows_each_payload_delivery_when_marked_isolated() {
@@ -1293,9 +1294,10 @@ fn hq_receipt_follows_each_payload_delivery_when_marked_isolated() {
 /// receiver.
 #[test]
 fn a_failed_hq_receipt_is_best_effort_and_never_resent() {
-    crate::testutil::with_throwaway_home(
-        a_failed_hq_receipt_is_best_effort_and_never_resent_isolated,
-    );
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
+        a_failed_hq_receipt_is_best_effort_and_never_resent_isolated()
+    });
 }
 
 fn a_failed_hq_receipt_is_best_effort_and_never_resent_isolated() {
@@ -1355,7 +1357,8 @@ fn a_failed_hq_receipt_is_best_effort_and_never_resent_isolated() {
 /// no other spelling.
 #[test]
 fn a_missing_ingest_env_names_the_home_path() {
-    crate::testutil::with_throwaway_home(|| {
+    let mut env = lock_env(&[]);
+    crate::testutil::with_throwaway_home(&mut env, |_| {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .expect("HOME set");

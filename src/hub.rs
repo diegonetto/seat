@@ -352,16 +352,10 @@ mod tests {
     /// end.
     #[test]
     fn discover_reads_home_settings_when_the_env_is_quiet() {
-        let _env = crate::testutil::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved = (
-            std::env::var_os("HAPI_API_URL"),
-            std::env::var_os("CLI_API_TOKEN"),
-        );
-        std::env::remove_var("HAPI_API_URL");
-        std::env::remove_var("CLI_API_TOKEN");
-        crate::testutil::with_throwaway_home(|| {
+        let mut env = crate::testutil::lock_env(&[]);
+        env.unset("HAPI_API_URL");
+        env.unset("CLI_API_TOKEN");
+        crate::testutil::with_throwaway_home(&mut env, |_| {
             let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
             std::fs::create_dir_all(home.join(".hapi")).unwrap();
             std::fs::write(
@@ -375,15 +369,7 @@ mod tests {
                 ("http://127.0.0.1:4242", "file-token"),
                 "the settings came from HOME, nowhere else"
             );
-        });
-        match saved.0 {
-            Some(v) => std::env::set_var("HAPI_API_URL", v),
-            None => std::env::remove_var("HAPI_API_URL"),
-        }
-        match saved.1 {
-            Some(v) => std::env::set_var("CLI_API_TOKEN", v),
-            None => std::env::remove_var("CLI_API_TOKEN"),
-        }
+        })
     }
 
     /// The live hub nests the flag under `session`; `session_active`

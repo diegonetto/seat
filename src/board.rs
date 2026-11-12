@@ -131,7 +131,7 @@ pub fn reset(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::temp_root;
+    use crate::testutil::{lock_env, temp_root};
 
     #[test]
     fn init_creates_marker_and_layout() {
@@ -270,17 +270,17 @@ mod tests {
         // One test touches the root environment; every other test
         // passes roots in.
         let thrown = temp_root("board-env");
-        std::env::remove_var("SEAT_ROOT");
+        let mut env = lock_env(&[]);
+        env.unset("SEAT_ROOT");
         assert_eq!(resolve_root(None), default_root());
         assert_ne!(resolve_root(None), thrown);
 
-        std::env::set_var("SEAT_ROOT", &thrown);
+        env.set("SEAT_ROOT", thrown.clone().into_os_string());
         assert_eq!(resolve_root(None), thrown);
         assert_eq!(
             resolve_root(Some("/elsewhere")),
             PathBuf::from("/elsewhere")
         );
-        std::env::remove_var("SEAT_ROOT");
     }
 
     /// The documented default, pinned: `$HOME/.local/share/seat`. A
@@ -288,15 +288,16 @@ mod tests {
     /// joins onto the empty path, a different PathBuf than `.` gives).
     #[test]
     fn default_root_pins_the_home_idiom() {
-        crate::testutil::with_throwaway_home(|| {
+        let mut env = lock_env(&[]);
+        crate::testutil::with_throwaway_home(&mut env, |env| {
             let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
             assert_eq!(
                 default_root(),
                 home.join(".local").join("share").join("seat")
             );
-            std::env::remove_var("HOME");
+            env.unset("HOME");
             assert_eq!(default_root(), PathBuf::from("./.local/share/seat"));
-            std::env::set_var("HOME", "");
+            env.set("HOME", "".into());
             assert_eq!(default_root(), PathBuf::from(".local/share/seat"));
         });
     }
