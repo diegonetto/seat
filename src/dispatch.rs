@@ -6,6 +6,7 @@
 //! when it chooses. The alarm hooks live in the hapi pass
 //! where it is.
 use crate::alarm;
+pub(crate) use crate::backoff::Waits;
 use crate::board;
 use crate::drain::{self, Received};
 use crate::dstate::{
@@ -33,12 +34,6 @@ const SLICE: Duration = Duration::from_millis(100);
 
 /// The worker's queued-state poll backoff (5 s doubling to 5 min in
 /// production; tests pass something tiny).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Waits {
-    pub first: Duration,
-    pub max: Duration,
-}
-
 const PROD_WAITS: Waits = Waits {
     first: Duration::from_secs(5),
     max: Duration::from_secs(5 * 60),
@@ -639,6 +634,19 @@ pub(crate) fn worker_loop(
     stop: Arc<AtomicBool>,
     waits: Waits,
 ) {
+    worker_loop_with_sleep(root, seat, cfg, stop, waits, &std::thread::sleep);
+}
+
+/// The same worker with an injectable sleep, so tests can observe
+/// the exact backoff without waiting on the wall clock.
+pub(crate) fn worker_loop_with_sleep(
+    root: PathBuf,
+    seat: String,
+    cfg: HubConfig,
+    stop: Arc<AtomicBool>,
+    waits: Waits,
+    sleeper: &dyn Fn(Duration),
+) {
     let mut hub = Hub::new(cfg);
     let mut backoff = waits.first;
     loop {
@@ -658,7 +666,7 @@ pub(crate) fn worker_loop(
             let mut left = backoff;
             while left > Duration::ZERO && !stop.load(Ordering::SeqCst) && !fresh_work(&root, &seat)
             {
-                std::thread::sleep(left.min(SLICE));
+                sleeper(left.min(SLICE));
                 left -= left.min(SLICE);
             }
             // The full backoff elapsed (not a fresh-work wake): grow it.
@@ -691,5 +699,18 @@ pub(crate) fn log_failure(root: &Path, seat: &str, e: &SeatError) {
     };
     if let Err(pe) = fired {
         log_line(root, "failure", seat, &format!("alarm not persisted: {pe}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_characterization_production_waits() {
+        assert_eq!(
+            (PROD_WAITS.first, PROD_WAITS.max),
+            (Duration::from_secs(5), Duration::from_secs(300))
+        );
     }
 }
