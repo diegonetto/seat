@@ -9,6 +9,7 @@
 //! per message id; everything else gets the signal. A marker file
 //! `<seat>/webhook.hq-ack` adds the hq receipt (see `hq_receipt`).
 use crate::alarm;
+use crate::board;
 use crate::dstate::{load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
 use crate::identity::Bindings;
@@ -176,10 +177,10 @@ pub(crate) fn post(
 /// `~/.config/bll-ingest/env`: `KEY=VALUE` lines (split at the first `=`), comment and other lines
 /// skipped. Missing values are an error that names nothing secret.
 fn ingest_env() -> std::result::Result<(String, String), String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let path = home.join(".config").join("bll-ingest").join("env");
+    let path = board::home_dir()
+        .join(".config")
+        .join("bll-ingest")
+        .join("env");
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("no readable {}: {e}", path.display()))?;
     let mut values = HashMap::new();
@@ -290,7 +291,7 @@ pub(crate) fn verified_hq_mail(path: &Path, root: &Path, seat: &str) -> Option<(
     if header.dest != seat || header.from != "inbox" {
         return None;
     }
-    let token = msg::read_token(&root.join("seats").join("inbox").join("token")).ok()?;
+    let token = msg::read_token(&seat::token_path(&seat::seat_dir(root, "inbox"))).ok()?;
     msg::verify_hmac(
         &token,
         &header.dest,
