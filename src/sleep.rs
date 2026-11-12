@@ -7,7 +7,7 @@
 use crate::dstate::{self, DispatchState};
 use crate::error::Result;
 use crate::hub::Hub;
-use crate::identity::Bindings;
+use crate::identity::{bound_session, Bindings};
 use crate::seat;
 use crate::webhook;
 use std::path::{Path, PathBuf};
@@ -379,8 +379,7 @@ pub(crate) fn settle_pending_sleep(
                 // replacement that snuck in under the same seat name.
                 return cancel_sleep(root, seat, state, &reason, "pane-replaced");
             }
-            let Some(session) = Bindings::load(root).session_id(seat).map(str::to_string)
-            else {
+            let Some(session) = bound_session(root, seat) else {
                 // No binding left to re-read: not quiet, by absence.
                 return cancel_sleep(root, seat, state, &reason, "no-binding");
             };
