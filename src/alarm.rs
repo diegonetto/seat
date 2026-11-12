@@ -121,6 +121,12 @@ fn cutoff() -> chrono::NaiveDateTime {
         - chrono::TimeDelta::try_minutes(UNDELIVERED_AFTER_MIN).unwrap_or_default()
 }
 
+/// The timestamp prefix before a mail file name's first `-`.
+fn file_ts(name: &str) -> Option<chrono::NaiveDateTime> {
+    name.split_once('-')
+        .and_then(|(ts, _)| chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%S%.6f").ok())
+}
+
 /// The present mail older than the cutoff and not in the delivered
 /// record, oldest first (the name's `ts` prefix is fixed width, so the
 /// set's order is the age order).
@@ -132,21 +138,18 @@ fn old_files<'a>(
     present
         .iter()
         .filter(|name| {
-            let Some((ts, rest)) = name.split_once('-') else {
+            let Some((_, rest)) = name.split_once('-') else {
                 return false;
             };
             let id = rest.strip_suffix(".msg").unwrap_or(rest);
-            !delivered.contains(id)
-                && chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%S%.6f")
-                    .is_ok_and(|t| t < cutoff)
+            !delivered.contains(id) && file_ts(name).is_some_and(|t| t < cutoff)
         })
         .collect()
 }
 
 /// An old file's age in whole minutes, from its file-name `ts`.
 fn age_minutes(name: &str) -> i64 {
-    name.split_once('-')
-        .and_then(|(ts, _)| chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%S%.6f").ok())
+    file_ts(name)
         .map(|t| (chrono::Utc::now().naive_utc() - t).num_minutes().max(0))
         .unwrap_or(UNDELIVERED_AFTER_MIN)
 }
@@ -298,4 +301,75 @@ pub(crate) fn undelivered_hapi(
         Ok(_) => base,
     };
     fire(root, Some(seat), UNDELIVERED, &detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Selection preserves the whole ordered result, including the
+    /// strict microsecond boundary and the exact delivered-id rule.
+    #[test]
+    fn old_files_complete_selection() {
+        let present = [
+            "20251231T235959.999999-first.msg",
+            "20260101T000000.000000-id-with-dash.msg",
+            "20260101T000000.000000-keep.msg.msg",
+            "20260101T000000.000000-without-extension",
+            "20260101T000000.000000-delivered.msg",
+            "20260101T000000.000000-delivered",
+            "20260101T000000.000000-delivered-with-dash.msg",
+            "20260101T000000.000000-",
+            "20260101T000000.000000-.msg",
+            "20260101T000000.000001-exact.msg",
+            "20260101T000000.000002-newer.msg",
+            "20250230T000000.000000-invalid-date.msg",
+            "20251231T235959.999999",
+            "invalid-id.msg",
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+        let delivered = ["delivered", "delivered-with-dash", "", "keep"]
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_micro_opt(0, 0, 0, 1)
+            .unwrap();
+        assert_eq!(
+            old_files(&present, &delivered, cutoff)
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "20251231T235959.999999-first.msg",
+                "20260101T000000.000000-id-with-dash.msg",
+                "20260101T000000.000000-keep.msg.msg",
+                "20260101T000000.000000-without-extension",
+            ]
+        );
+    }
+
+    /// Mid-minute fixtures leave thirty seconds for the call while
+    /// pinning the complete integer result, fallback and zero clamp.
+    #[test]
+    fn age_minutes_complete_values() {
+        let now = chrono::Utc::now();
+        for (offset, expected) in [(-2550, 42), (-30, 0), (3600, 0)] {
+            let ts = now + chrono::TimeDelta::seconds(offset);
+            let name = format!("{}-id-with-dash.msg", ts.format("%Y%m%dT%H%M%S%.6f"));
+            assert_eq!(age_minutes(&name), expected, "{name}");
+        }
+        for name in [
+            "",
+            "20260101T000000.000000",
+            "invalid-id.msg",
+            "20250230T000000.000000-id.msg",
+        ] {
+            assert_eq!(age_minutes(name), 15, "{name}");
+        }
+        assert!(chrono::Utc::now() - now < chrono::TimeDelta::seconds(30));
+    }
 }
