@@ -324,6 +324,22 @@ fn save_id_list(path: &Path, ids: &[String]) -> Result<()> {
     seat::atomic_write_json(path, serde_json::to_string(keep)?)
 }
 
+/// The signal ring both modes send: a fresh body — new UTC ts, new
+/// 32-hex nonce, in that order — POSTed with the script's 3-attempt
+/// retry. `Ok(true)`: a POST went out.
+fn ring_signal(
+    cfg: &WebhookConfig,
+    seat: &str,
+    sleeper: &dyn Fn(Duration),
+) -> std::result::Result<bool, String> {
+    let body = signal_body(
+        seat,
+        &now_utc(),
+        &msg::rand_hex(16).map_err(|e| e.to_string())?,
+    );
+    post(cfg, &body, 3, sleeper).map(|()| true)
+}
+
 /// One ring: the payload for payload seats, the plain signal
 /// otherwise. `Ok(true)` — a POST went out; `Ok(false)` — mail waits
 /// but nothing was sent (payload mode's suppression); `Err` — a POST
@@ -335,12 +351,7 @@ pub(crate) fn ring_once(
     sleeper: &dyn Fn(Duration),
 ) -> std::result::Result<bool, String> {
     if !cfg.payload_mode {
-        let body = signal_body(
-            seat,
-            &now_utc(),
-            &msg::rand_hex(16).map_err(|e| e.to_string())?,
-        );
-        return post(cfg, &body, 3, sleeper).map(|()| true);
+        return ring_signal(cfg, seat, sleeper);
     }
     let dir = seat::seat_dir(root, seat);
     let (attempted_path, delivered_path) = (
@@ -368,12 +379,7 @@ pub(crate) fn ring_once(
         // While an attempted hq message is still unread, a signal
         // would make the bot drain and answer it twice.
         if other_mail && !attempted_hq_still_unread {
-            let body = signal_body(
-                seat,
-                &now_utc(),
-                &msg::rand_hex(16).map_err(|e| e.to_string())?,
-            );
-            return post(cfg, &body, 3, sleeper).map(|()| true);
+            return ring_signal(cfg, seat, sleeper);
         }
         return Ok(false);
     }

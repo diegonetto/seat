@@ -65,6 +65,85 @@ fn kotek_dir(root: &Path) -> PathBuf {
     seat::seat_dir(root, "kotek-grokbot")
 }
 
+/// Pin one signal POST whole — the complete body and the complete
+/// header block the receiver records — comparing complete outputs,
+/// not substrings. The only nondeterministic bytes are handled
+/// explicitly: the UTC `ts` and the 32-lowercase-hex `nonce` are read
+/// out of the captured body, validated for shape, and substituted
+/// back so every other byte stays pinned; the signature is recomputed
+/// over the exact captured body; the receiver's ephemeral `host:port`
+/// comes from the hook itself.
+fn pin_signal_post(hook: &FakeWebhook, hit: usize) {
+    let (headers, body) = hook.hits()[hit].clone();
+    let (ts, after_ts) = body
+        .strip_prefix("{\"schema_version\":1,\"seat\":\"kotek-grokbot\",\"ts\":\"")
+        .and_then(|r| r.split_once("\",\"nonce\":\""))
+        .unwrap_or_else(|| panic!("signal body does not parse: {body}"));
+    let (nonce, tail) = after_ts
+        .split_once("\"}")
+        .unwrap_or_else(|| panic!("signal body does not parse: {body}"));
+    assert_eq!(tail, "", "bytes after the closing brace: {tail:?}");
+    assert_eq!(ts.len(), 20, "second-resolution UTC ts: {ts}");
+    chrono::DateTime::parse_from_rfc3339(ts).expect("RFC 3339 ts");
+    assert_eq!(nonce.len(), 32, "16 bytes as 32 hex chars: {nonce}");
+    assert!(
+        nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "lowercase hex nonce: {nonce}"
+    );
+    assert_eq!(
+        body,
+        format!(
+            "{{\"schema_version\":1,\"seat\":\"kotek-grokbot\",\"ts\":\"{ts}\",\"nonce\":\"{nonce}\"}}"
+        ),
+        "the complete body, byte for byte"
+    );
+    let sig = webhook::signature_hex(KEY, &body);
+    let url = hook.url();
+    let host = url.strip_prefix("http://").unwrap_or_default();
+    assert_eq!(
+        headers,
+        format!(
+            "accept-encoding: gzip\ncontent-length: {}\nuser-agent: ureq/3.4.2\naccept: */*\nhost: {host}\ncontent-type: application/json\nx-memo-signature: sha256={sig}\n",
+            body.len()
+        ),
+        "the complete header block, line for line"
+    );
+}
+
+/// The signal ring `ring_once` sends in signal mode (no payload
+/// marker): exactly one POST, its complete body and complete header
+/// block pinned whole by `pin_signal_post`.
+#[test]
+fn signal_mode_ring_once_pins_the_whole_post() {
+    let hook = FakeWebhook::start();
+    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false, None);
+    let root = temp_root("signal-pin");
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &cfg, &no_sleep).unwrap(),
+        true
+    );
+    assert_eq!(hook.hits().len(), 1);
+    pin_signal_post(&hook, 0);
+}
+
+/// Payload mode's fallback ring — unverified other mail waits, so no
+/// payload is due — sends the very same complete POST, pinned whole
+/// by the same check: both signal sends are byte-identical.
+#[test]
+fn payload_fallback_ring_once_pins_the_whole_post() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "plain note", "aaaa1111", "other", false);
+    assert_eq!(
+        webhook::ring_once(&root, "kotek-grokbot", &payload_cfg(&hook.url()), &no_sleep).unwrap(),
+        true
+    );
+    assert_eq!(hook.hits().len(), 1);
+    pin_signal_post(&hook, 0);
+}
+
 /// kotek's board: the payload seat plus the `inbox` and `other` seats
 /// (`test_grok_doorbell.py`'s setUp, on a temp root).
 fn kotek_board(hook_url: &str) -> PathBuf {
