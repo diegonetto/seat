@@ -1,7 +1,7 @@
 // Test-only helpers. Tests never touch the operator's live board: every
 // helper returns a throwaway directory under the system temp dir and
 // refuses to hand out the documented default root.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -12,6 +12,21 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// threads, and the stubs these tests install are visible to every
 /// subprocess this process spawns.
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock a process-wide test mutex, treating poison as acquired: the
+/// panic that poisoned it is already reported, and a later test that
+/// needs the same lock must still run.
+pub fn lock_despite_poison(
+    lock: &'static std::sync::Mutex<()>,
+) -> std::sync::MutexGuard<'static, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// ENV_LOCK taken for the caller's scope (see ENV_LOCK and
+/// lock_despite_poison above).
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    lock_despite_poison(&ENV_LOCK)
+}
 
 pub fn temp_root(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -52,9 +67,7 @@ pub fn assert_throwaway(root: &std::path::Path) {
 /// on panic.
 pub fn with_throwaway_home<T>(body: impl FnOnce() -> T) -> T {
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = HOME_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock_despite_poison(&HOME_LOCK);
     let home = temp_root("home");
     let prev = std::env::var_os("HOME");
     std::env::set_var("HOME", &home);
@@ -67,6 +80,25 @@ pub fn with_throwaway_home<T>(body: impl FnOnce() -> T) -> T {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+/// Poll `pred` every 10ms until it holds; `msg` fails the test when
+/// 3s pass first (the threads the cases spawn need a moment).
+pub fn wait_for(pred: impl Fn() -> bool, msg: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !pred() {
+        assert!(std::time::Instant::now() < deadline, "{msg}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The fake multiplexer behind SEAT_TMUX: the committed
+/// tests/fake-tmux.sh, whose state file doubles as the record of
+/// every call it answered.
+pub fn fake_tmux() -> String {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh");
+    assert!(Path::new(p).is_file(), "fake-tmux.sh must exist at {p}");
+    p.to_string()
 }
 
 /// Write a throwaway `<root>/hapi-sessions.json` binding each seat to
@@ -466,5 +498,61 @@ pub mod dispatchkit {
 
     pub fn n_posts(journal: &[String]) -> usize {
         journal.iter().filter(|l| l.starts_with("POST-MSG")).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A poisoned ENV_LOCK still yields its guard: the panic that
+    /// poisoned it is already reported, and every later test that
+    /// takes the lock must still run.
+    #[test]
+    fn env_lock_survives_poison() {
+        let _ = std::panic::catch_unwind(|| {
+            let _g = env_lock();
+            panic!("poison ENV_LOCK for the characterization");
+        });
+        let _recovered = env_lock();
+    }
+
+    /// The shared fake multiplexer is exactly the committed script
+    /// beside the manifest.
+    #[test]
+    fn fake_tmux_is_the_committed_fake_script() {
+        assert_eq!(
+            fake_tmux(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh")
+        );
+        assert!(Path::new(&fake_tmux()).is_file());
+    }
+
+    /// wait_for polls a predicate that starts false, then returns
+    /// once it holds.
+    #[test]
+    fn wait_for_returns_once_the_predicate_holds() {
+        let tries = AtomicU32::new(0);
+        wait_for(
+            || tries.fetch_add(1, Ordering::SeqCst) > 0,
+            "the predicate never held",
+        );
+        assert!(tries.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// On timeout, the caller's message is the whole panic payload,
+    /// not a substring of it (the failure path every waiter
+    /// inherits).
+    #[test]
+    fn wait_for_fails_with_the_callers_message_on_timeout() {
+        let payload = std::panic::catch_unwind(|| {
+            wait_for(|| false, "waited 3s and it never came");
+        })
+        .expect_err("the 3s deadline must fail the waiter");
+        let printed = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        assert_eq!(printed, Some("waited 3s and it never came"));
     }
 }

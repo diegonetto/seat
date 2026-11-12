@@ -542,16 +542,8 @@ pub fn cmd_status(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::board;
-    use crate::testutil::temp_root;
+    use crate::testutil::{fake_tmux, temp_root};
     use crate::verbs;
-
-    /// The fake multiplexer for SEAT_TMUX. Its
-    /// state file doubles as the record of every call it answered.
-    fn fake_tmux() -> String {
-        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-tmux.sh");
-        assert!(Path::new(p).is_file(), "fake-tmux.sh must exist at {p}");
-        p.to_string()
-    }
 
     #[test]
     fn presence_is_pane_asleep_awake_or_unattended() {
@@ -571,9 +563,7 @@ mod tests {
     /// record (the wake or a manual `up` happened first).
     #[test]
     fn status_prints_asleep_from_the_record() {
-        let _guard = crate::testutil::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
         let root = temp_root("status-asleep");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -626,7 +616,7 @@ mod tests {
     /// file count and does not change presence.
     #[test]
     fn status_presence_and_mail_are_separate() {
-        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
         let root = temp_root("status-presence");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -677,7 +667,7 @@ mod tests {
     /// The whole session story against the fake.
     #[test]
     fn session_verbs_drive_the_fake_multiplexer() {
-        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
         let root = temp_root("session");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
@@ -951,7 +941,7 @@ mod tests {
     /// leaves earlier seats running and later seats unstarted.
     #[test]
     fn up_starts_the_stored_command() {
-        let _guard = crate::testutil::ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
         let root = temp_root("session-launch");
         board::init(&root).unwrap();
         let cwd = root.display().to_string();
