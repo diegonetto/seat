@@ -156,16 +156,15 @@ fn kotek_board(hook_url: &str) -> PathBuf {
 /// inbox, which then fails verification, like `sender="other-seat"`).
 fn hq_mail(root: &Path, text: &str, id: &str, sender: &str, tamper: bool) -> PathBuf {
     let token = msg::read_token(&seat::seat_dir(root, "inbox").join("token")).unwrap();
-    let mac = msg::compute_hmac(
-        &token,
-        "kotek-grokbot",
-        sender,
-        id,
-        MAIL_TS,
-        text.as_bytes(),
-        None,
-    )
-    .unwrap();
+    let head = msg::Header {
+        dest: "kotek-grokbot".into(),
+        from: sender.into(),
+        id: id.into(),
+        ts: MAIL_TS.into(),
+        hmac: String::new(),
+        session: None,
+    };
+    let mac = msg::compute_hmac(&token, &head, text.as_bytes()).unwrap();
     let head = format!(
         "{{\"dest\":\"kotek-grokbot\",\"from\":\"{sender}\",\"id\":\"{id}\",\"ts\":\"{MAIL_TS}\",\"hmac\":\"{mac}\"}}"
     );
@@ -280,6 +279,60 @@ fn payload_doorbell_ports_the_python_cases() {
         false
     );
     assert!(hook.hits().is_empty(), "{:?}", hook.hits());
+}
+
+/// The webhook verifier pins the pre-session wire format: hq mail is
+/// MAC'd without a session even when the header carries one. Both
+/// claims are digests computed outside the crate (python3 `hmac`,
+/// key = 16 bytes of 0x07, the fixed inbox token this test stages):
+/// only the no-session claim rides the payload, while the message
+/// path (`verify_msg`) accepts exactly the session claim — the two
+/// verifiers disagree over a session-bearing header by design.
+#[test]
+fn verified_hq_mail_pins_the_no_session_mac_even_for_session_headers() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    let token = hex::encode([7u8; 16]);
+    std::fs::write(seat::seat_dir(&root, "inbox").join("token"), &token).unwrap();
+    const NO_SESSION: &str = "32571bfa0f1cbd23170f273fc0d701030a94b8b985901281d337d8e11e716c4d";
+    const WITH_SESSION: &str = "3bf3ffcdb6c9a17208cfe6e211b6cbb0a34ea60bf78ee1a8f45095fc884f400e";
+    let write = |hmac: &str, session: Option<&str>| {
+        let p = kotek_dir(&root)
+            .join("inbox")
+            .join(format!("{MAIL_TS}-abcdef12.msg"));
+        let sess = session
+            .map(|s| format!(",\"session\":\"{s}\""))
+            .unwrap_or_default();
+        std::fs::write(
+            &p,
+            format!(
+                "{{\"dest\":\"kotek-grokbot\",\"from\":\"inbox\",\"id\":\"abcdef12\",\"ts\":\"{MAIL_TS}\",\"hmac\":\"{hmac}\"{sess}}}\n\nhello Mariola"
+            ),
+        )
+        .unwrap();
+        p
+    };
+    // A session-bearing header with the no-session claim rides the
+    // payload; the message path refuses it (it feeds the session).
+    let p = write(NO_SESSION, Some("sess-42"));
+    assert_eq!(
+        webhook::verified_hq_mail(&p, &root, "kotek-grokbot"),
+        Some(("abcdef12".to_string(), "hello Mariola".to_string()))
+    );
+    assert!(
+        !msg::verify_msg(&p, &token).unwrap(),
+        "the message path demands the session claim"
+    );
+    // The session claim — exactly what verify_msg checks — is refused
+    // here: verified_hq_mail feeds no session to the MAC.
+    let p = write(WITH_SESSION, Some("sess-42"));
+    assert!(webhook::verified_hq_mail(&p, &root, "kotek-grokbot").is_none());
+    assert!(msg::verify_msg(&p, &token).unwrap());
+    // A sessionless header with the no-session claim rides too, and
+    // the message path agrees.
+    let p = write(NO_SESSION, None);
+    assert!(webhook::verified_hq_mail(&p, &root, "kotek-grokbot").is_some());
+    assert!(msg::verify_msg(&p, &token).unwrap());
 }
 
 #[test]
