@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub const SESSION: &str = "swarm";
 
 /// The liveness format every session verb agrees on: tab-separated session, pane id, `@seat`,
-/// `pane_dead`, `@cwd` (JSON string), `@cmd` (JSON array). Compact
+/// `pane_dead`, `@cwd` (JSON string), `@cmd` (JSON array), `window_name`. Compact
 /// JSON escapes tabs, so a tab inside a path or word cannot split a
 /// field. Seat names cannot contain whitespace.
 const PANE_FMT: &str =
