@@ -3492,6 +3492,500 @@ fi
     assert_eq!(n_files(&root, "opus", "archive"), 1);
 }
 
+/// One log line with every wall-clock time masked (the leading
+/// timestamp and any `field=<rfc3339>` inside it): every other byte
+/// of the line is pinned.
+fn mask_times(line: &str) -> String {
+    line.split(' ')
+        .map(|tok| match tok.split_once('=') {
+            Some((k, v)) if chrono::DateTime::parse_from_rfc3339(v).is_ok() => {
+                format!("{k}=<ts>")
+            }
+            _ if chrono::DateTime::parse_from_rfc3339(tok).is_ok() => "<ts>".to_string(),
+            _ => tok.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// dispatch.log's whole text, every line time-masked.
+fn masked_log(root: &Path) -> String {
+    log_text(root)
+        .lines()
+        .map(mask_times)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// dispatch.json's full bytes with the given wall-clock values
+/// masked: field order, spellings, and every other byte pinned.
+fn masked_state(dir: &Path, times: &[&str]) -> String {
+    let mut raw = std::fs::read_to_string(dir.join("dispatch.json")).unwrap();
+    for t in times {
+        raw = raw.replace(t, "<ts>");
+    }
+    raw
+}
+
+/// The awake preamble's complete outputs on a successful wake: the
+/// pass verdict, every log line (times masked), the full final
+/// dispatch.json, the full hub journal, and the file layout — the
+/// full-output pin for the block `sleep::asleep_preamble` now owns.
+#[test]
+fn a_successful_wake_pass_full_outputs_are_pinned() {
+    let root = board_with(&[("opus", "s1")]); // s1: the binding sleep left behind
+    let kit_dir = stub_kit(
+        "wake-pin",
+        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(&wake_success(&root, "opus", "opus", "s2")),
+    );
+    let hub = FakeHub::start();
+    hub.ctl.lock().unwrap().sessions.insert("s2".into(), true);
+    let mut client = Hub::new(hub.config());
+    let _env = lock_env(&[
+        ("PATH", path_with(&kit_dir)),
+        ("SEAT_KIT", OsString::from("")),
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+        (
+            "SEAT_FAKE_STATE",
+            OsString::from(root.join("tmux.state").display().to_string()),
+        ),
+    ]);
+    let dir = seat::seat_dir(&root, "opus");
+    dstate::store_state(
+        &dir,
+        &dstate::DispatchState {
+            asleep: Some(dstate::Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    send(&root, "opus", "wake up");
+    let key = only_key(&root, "opus");
+    mark(&hub, &key, "invoked");
+
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    assert_eq!(
+        masked_log(&root),
+        format!(
+            "<ts> wake seat=opus seat-role wake answered awake\n\
+             <ts> delivered seat=opus key={key} accepted-at=<ts> invoked-at=<ts>"
+        )
+    );
+    let state = dstate::load_state(&dir);
+    let times = [
+        state.items[&key].accepted_at.clone().unwrap(),
+        state.last_delivery.as_ref().unwrap().invoked_at.clone(),
+        state.woken.as_ref().unwrap().at.clone(),
+    ];
+    assert_eq!(
+        masked_state(&dir, &times.iter().map(String::as_str).collect::<Vec<_>>()),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"session\": \"s2\",\n",
+                "  \"last_delivery\": {{\n",
+                "    \"session\": \"s2\",\n",
+                "    \"invoked_at\": \"<ts>\"\n",
+                "  }},\n",
+                "  \"items\": {{\n",
+                "    \"{key}\": {{\n",
+                "      \"phase\": \"done\",\n",
+                "      \"accepted_at\": \"<ts>\"\n",
+                "    }}\n",
+                "  }},\n",
+                "  \"woken\": {{\n",
+                "    \"at\": \"<ts>\",\n",
+                "    \"key\": \"{key}\"\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            key = key
+        )
+    );
+    assert_eq!(
+        hub.journal(),
+        vec![
+            "POST /api/auth".to_string(),
+            "GET /api/sessions/s2".to_string(),
+            format!("POST /api/sessions/s2/messages"),
+            format!("POST-MSG s2 {key}"),
+            "POST /api/sessions/s2/messages/queued-state".to_string(),
+            "GET /api/sessions/s2".to_string(),
+        ]
+    );
+    assert_eq!(
+        (
+            n_files(&root, "opus", "inbox"),
+            n_files(&root, "opus", "draining"),
+            n_files(&root, "opus", "archive")
+        ),
+        (0, 0, 1)
+    );
+}
+
+/// The failed wake's complete outputs, both shapes: `busy` leaves
+/// the record byte-identical and writes exactly one failure line;
+/// `up` records the hold beside the mark with the script's full
+/// reason. Neither ever reaches the hub.
+#[test]
+fn failed_and_up_wake_passes_full_outputs_are_pinned() {
+    let root = board_with(&[]);
+    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "bll", "sb", None, None, Vec::new(), None).unwrap();
+    let body = r#"
+[ "$1" = "wake" ] || { echo "stub: expected wake, got $*" >&2; exit 9; }
+if [ "$2" = "opus" ]; then
+  printf '%s' '{"status":"busy"}'
+else
+  printf '%s' '{"status":"up","reason":"pane is up; no phone session yet"}'
+fi
+"#;
+    let kit_dir = stub_kit(
+        "wake-fail-pin",
+        Some(r#"{"seats":{"opus":{"role":"opus"},"bll":{"role":"bll"}}}"#),
+        Some(body),
+    );
+    let hub = FakeHub::start();
+    let mut client = Hub::new(hub.config());
+    let _env = lock_env(&[
+        ("PATH", path_with(&kit_dir)),
+        ("SEAT_KIT", OsString::from("")),
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+        (
+            "SEAT_FAKE_STATE",
+            OsString::from(root.join("tmux.state").display().to_string()),
+        ),
+    ]);
+    let stored = dstate::DispatchState {
+        asleep: Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        }),
+        ..Default::default()
+    };
+    for seat in ["opus", "bll"] {
+        dstate::store_state(&seat::seat_dir(&root, seat), &stored).unwrap();
+        send(&root, seat, "still sleeping");
+    }
+
+    // busy: blocked, the record never moved, one line.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    let opus_dir = seat::seat_dir(&root, "opus");
+    let before = std::fs::read_to_string(opus_dir.join("dispatch.json")).unwrap();
+    assert_eq!(
+        masked_state(&opus_dir, &[]),
+        before,
+        "busy wrote nothing to the record"
+    );
+    assert_eq!(n_files(&root, "opus", "inbox"), 1);
+    assert_eq!(n_files(&root, "opus", "archive"), 0);
+
+    // up: blocked, the hold recorded beside the mark.
+    assert_eq!(
+        dispatch::pass_seat(&root, "bll", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    let bll_dir = seat::seat_dir(&root, "bll");
+    let hold_at = dstate::load_state(&bll_dir).wake_hold.unwrap().at;
+    assert_eq!(
+        masked_state(&bll_dir, &[hold_at.as_str()]),
+        concat!(
+            "{\n",
+            "  \"items\": {},\n",
+            "  \"asleep\": {\n",
+            "    \"at\": \"2026-10-23T00:00:00Z\",\n",
+            "    \"reason\": \"idle 30m\"\n",
+            "  },\n",
+            "  \"wake_hold\": {\n",
+            "    \"at\": \"<ts>\",\n",
+            "    \"reason\": \"seat-role wake bll answered up: pane is up; no phone session yet\"\n",
+            "  }\n",
+            "}\n"
+        )
+    );
+    assert_eq!(
+        masked_log(&root),
+        "<ts> failure seat=opus wake failed: seat-role wake opus answered busy; mail stays in the inbox\n\
+         <ts> failure seat=bll wake failed: seat-role wake bll answered up: pane is up; no phone session yet; \
+         mail stays in the inbox while the pane stands"
+    );
+    assert!(
+        hub.journal().is_empty(),
+        "neither wake ever reached the hub: {:?}",
+        hub.journal()
+    );
+    assert_eq!(n_files(&root, "bll", "inbox"), 1);
+    assert_eq!(n_files(&root, "bll", "archive"), 0);
+}
+
+/// The remaining asleep-preamble paths' complete outputs: a held
+/// wake neither logs nor writes while its pane stands, re-arms and
+/// delivers once the pane is verifiably gone; a completed sleep with
+/// a live pane back ends itself with a fresh pane fact and no line;
+/// a completed sleep with no pane and no mail changes nothing at
+/// all; a pending sleep whose pane was replaced cancels with one
+/// sleep line and an empty record.
+#[test]
+fn held_wake_resume_and_settle_passes_full_outputs_are_pinned() {
+    let root = board_with(&[]); // the wake stub writes the binding
+    for seat in ["opus", "bll", "cat", "dog"] {
+        verbs::cmd_register(
+            &root,
+            seat,
+            "sb",
+            None,
+            Some(root.display().to_string()),
+            vec!["/bin/sleep".into(), "30".into()],
+            None,
+        )
+        .unwrap();
+    }
+    let counter = root.join("wake-calls");
+    let body = r#"
+[ "$1" = "wake" ] && [ "$2" = "opus" ] || { echo "stub: expected wake opus, got $*" >&2; exit 9; }
+n=$(cat 'COUNT' 2>/dev/null || echo 0)
+n=$((n+1))
+echo "$n" > 'COUNT'
+if [ "$n" -ge 2 ]; then
+  printf '%s\n' '{"schema_version":1,"seats":{"opus":{"url":"https://hapi.bll.dev/sessions/s2","moved_at":"2026-10-23T12:00:00Z"}}}' > 'ROOT/hapi-sessions.json'
+  printf '%s' '{"status":"awake","url":"https://hapi.bll.dev/sessions/s2"}'
+else
+  printf '%s' '{"status":"up","reason":"opus runs in its terminal resuming an old session; no phone session yet"}'
+fi
+"#
+    .replace("COUNT", &counter.display().to_string())
+    .replace("ROOT", &root.display().to_string());
+    let kit_dir = stub_kit(
+        "wake-preamble-pin",
+        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(&body),
+    );
+    let hub = FakeHub::start();
+    hub.ctl.lock().unwrap().sessions.insert("s2".into(), true);
+    let mut client = Hub::new(hub.config());
+    let _env = lock_env(&[
+        ("PATH", path_with(&kit_dir)),
+        ("SEAT_KIT", OsString::from("")),
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+        (
+            "SEAT_FAKE_STATE",
+            OsString::from(root.join("tmux.state").display().to_string()),
+        ),
+    ]);
+    let calls = || {
+        std::fs::read_to_string(&counter)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let opus_dir = seat::seat_dir(&root, "opus");
+    dstate::store_state(
+        &opus_dir,
+        &dstate::DispatchState {
+            asleep: Some(dstate::Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    send(&root, "opus", "wake up");
+    let key = only_key(&root, "opus");
+    mark(&hub, &key, "invoked");
+
+    // The up answer: one failure line, the hold recorded, mail kept.
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(calls(), "1");
+    let up_line = "<ts> failure seat=opus wake failed: seat-role wake opus answered up: \
+opus runs in its terminal resuming an old session; no phone session yet; \
+mail stays in the inbox while the pane stands";
+    assert_eq!(masked_log(&root), up_line);
+    let held = std::fs::read_to_string(opus_dir.join("dispatch.json")).unwrap();
+
+    // The pane the script started stands: no line, no write, no call.
+    crate::session::cmd_up(&root, &["opus".to_string()]).unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Blocked
+    );
+    assert_eq!(calls(), "1", "the script was not called again");
+    assert_eq!(masked_log(&root), up_line, "the hold is not re-reported");
+    assert_eq!(
+        std::fs::read_to_string(opus_dir.join("dispatch.json")).unwrap(),
+        held,
+        "the held pass wrote nothing"
+    );
+
+    // The pane verifiably gone: the wake re-arms and now delivers.
+    crate::session::cmd_down(&root, &["opus".to_string()]).unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered
+    );
+    assert_eq!(calls(), "2", "the pane gone re-armed the wake");
+    assert_eq!(
+        masked_log(&root),
+        format!(
+            "{up_line}\n\
+             <ts> wake seat=opus seat-role wake answered awake\n\
+             <ts> delivered seat=opus key={key} accepted-at=<ts> invoked-at=<ts>"
+        )
+    );
+    let state = dstate::load_state(&opus_dir);
+    let times = [
+        state.items[&key].accepted_at.clone().unwrap(),
+        state.last_delivery.as_ref().unwrap().invoked_at.clone(),
+        state.woken.as_ref().unwrap().at.clone(),
+    ];
+    assert_eq!(
+        masked_state(&opus_dir, &times.iter().map(String::as_str).collect::<Vec<_>>()),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"session\": \"s2\",\n",
+                "  \"last_delivery\": {{\n",
+                "    \"session\": \"s2\",\n",
+                "    \"invoked_at\": \"<ts>\"\n",
+                "  }},\n",
+                "  \"items\": {{\n",
+                "    \"{key}\": {{\n",
+                "      \"phase\": \"done\",\n",
+                "      \"accepted_at\": \"<ts>\"\n",
+                "    }}\n",
+                "  }},\n",
+                "  \"woken\": {{\n",
+                "    \"at\": \"<ts>\",\n",
+                "    \"key\": \"{key}\"\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            key = key
+        )
+    );
+    assert_eq!(
+        hub.journal(),
+        vec![
+            "POST /api/auth".to_string(),
+            "GET /api/sessions/s2".to_string(),
+            "POST /api/sessions/s2/messages".to_string(),
+            format!("POST-MSG s2 {key}"),
+            "POST /api/sessions/s2/messages/queued-state".to_string(),
+            "GET /api/sessions/s2".to_string(),
+        ],
+        "only the delivering pass reached the hub"
+    );
+    assert_eq!(n_files(&root, "opus", "archive"), 1);
+    let after_delivery = masked_log(&root);
+
+    // A completed sleep with a live pane back beside the mark: the
+    // sleep ends itself, the pane fact starts fresh, no line at all.
+    let bll_dir = seat::seat_dir(&root, "bll");
+    dstate::store_state(
+        &bll_dir,
+        &dstate::DispatchState {
+            asleep: Some(dstate::Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::session::cmd_up(&root, &["bll".to_string()]).unwrap();
+    let bll_pane = crate::session::live_pane_id("bll")
+        .expect("the fake multiplexer answers")
+        .expect("bll's pane is up");
+    assert_eq!(
+        dispatch::pass_seat(&root, "bll", &mut client).unwrap(),
+        Pass::Idle
+    );
+    assert_eq!(masked_log(&root), after_delivery, "the resume logs nothing");
+    let seen_at = dstate::load_state(&bll_dir).pane_seen_at.unwrap();
+    assert_eq!(
+        masked_state(&bll_dir, &[seen_at.as_str()]),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"items\": {{}},\n",
+                "  \"pane_seen_at\": \"<ts>\",\n",
+                "  \"pane_id\": \"{pane}\"\n",
+                "}}\n"
+            ),
+            pane = bll_pane
+        )
+    );
+
+    // A completed sleep with no pane and no mail: nothing at all.
+    let cat_dir = seat::seat_dir(&root, "cat");
+    let cat_state = dstate::DispatchState {
+        asleep: Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        }),
+        ..Default::default()
+    };
+    dstate::store_state(&cat_dir, &cat_state).unwrap();
+    let cat_before = std::fs::read_to_string(cat_dir.join("dispatch.json")).unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "cat", &mut client).unwrap(),
+        Pass::Idle
+    );
+    assert_eq!(masked_log(&root), after_delivery, "the quiet pass logs nothing");
+    assert_eq!(
+        std::fs::read_to_string(cat_dir.join("dispatch.json")).unwrap(),
+        cat_before,
+        "the quiet pass wrote nothing"
+    );
+
+    // A pending sleep whose pane was replaced: the settlement
+    // cancels with one sleep line and an empty record.
+    let dog_dir = seat::seat_dir(&root, "dog");
+    dstate::store_state(
+        &dog_dir,
+        &dstate::DispatchState {
+            pane_seen_at: Some("2026-10-22T00:00:00Z".into()),
+            pane_id: Some("%0".into()), // never a live id: ids start at %1
+            asleep: Some(dstate::Asleep {
+                at: "2026-10-23T00:00:00Z".into(),
+                reason: "idle 30m".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::session::cmd_up(&root, &["dog".to_string()]).unwrap();
+    assert_eq!(
+        dispatch::pass_seat(&root, "dog", &mut client).unwrap(),
+        Pass::Idle
+    );
+    assert_eq!(
+        masked_log(&root),
+        format!(
+            "{after_delivery}\n\
+             <ts> sleep seat=dog reason=idle 30m cancelled=1 cause=pane-replaced"
+        )
+    );
+    assert_eq!(
+        masked_state(&dog_dir, &[]),
+        concat!("{\n", "  \"items\": {}\n", "}\n"),
+        "the cancel cleared every fact"
+    );
+}
+
 /// seat-role fixes its board at `<SEAT_ROLE_HOME>/.local/share/seat`
 /// and calls `seat up` with no `--root`, so a dispatcher on any other
 /// board could sleep a seat whose wake would rewrite another board's

@@ -4,12 +4,16 @@
 //! wakes it through `kit/scripts/seat-role wake <role>`. The script
 //! is called, never reimplemented, and this crate never writes
 //! `hapi-sessions.json` — the script is its only writer.
-use crate::dstate::{self, DispatchState};
+use crate::alarm;
+use crate::dispatch::Pass;
+use crate::dstate::{self, direct_key, DispatchState, Phase, WakeHold, Woken};
 use crate::error::Result;
 use crate::hub::Hub;
 use crate::identity::Bindings;
+use crate::msg;
 use crate::seat;
 use crate::webhook;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -151,6 +155,147 @@ pub(crate) fn wake_seat(root: &Path, seat: &str) -> WakeOutcome {
         ));
     }
     WakeOutcome::Awake
+}
+
+/// The asleep-seat preamble of one hapi pass (`pass_seat`'s first
+/// act): settle a pending sleep, end a completed one, hold or re-arm
+/// a held wake, and wake a seat with mail to deliver. `Some(pass)`
+/// ends the pass there with that verdict; `None` — the seat is
+/// awake, or never slept — runs the rest of the pass, which re-reads
+/// the binding itself, after any wake rewrote it.
+pub(crate) fn asleep_preamble(
+    root: &Path,
+    seat: &str,
+    state: &mut DispatchState,
+    hub: &mut Hub,
+) -> Result<Option<Pass>> {
+    let dir = seat::seat_dir(root, seat);
+    // An asleep seat: nothing owed means nothing to do. A pane fact
+    // beside the mark is a sleep whose kill never landed — a crash or
+    // a failed kill between recording the sleep and stopping the pane
+    // — settled first, before anything else (the wake needs the pane
+    // down, and the settlement decides whether this pane is still the
+    // one to kill). A pane that came back after a completed sleep has
+    // no pane fact: the early return below ends the sleep — the mark
+    // clears and that pane starts a fresh clock.
+    if state.asleep.is_some() && state.pane_seen_at.is_some() {
+        settle_pending_sleep(root, seat, state, hub)?;
+        // The settlement cancelled the sleep and logged its line: no
+        // binding and no owed mail means nothing staged and nothing
+        // to deliver — end the pass clean, not with the failure below.
+        if state.asleep.is_none()
+            && Bindings::load(root).session_id(seat).is_none()
+            && webhook::present_files(&dir).is_empty()
+        {
+            return Ok(Some(Pass::Idle));
+        }
+    }
+    if state.asleep.is_some() {
+        let owed = webhook::present_files(&dir);
+        alarm::undelivered(root, seat, &BTreeSet::new(), &owed)?;
+        let in_flight = state.items.values().any(|i| i.phase != Phase::Done);
+        if owed.is_empty() && !in_flight {
+            // A completed sleep (the pane fact is already clear) with
+            // a live pane back beside the mark: someone brought the
+            // seat back — `seat up`, a resume. The sleep is over: the
+            // mark clears, this pane starts a fresh clock on its own
+            // id, and it is never killed for the old decision.
+            if state.pane_seen_at.is_none() {
+                if let Some(Some(id)) = crate::session::live_pane_id(seat) {
+                    state.asleep = None;
+                    state.wake_hold = None;
+                    state.pane_seen_at = Some(seat::now_ts());
+                    state.pane_id = Some(id);
+                    dstate::store_state(&dir, state)?;
+                }
+            }
+            return Ok(Some(Pass::Idle));
+        }
+        // The script's `up` answer holds the wake: while the pane it
+        // started stands the script is not called again — `up` means
+        // stop calling — and only a pane that is verifiably gone
+        // re-arms it. `busy`, `refused`, and `failed` stay next-pass
+        // retries (the failure line was written when the hold was).
+        if state.wake_hold.is_some()
+            && crate::session::live_pane_id(seat).map(|id| id.is_some()) != Some(false)
+        {
+            return Ok(Some(Pass::Blocked));
+        }
+        if state.wake_hold.is_some() {
+            state.wake_hold = None; // the pane is gone: the wake may run again
+            dstate::store_state(&dir, state)?;
+        }
+        let key = wake_key(&dir, seat, state);
+        match wake_seat(root, seat) {
+            WakeOutcome::Awake => {
+                state.asleep = None;
+                state.wake_hold = None;
+                state.woken = Some(Woken {
+                    at: seat::now_ts(),
+                    key,
+                });
+                dstate::store_state(&dir, state)?; // before any POST
+                dstate::log_line(root, "wake", seat, "seat-role wake answered awake");
+            }
+            // busy, refused, failed, or no binding after it: the seat
+            // stays asleep, the item stays in the inbox, and the next
+            // scan retries (the failure is reported like an
+            // undelivered item, naming the script's reason).
+            WakeOutcome::Failed(reason) => {
+                dstate::log_line(
+                    root,
+                    "failure",
+                    seat,
+                    &format!("wake failed: {reason}; mail stays in the inbox"),
+                );
+                return Ok(Some(Pass::Blocked));
+            }
+            // The script's `up`: a pane runs with no phone session.
+            // The seat stays asleep, the mail stays, and the wake is
+            // held — not retried — until that pane is verifiably gone.
+            WakeOutcome::Up(reason) => {
+                state.wake_hold = Some(WakeHold {
+                    at: seat::now_ts(),
+                    reason: reason.clone(),
+                });
+                dstate::store_state(&dir, state)?;
+                dstate::log_line(
+                    root,
+                    "failure",
+                    seat,
+                    &format!(
+                        "wake failed: {reason}; mail stays in the inbox while the pane stands"
+                    ),
+                );
+                return Ok(Some(Pass::Blocked));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The delivery key that woke an asleep seat: its oldest present
+/// mail (the wake runs before `receive`, so the mail is still in the
+/// inbox), else the oldest in-flight key.
+fn wake_key(dir: &Path, seat: &str, state: &DispatchState) -> String {
+    if let Some(first) = msg::list_msg_dir(&dir.join("inbox"))
+        .unwrap_or_default()
+        .first()
+    {
+        return direct_key(
+            seat,
+            first
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+        );
+    }
+    state
+        .items
+        .iter()
+        .find(|(_, i)| i.phase != Phase::Done)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default()
 }
 
 /// The board the kit's wake script writes: seat-role fixes its binding
