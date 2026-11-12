@@ -540,11 +540,19 @@ mod tests {
         assert!(tries.load(Ordering::SeqCst) >= 2);
     }
 
-    /// On timeout, the caller's message is the failure (the failure
-    /// path every waiter inherits).
+    /// On timeout, the caller's message is the whole panic payload,
+    /// not a substring of it (the failure path every waiter
+    /// inherits).
     #[test]
-    #[should_panic(expected = "waited 3s and it never came")]
     fn wait_for_fails_with_the_callers_message_on_timeout() {
-        wait_for(|| false, "waited 3s and it never came");
+        let payload = std::panic::catch_unwind(|| {
+            wait_for(|| false, "waited 3s and it never came");
+        })
+        .expect_err("the 3s deadline must fail the waiter");
+        let printed = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        assert_eq!(printed, Some("waited 3s and it never came"));
     }
 }
