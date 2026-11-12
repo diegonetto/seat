@@ -16,6 +16,8 @@ mod sleep;
 #[cfg(test)]
 mod testutil;
 mod verbs;
+#[cfg(test)]
+mod verbs_tests;
 mod webhook;
 #[cfg(test)]
 mod webhook_tests;
