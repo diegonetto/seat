@@ -220,12 +220,21 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Atomic private write of serialized JSON (see
+/// `atomic_write_private`): the caller's serialization — pretty or
+/// compact, each file's own choice — plus exactly one trailing
+/// newline. Every JSON state file on the board goes through here:
+/// `write_meta` and `dstate::store_state` pretty, `alarm::store` and
+/// `webhook::save_id_list` compact.
+pub(crate) fn atomic_write_json(path: &Path, mut json: String) -> Result<()> {
+    json.push('\n');
+    atomic_write_private(path, json.as_bytes())
+}
+
 /// Write meta.json atomically. This takes no lock; the locked
 /// read-modify-write is `update_meta`.
 pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
-    let mut json = serde_json::to_string_pretty(meta)?.into_bytes();
-    json.push(b'\n');
-    atomic_write_private(&meta_path(dir), &json)
+    atomic_write_json(&meta_path(dir), serde_json::to_string_pretty(meta)?)
 }
 
 /// Read-modify-write meta.json under the per-seat metadata lock. Every
@@ -304,6 +313,44 @@ mod tests {
         let raw = std::fs::read_to_string(meta_path(&dir)).unwrap();
         assert!(!raw.contains("lifecycle"), "raw meta: {raw}");
         assert!(!raw.contains("session"), "raw meta: {raw}");
+    }
+
+    #[test]
+    fn write_meta_pins_the_full_file_bytes() {
+        let root = temp_root("seat-meta-bytes");
+        board::init(&root).unwrap();
+        let dir = create(&root, "alpha").unwrap();
+        write_meta(
+            &dir,
+            &Meta {
+                harness: "h".into(),
+                model: Some("m".into()),
+                last_seen: Some("t0".into()),
+                last_drained: Some("t1".into()),
+                cwd: Some("/w".into()),
+                cmd: Some(vec!["/bin/sleep".into(), "9".into()]),
+                idle_after: Some("30m".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(meta_path(&dir)).unwrap(),
+            concat!(
+                "{\n",
+                "  \"harness\": \"h\",\n",
+                "  \"model\": \"m\",\n",
+                "  \"last_seen\": \"t0\",\n",
+                "  \"last_drained\": \"t1\",\n",
+                "  \"cwd\": \"/w\",\n",
+                "  \"cmd\": [\n",
+                "    \"/bin/sleep\",\n",
+                "    \"9\"\n",
+                "  ],\n",
+                "  \"idle_after\": \"30m\"\n",
+                "}\n",
+            ),
+            "pretty JSON, every field in order, exactly one trailing newline"
+        );
     }
 
     #[test]

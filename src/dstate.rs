@@ -128,11 +128,9 @@ pub fn load_state(dir: &Path) -> DispatchState {
         .unwrap_or_default()
 }
 
-/// Atomic state write (see `seat::atomic_write_private`).
+/// Atomic state write (see `seat::atomic_write_json`).
 pub fn store_state(dir: &Path, state: &DispatchState) -> Result<()> {
-    let mut json = serde_json::to_string_pretty(state)?.into_bytes();
-    json.push(b'\n');
-    seat::atomic_write_private(&dir.join(STATE_FILE), &json)
+    seat::atomic_write_json(&dir.join(STATE_FILE), serde_json::to_string_pretty(state)?)
 }
 
 /// Status's `awake`: dispatch.json records a delivery to this seat's
