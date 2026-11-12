@@ -1593,10 +1593,8 @@ fn a_second_dispatcher_exits_nonzero_while_the_first_holds_the_lock() {
 
 // ---- sleep and wake -------------------------------------------------
 
-// lock_env — the one RAII env guard, in testutil beside ENV_LOCK —
-// holds the process-wide lock and restores on drop every variable it
-// touched, even on panic; the lock_env_* characterizations below pin
-// that restoration.
+// lock_env now lives in testutil, beside ENV_LOCK; the lock_env_*
+// characterizations below pin its restoration.
 
 /// `lock_env` restores what it borrowed on a plain return: a variable
 /// that had a value reads as that value again, one that was absent is

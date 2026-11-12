@@ -97,9 +97,7 @@ impl Drop for EnvGuard {
 
 /// Hold ENV_LOCK for the caller's scope and set each variable,
 /// restoring the previous value (or absence) of every one on drop,
-/// even on panic. The stubs a test installs are visible to every
-/// subprocess this process spawns, so they never run beside a test
-/// that reads them.
+/// even on panic.
 pub fn lock_env(vars: &[(&'static str, OsString)]) -> EnvGuard {
     let lock = env_lock();
     let mut env = EnvGuard {

@@ -268,8 +268,7 @@ mod tests {
     #[test]
     fn resolve_root_prefers_explicit_then_env_over_default() {
         // One test touches the root environment; every other test
-        // passes roots in. The guard holds ENV_LOCK and restores the
-        // inherited value (or absence) on drop, even on panic.
+        // passes roots in.
         let thrown = temp_root("board-env");
         let mut env = lock_env(&[]);
         env.unset("SEAT_ROOT");
