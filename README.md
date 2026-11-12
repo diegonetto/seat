@@ -276,7 +276,7 @@ empty.
 
 ```
 <root>/marker                 the literal seat
-<root>/seats/<name>/          meta.json, token, inbox/, archive/
+<root>/seats/<name>/          meta.json, token, inbox/, draining/, archive/
 <root>/alarm-seat             the seat alarms are mailed to (one line;
                               absent or empty: the log line only)
 <root>/dispatch.lock          one dispatcher per board (non-blocking)
