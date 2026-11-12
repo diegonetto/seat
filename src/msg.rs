@@ -109,8 +109,7 @@ fn token_key(token_hex: &str) -> Result<Vec<u8>> {
 
 /// HMAC-SHA256 **full** hex digest (64 chars), keyed by the sender
 /// token, over the header's own fields — the `hmac` field it carries
-/// is ignored; this mints it. The session fed to the MAC's id slot is
-/// the header's `session` field, absent meaning the legacy form.
+/// is ignored; this mints it.
 pub fn compute_hmac(token_hex: &str, header: &Header, body: &[u8]) -> Result<String> {
     let key = token_key(token_hex)?;
     let mut mac =
@@ -193,13 +192,11 @@ pub fn write_msg(
             "session id {s:?} is not 1-64 characters of [A-Za-z0-9-]"
         )));
     }
-    let ts = now_ts();
-    let id = new_id()?;
     let mut header = Header {
         dest: dest.to_string(),
         from: from.to_string(),
-        id,
-        ts,
+        id: new_id()?,
+        ts: now_ts(),
         hmac: String::new(),
         session: session.map(str::to_string),
     };
