@@ -514,7 +514,9 @@ fn backoff_characterization_queued_worker() {
         );
         assert_eq!(*sleeps.borrow(), expected.map(Duration::from_millis));
         let mut journal = vec!["POST /api/auth".to_string()];
-        for _ in expected {
+        // Stop is checked after each pass, so stopping in the last sleep
+        // still lets one final pass complete.
+        for _ in 0..=expected.len() {
             journal.extend([
                 "GET /api/sessions/s1".into(),
                 "POST /api/sessions/s1/messages/queued-state".into(),
