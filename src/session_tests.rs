@@ -577,3 +577,25 @@ fn up_failure_message_pins_the_tmux_ok_refusal() {
         format!("tmux: `{prog} kill-pane -t %999` failed: fake-tmux: no such pane: %999")
     );
 }
+
+/// A seat directory with no meta.json counts as registered by the
+/// listing; reading its launch is UnknownSeat in full — both in
+/// preflight and in the bare `up` that walks every registered
+/// seat. Both error before any multiplexer call.
+#[test]
+fn up_names_a_registered_seat_without_meta_in_full() {
+    let root = temp_root("session-up-ghost");
+    board::init(&root).unwrap();
+    std::fs::create_dir_all(root.join("seats").join("ghost")).unwrap();
+    assert_eq!(
+        preflight(&root, "ghost")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string(),
+        "seat ghost is not registered on this board"
+    );
+    assert_eq!(
+        cmd_up(&root, &[]).unwrap_err().to_string(),
+        "seat ghost is not registered on this board"
+    );
+}

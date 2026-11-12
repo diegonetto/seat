@@ -740,3 +740,24 @@ fn unbound_omitted_from_to_a_non_factory_seat_is_refused() {
     }
     assert!(cmd_send(&bare, None, "alpha", "no file", None).is_err());
 }
+
+/// The send error wordings, pinned in full: a sender whose token
+/// is missing is GhostSeat; a destination whose meta is missing is
+/// UnknownSeat — the same name, two different named errors.
+#[test]
+fn send_names_a_ghost_sender_and_an_unknown_destination_in_full() {
+    let root = setup();
+    cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+    assert_eq!(
+        cmd_send(&root, Some("ghost"), "alpha", "hi", None)
+            .unwrap_err()
+            .to_string(),
+        "seat ghost has no token on this board"
+    );
+    assert_eq!(
+        cmd_send(&root, Some("alpha"), "ghost", "hi", None)
+            .unwrap_err()
+            .to_string(),
+        "seat ghost is not registered on this board"
+    );
+}

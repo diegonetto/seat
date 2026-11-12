@@ -369,7 +369,12 @@ mod tests {
     fn drain_of_unknown_or_corrupt_seat_refuses() {
         let root = setup();
         let (r, _) = drain_str(&root, "ghost");
-        assert!(r.is_err());
+        // Drain reads meta at the storage level, so it keeps the
+        // GhostSeat wording; read_meta_named callers get UnknownSeat.
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "seat ghost has no token on this board"
+        );
         std::fs::create_dir_all(root.join("seats").join("broken")).unwrap();
         std::fs::write(
             root.join("seats").join("broken").join("meta.json"),

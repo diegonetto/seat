@@ -127,10 +127,7 @@ pub fn send(
     let from = who.from.as_str();
     valid_name(from)?;
     valid_name(to)?;
-    seat::read_meta(&seat::seat_dir(root, to)).map_err(|e| match e {
-        SeatError::GhostSeat(_) => SeatError::UnknownSeat(to.to_string()),
-        other => other,
-    })?;
+    seat::read_meta_named(root, to)?;
     let token = sender_token(root, from)?;
     let (_, header) = msg::write_msg(
         &seat::seat_dir(root, to).join("inbox"),

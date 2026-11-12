@@ -159,10 +159,7 @@ struct Launch {
 /// Start-time checks for one target: a non-empty command, a
 /// stored absolute directory, and a directory that is a directory.
 fn preflight(root: &Path, name: &str) -> Result<Launch> {
-    let meta = seat::read_meta(&seat::seat_dir(root, name)).map_err(|e| match e {
-        SeatError::GhostSeat(_) => SeatError::UnknownSeat(name.to_string()),
-        other => other,
-    })?;
+    let meta = seat::read_meta_named(root, name)?;
     let cmd = meta
         .cmd
         .filter(|c| !c.is_empty())
@@ -262,10 +259,7 @@ pub fn cmd_up(root: &Path, names: &[String]) -> Result<()> {
         // targets; mail-only seats are not mentioned and not errors.
         let mut with_cmd = Vec::new();
         for name in &registered {
-            let meta = seat::read_meta(&seat::seat_dir(root, name)).map_err(|e| match e {
-                SeatError::GhostSeat(_) => SeatError::UnknownSeat(name.clone()),
-                other => other,
-            })?;
+            let meta = seat::read_meta_named(root, name)?;
             if meta.cmd.as_ref().is_some_and(|c| !c.is_empty()) {
                 with_cmd.push(name.clone());
             }
