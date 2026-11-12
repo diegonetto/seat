@@ -678,6 +678,35 @@ mod tests {
             !verify_msg(&write(WITH_SESSION, None, "hello board"), &token).unwrap(),
             "a session claim does not cover a sessionless header"
         );
+        // Signing, not just verification: `compute_hmac`'s complete
+        // output is exactly the external digests — the published
+        // bytes, not a round trip or a shape — for the absent session
+        // (plain and BOM'd body alike) and the present session.
+        let sessionless = head("beta", "alpha", "ab12cd34", "20261112T000000.000000", None);
+        assert_eq!(
+            compute_hmac(&token, &sessionless, b"hello board").unwrap(),
+            NO_SESSION
+        );
+        assert_eq!(
+            compute_hmac(&token, &sessionless, "\u{feff}hello board".as_bytes()).unwrap(),
+            NO_SESSION,
+            "the BOM is stripped from the signing input"
+        );
+        assert_eq!(
+            compute_hmac(
+                &token,
+                &head(
+                    "beta",
+                    "alpha",
+                    "ab12cd34",
+                    "20261112T000000.000000",
+                    Some("sess-42")
+                ),
+                b"hello board"
+            )
+            .unwrap(),
+            WITH_SESSION
+        );
     }
 
     /// A malformed MAC claim is decided before the sender token is
