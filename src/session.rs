@@ -68,16 +68,23 @@ fn tmux_attach(prog: &str, target: &str) -> Result<()> {
     )))
 }
 
+/// The one wording for a refused multiplexer call: the command line
+/// as issued and tmux's own complaint from stderr. Each caller wraps
+/// it in the error variant its reader expects.
+fn tmux_failure_line(prog: &str, args: &[&str], stderr: &[u8]) -> String {
+    format!(
+        "`{} {}` failed: {}",
+        prog,
+        args.join(" "),
+        String::from_utf8_lossy(stderr).trim()
+    )
+}
+
 /// Run tmux and refuse to continue when it fails.
 fn tmux_ok(prog: &str, args: &[&str]) -> Result<std::process::Output> {
     let out = tmux(prog, args)?;
     if !out.status.success() {
-        return Err(SeatError::Tmux(format!(
-            "`{} {}` failed: {}",
-            prog,
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(SeatError::Tmux(tmux_failure_line(prog, args, &out.stderr)));
     }
     Ok(out)
 }
@@ -202,12 +209,7 @@ fn start_seat(prog: &str, seat_name: &str, launch: &Launch, have_session: &mut b
     if !out.status.success() {
         return Err(SeatError::StartFailed(
             seat_name.to_string(),
-            format!(
-                "`{} {}` failed: {}",
-                prog,
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
+            tmux_failure_line(prog, &args, &out.stderr),
         ));
     }
     *have_session = true;
@@ -1072,6 +1074,70 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.seat == "nope"));
+
+        std::env::remove_var("SEAT_TMUX");
+        std::env::remove_var("SEAT_FAKE_STATE");
+    }
+
+    /// A refused multiplexer call inside `up` names the seat and the
+    /// full command line it tried: the complete `StartFailed` message,
+    /// byte for byte (the spawn refusal in start_seat).
+    #[test]
+    fn up_failure_message_pins_the_start_seat_refusal() {
+        let _guard = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = temp_root("session-fail-line");
+        board::init(&root).unwrap();
+        let cwd = root.display().to_string();
+        verbs::cmd_register(
+            &root,
+            "nope",
+            "sb",
+            None,
+            Some(cwd.clone()),
+            vec!["seat-fail".to_string()],
+            None,
+        )
+        .unwrap();
+        let state = root.join("tmux.state");
+        std::env::set_var("SEAT_TMUX", fake_tmux());
+        std::env::set_var("SEAT_FAKE_STATE", &state);
+
+        let prog = fake_tmux();
+        let err = cmd_up(&root, &["nope".to_string()]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "up: seat nope did not start: `{prog} new-session -d -s swarm -n nope \
+                 -c {cwd} -P -F #{{pane_id}} -- /usr/bin/env -- seat-fail` failed: \
+                 fake-tmux: launch refused: seat-fail"
+            )
+        );
+
+        std::env::remove_var("SEAT_TMUX");
+        std::env::remove_var("SEAT_FAKE_STATE");
+    }
+
+    /// The same refusal wording, in its other wrapper: a tmux call
+    /// that fails outside a seat start is `Tmux`, complete message
+    /// byte for byte (the check in tmux_ok).
+    #[test]
+    fn up_failure_message_pins_the_tmux_ok_refusal() {
+        let _guard = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = temp_root("session-fail-line-ok");
+        let state = root.join("tmux.state");
+        std::env::set_var("SEAT_TMUX", fake_tmux());
+        std::env::set_var("SEAT_FAKE_STATE", &state);
+
+        let prog = fake_tmux();
+        let err = tmux_ok(&prog, &["kill-pane", "-t", "%999"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("tmux: `{prog} kill-pane -t %999` failed: fake-tmux: no such pane: %999")
+        );
 
         std::env::remove_var("SEAT_TMUX");
         std::env::remove_var("SEAT_FAKE_STATE");
