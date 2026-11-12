@@ -52,7 +52,7 @@ note() {
 S="$SEAT"
 R="$ROOT"
 
-## quickstart step 1: fresh drain (SC-002) ----------------------------
+## quickstart step 1: fresh drain ----------------------------------------
 "$S" --root "$R" init >/dev/null 2>&1;               note $? "init"
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
                                                       note $? "register A"
@@ -74,7 +74,7 @@ out="$("$S" --root "$R" drain --seat A 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "reply seat"
                                                       note $? "drain A returns the reply"
 
-## quickstart step 4: bad mark (FR-012) -------------------------------
+## quickstart step 4: bad mark -------------------------------------------
 "$S" --root "$R" send --from A B "tamper target" >/dev/null 2>&1
                                                      note $? "send a message to tamper with"
 f="$(ls "$R/seats/B/inbox" | sort | tail -1)"
@@ -99,9 +99,9 @@ grep -qF "from 'A'" "$R/drain-utf8.err";             note $? "non-utf8 body name
 [ "$(grep -cF "from 'A'" "$R/drain-utf8.err")" -eq 1 ]
                                                      note $? "claimed from is named once"
 
-## quickstart step 5: session (SC-005) --------------------------------
+## quickstart step 5: session ---------------------------------------------
 # A fresh root, the fake multiplexer behind SEAT_TMUX, and no mail
-# anywhere: this step never sends and never drains (US2 is mail-free).
+# anywhere: this step never sends and never drains (mail-free).
 SMOKE_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAKE="$SMOKE_DIR/fake-tmux.sh"
 if [ ! -x "$FAKE" ]; then
@@ -160,7 +160,7 @@ out="$(tm4 down)"; rc=$?
 out="$(tm4 gallery)"; [ "$out" = "gallery: empty" ]
                                                    note $? "down with no names stops every seat"
 
-## quickstart step 6: status (SC-004) ----------------------------------
+## quickstart step 6: status -----------------------------------------------
 # A fresh root with three seats in three states: runner stays up,
 # fresh is never started with an empty inbox, parked is stopped with
 # unread mail. Only runner may appear in gallery.
@@ -233,9 +233,9 @@ out="$("$S" --root "$R5" dispatch --once 2>&1)"; rc=$?
 "$S" --root "$R5" no-such-verb >/dev/null 2>&1; [ "$?" -eq 2 ]
                                                 note $? "an unknown verb exits 2"
 
-## seat-launch quickstart (003) steps 1, 2, 3, 6, 7 ---------------------
+## seat-launch quickstart steps 1, 2, 3, 6, 7 -------------------------------
 # The session record, read without attaching: tab-separated session,
-# pane id, seat, dead, cwd-json, cmd-json (data model: Session record).
+# pane id, seat, dead, cwd-json, cmd-json.
 R6="$(mktemp -d)"; EXTRA_ROOTS="$EXTRA_ROOTS $R6"
 F6="$R6/tmux.state"
 tm6() { SEAT_TMUX="$FAKE" SEAT_FAKE_STATE="$F6" "$S" --root "$R6" "$@"; }
@@ -288,8 +288,7 @@ out="$(tm6 up bad run 2>&1)"; rc=$?
 
 ## seat-launch quickstart step 4: mail survives a new command ---------
 # box starts mail-only, receives `kept`, then records a launch. The
-# token is byte-for-byte the same and the inbox still drains (US2,
-# SC-004).
+# token is byte-for-byte the same and the inbox still drains.
 tm6 register --seat box --harness h >/dev/null 2>&1
                                                     note $? "launch step 4: register box (mail-only)"
 tm6 send --from run box kept >/dev/null 2>&1;       note $? "launch step 4: send kept from run to box"
@@ -303,7 +302,7 @@ out="$(tm6 drain --seat box 2>&1)"; rc=$?
 
 ## seat-launch quickstart step 5: the running command stays -----------
 # A running seat keeps the command it was started with until down and
-# up. down prints nothing and drains nothing (FR-007, FR-009).
+# up. down prints nothing and drains nothing.
 box_cmd6() { record6 | awk -F'\t' '$3 == "box" { print $6 }'; }
 tm6 up box >/dev/null 2>&1;                         note $? "launch step 5: up box starts the stored command"
 [ "$(box_cmd6)" = '["/bin/sleep","5"]' ];           note $? "launch step 5: the record shows /bin/sleep 5"
@@ -349,7 +348,7 @@ out="$(tm7 up nope 2>&1)"; rc=$?
 grep -qF 'P|swarm|nope|' "$F7" && rc=1 || rc=0
                                                     note $rc "launch step 7: no pane for nope"
 
-## quickstart step 7: foreign root (FR-010) ---------------------------
+## quickstart step 7: foreign root ----------------------------------------
 R2="$(mktemp -d)"; EXTRA_ROOTS="$EXTRA_ROOTS $R2"
 mkdir -p "$R2/seats/ghost"
 out="$("$S" --root "$R2" init 2>&1)"; rc=$?
