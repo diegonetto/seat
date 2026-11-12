@@ -9,6 +9,7 @@
 //! per message id; everything else gets the signal. A marker file
 //! `<seat>/webhook.hq-ack` adds the hq receipt (see `hq_receipt`).
 use crate::alarm;
+pub(crate) use crate::backoff::Waits as RingWaits;
 use crate::board;
 use crate::dstate::{load_state, log_line, store_state, RingState};
 use crate::error::{Result, SeatError};
@@ -32,12 +33,6 @@ const HQ_INGEST_URL: &str = "https://hq.bll.dev/ingest/seat-delivery";
 const HQ_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Re-ring backoff (1 min doubling to 1 h; tests pass something tiny).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RingWaits {
-    pub first: Duration,
-    pub max: Duration,
-}
-
 pub(crate) const PROD_RING_WAITS: RingWaits = RingWaits {
     first: Duration::from_secs(60),
     max: Duration::from_secs(60 * 60),

@@ -211,6 +211,84 @@ fn payload_doorbell_ports_the_python_cases() {
     assert!(hook.hits().is_empty(), "{:?}", hook.hits());
 }
 
+#[test]
+fn backoff_characterization_production_ring_waits() {
+    assert_eq!(
+        (webhook::PROD_RING_WAITS.first, webhook::PROD_RING_WAITS.max),
+        (Duration::from_secs(60), Duration::from_secs(3600))
+    );
+}
+
+/// An already delivered payload suppresses POSTs while its burst
+/// keeps backing off. Pin every state byte, the initial cap, doubling,
+/// the repeated cap, and the reset when the bot drains the burst.
+#[test]
+fn backoff_characterization_ring_state() {
+    for (first, max, expected) in [(3, 10, [3000, 6000, 10000, 10000]), (20, 7, [7000; 4])] {
+        let hook = FakeWebhook::start();
+        let root = kotek_board(&hook.url());
+        let dir = kotek_dir(&root);
+        let file = hq_mail(&root, "already delivered", "abcdef12", "inbox", false);
+        let mail = std::fs::read(&file).unwrap();
+        let delivered = "[\"abcdef12\"]\n";
+        std::fs::write(dir.join("webhook-delivered.json"), delivered).unwrap();
+        let cfg = payload_cfg(&hook.url());
+        let waits = RingWaits {
+            first: Duration::from_secs(first),
+            max: Duration::from_secs(max),
+        };
+        // The fifth pass is a new burst, after the fourth was drained.
+        for (pass, backoff_ms) in expected.into_iter().chain([expected[0]]).enumerate() {
+            let before = chrono::Utc::now();
+            assert_eq!(
+                webhook::ring_pass(&root, "kotek-grokbot", &cfg, waits, &|_| {
+                    panic!("a suppressed payload must not retry HTTP")
+                })
+                .unwrap(),
+                RingOutcome::Waiting
+            );
+            let after = chrono::Utc::now();
+            let mut state = load_state(&dir);
+            let next = state.ring.as_ref().unwrap().next_at.as_deref().unwrap();
+            let at = chrono::DateTime::parse_from_rfc3339(next).unwrap();
+            let delay = chrono::TimeDelta::milliseconds(backoff_ms);
+            assert!(at >= before + delay && at <= after + delay);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+                format!(
+                    "{{\n  \"items\": {{}},\n  \"ring\": {{\n    \"rung\": [\n      \"{MAIL_TS}-abcdef12.msg\"\n    ],\n    \"next_at\": \"{next}\",\n    \"backoff_ms\": {backoff_ms},\n    \"failures\": 0\n  }}\n}}\n"
+                )
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), mail);
+            if pass == 3 {
+                std::fs::remove_file(&file).unwrap();
+                assert_eq!(
+                    webhook::ring_pass(&root, "kotek-grokbot", &cfg, waits, &no_sleep).unwrap(),
+                    RingOutcome::Idle
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+                    "{\n  \"items\": {}\n}\n"
+                );
+                hq_mail(&root, "already delivered", "abcdef12", "inbox", false);
+            } else {
+                state.ring.as_mut().unwrap().next_at = Some("2000-01-01T00:00:00Z".into());
+                crate::dstate::store_state(&dir, &state).unwrap();
+            }
+        }
+        assert_eq!(hook.hits(), Vec::<(String, String)>::new());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("webhook-delivered.json")).unwrap(),
+            delivered
+        );
+        assert!(!dir.join("webhook-attempted.json").exists());
+        assert!(!root.join("dispatch.log").exists());
+        assert!(!root.join("dispatch-alarms.json").exists());
+        assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
+        assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
+    }
+}
+
 /// Re-ring backs off while the rung mail waits, and stops once the
 /// bot's own drain took every rung message (the burst closes).
 #[test]

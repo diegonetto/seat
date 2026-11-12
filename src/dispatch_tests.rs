@@ -469,6 +469,72 @@ fn awake_reads_the_last_delivery_locally() {
     );
 }
 
+/// Pin both the ordinary doubling/cap and the deliberately uncapped
+/// first wait. The sleeper records exact durations; the queued mail,
+/// state bytes, complete hub journal and empty log must stay intact.
+#[test]
+fn backoff_characterization_queued_worker() {
+    for (first, max, expected) in [(20, 50, [20, 40, 50, 50]), (70, 30, [70, 30, 30, 30])] {
+        let (root, hub, _client) = kit(&[("opus", "s1")], &["s1"]);
+        let _env = lock_env(&[
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+            ("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string()),
+        ]);
+        send(&root, "opus", "still queued");
+        let key = only_key(&root, "opus");
+        mark(&hub, &key, "queued");
+        let dir = seat::seat_dir(&root, "opus");
+        let inbox = msg::list_msg_dir(&dir.join("inbox")).unwrap().remove(0);
+        let staged = dir.join("draining").join(inbox.file_name().unwrap());
+        let mail = std::fs::read(&inbox).unwrap();
+        std::fs::rename(inbox, &staged).unwrap();
+        let state = format!(
+            "{{\n  \"session\": \"s1\",\n  \"items\": {{\n    \"{key}\": {{\n      \"phase\": \"posted\",\n      \"accepted_at\": \"2026-11-11T00:00:00Z\"\n    }}\n  }}\n}}\n"
+        );
+        std::fs::write(dir.join("dispatch.json"), &state).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        dispatch::worker_loop_with_sleep(
+            root.clone(),
+            "opus".into(),
+            hub.config(),
+            Arc::clone(&stop),
+            Waits {
+                first: Duration::from_millis(first),
+                max: Duration::from_millis(max),
+            },
+            &|duration| {
+                let mut sleeps = sleeps.borrow_mut();
+                assert_eq!(duration, Duration::from_millis(expected[sleeps.len()]));
+                sleeps.push(duration);
+                if sleeps.len() == expected.len() {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+        assert_eq!(*sleeps.borrow(), expected.map(Duration::from_millis));
+        let mut journal = vec!["POST /api/auth".to_string()];
+        for _ in expected {
+            journal.extend([
+                "GET /api/sessions/s1".into(),
+                "POST /api/sessions/s1/messages/queued-state".into(),
+                "GET /api/sessions/s1".into(),
+            ]);
+        }
+        assert_eq!(hub.journal(), journal);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+            state
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), mail);
+        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap(), [staged]);
+        assert_eq!(n_files(&root, "opus", "inbox"), 0);
+        assert_eq!(n_files(&root, "opus", "archive"), 0);
+        assert_eq!(log_text(&root), "");
+        assert!(!root.join("dispatch-alarms.json").exists());
+    }
+}
+
 /// A waiting worker sleeps up to its 5-minute queued-state backoff
 /// between passes, but fresh work never waits behind it: a moved
 /// binding and new inbox mail each wake the worker at once (the
