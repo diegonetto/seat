@@ -3676,12 +3676,12 @@ fi
     }
 
     // busy: blocked, the record never moved, one line.
+    let opus_dir = seat::seat_dir(&root, "opus");
+    let before = std::fs::read_to_string(opus_dir.join("dispatch.json")).unwrap();
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
         Pass::Blocked
     );
-    let opus_dir = seat::seat_dir(&root, "opus");
-    let before = std::fs::read_to_string(opus_dir.join("dispatch.json")).unwrap();
     assert_eq!(
         masked_state(&opus_dir, &[]),
         before,
