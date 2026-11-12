@@ -3,9 +3,10 @@
 //! `HAPI_API_URL`/`CLI_API_TOKEN` override), `POST /api/auth` for a
 //! 4 h JWT re-exchanged near expiry or on any 401, every request
 //! bounded at 10 s (ureq 3; no async runtime, no handwritten HTTP).
+use crate::board;
 use crate::error::{Result, SeatError};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -78,11 +79,8 @@ impl HubConfig {
     /// Env overrides first, then `~/.hapi/settings.json` (each value
     /// independently — see `discover_with`).
     pub fn discover() -> Result<HubConfig> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
         Self::discover_with(
-            &home,
+            &board::home_dir(),
             std::env::var("HAPI_API_URL").ok().as_deref(),
             std::env::var("CLI_API_TOKEN").ok().as_deref(),
         )
@@ -319,6 +317,7 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn home_with_settings(json: &str) -> PathBuf {
         let home = crate::testutil::temp_root("hub-settings");
@@ -346,6 +345,45 @@ mod tests {
             (cfg.base.as_str(), cfg.token.as_str()),
             ("http://127.0.0.1:9999", "file-token")
         );
+    }
+
+    /// `discover` reads `$HOME/.hapi/settings.json` itself when the
+    /// env is quiet — the wrapper's own HOME reading, pinned end to
+    /// end.
+    #[test]
+    fn discover_reads_home_settings_when_the_env_is_quiet() {
+        let _env = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = (
+            std::env::var_os("HAPI_API_URL"),
+            std::env::var_os("CLI_API_TOKEN"),
+        );
+        std::env::remove_var("HAPI_API_URL");
+        std::env::remove_var("CLI_API_TOKEN");
+        crate::testutil::with_throwaway_home(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+            std::fs::create_dir_all(home.join(".hapi")).unwrap();
+            std::fs::write(
+                home.join(".hapi").join("settings.json"),
+                r#"{"listenPort":4242,"cliApiToken":"file-token"}"#,
+            )
+            .unwrap();
+            let cfg = HubConfig::discover().unwrap();
+            assert_eq!(
+                (cfg.base.as_str(), cfg.token.as_str()),
+                ("http://127.0.0.1:4242", "file-token"),
+                "the settings came from HOME, nowhere else"
+            );
+        });
+        match saved.0 {
+            Some(v) => std::env::set_var("HAPI_API_URL", v),
+            None => std::env::remove_var("HAPI_API_URL"),
+        }
+        match saved.1 {
+            Some(v) => std::env::set_var("CLI_API_TOKEN", v),
+            None => std::env::remove_var("CLI_API_TOKEN"),
+        }
     }
 
     /// The live hub nests the flag under `session`; `session_active`

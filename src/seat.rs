@@ -1,3 +1,4 @@
+use crate::board;
 use crate::error::{Result, SeatError};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -48,7 +49,7 @@ pub fn parse_idle_after(raw: &str) -> Option<Duration> {
 pub const SUBDIRS: [&str; 3] = ["inbox", "draining", "archive"];
 
 pub fn seat_dir(root: &Path, name: &str) -> PathBuf {
-    root.join("seats").join(name)
+    board::seats_dir(root).join(name)
 }
 
 pub fn meta_path(dir: &Path) -> PathBuf {
@@ -278,6 +279,22 @@ mod tests {
         for sub in SUBDIRS {
             assert!(dir.join(sub).is_dir(), "missing {sub}");
         }
+    }
+
+    /// The seat paths never carry a second spelling of the layout:
+    /// `seats/` comes from `board::seats_dir`, and the inbox token
+    /// from the seat helpers.
+    #[test]
+    fn seat_paths_route_through_the_board_spelling() {
+        let root = temp_root("seat-paths");
+        assert_eq!(
+            seat_dir(&root, "alpha"),
+            board::seats_dir(&root).join("alpha")
+        );
+        assert_eq!(
+            token_path(&seat_dir(&root, "inbox")),
+            root.join("seats").join("inbox").join("token")
+        );
     }
 
     #[test]

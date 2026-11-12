@@ -529,3 +529,28 @@ fn a_failed_hq_receipt_is_best_effort_and_never_resent_isolated() {
     );
     assert_eq!(hq.hits().len(), 1, "no receipt without credentials");
 }
+
+/// A missing ingest env names the exact path it could not read:
+/// `$HOME/.config/bll-ingest/env`, HOME read with the `.` fallback,
+/// no other spelling.
+#[test]
+fn a_missing_ingest_env_names_the_home_path() {
+    crate::testutil::with_throwaway_home(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME set");
+        let err =
+            webhook::hq_receipt("https://hq.invalid/", "kotek-grokbot", "abcdef12").unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "no readable {}: No such file or directory (os error 2)",
+                home.join(".config")
+                    .join("bll-ingest")
+                    .join("env")
+                    .display()
+            ),
+            "the error names the HOME-derived path"
+        );
+    });
+}

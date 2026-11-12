@@ -18,13 +18,19 @@ pub fn resolve_root(explicit: Option<&str>) -> PathBuf {
     }
 }
 
+/// The operator's home: `$HOME`, else `.`. One spelling for every
+/// settings reader (the board default, the hub settings, the ingest
+/// env); an empty `$HOME` is not a missing one.
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Documented default board location (see README). This is for the human
 /// operator's shell, not for tests.
 pub fn default_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local").join("share").join("seat")
+    home_dir().join(".local").join("share").join("seat")
 }
 
 pub fn seats_dir(root: &Path) -> PathBuf {
@@ -275,5 +281,23 @@ mod tests {
             PathBuf::from("/elsewhere")
         );
         std::env::remove_var("SEAT_ROOT");
+    }
+
+    /// The documented default, pinned: `$HOME/.local/share/seat`. A
+    /// missing HOME means `.`; an empty HOME is not a missing one (it
+    /// joins onto the empty path, a different PathBuf than `.` gives).
+    #[test]
+    fn default_root_pins_the_home_idiom() {
+        crate::testutil::with_throwaway_home(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+            assert_eq!(
+                default_root(),
+                home.join(".local").join("share").join("seat")
+            );
+            std::env::remove_var("HOME");
+            assert_eq!(default_root(), PathBuf::from("./.local/share/seat"));
+            std::env::set_var("HOME", "");
+            assert_eq!(default_root(), PathBuf::from(".local/share/seat"));
+        });
     }
 }
