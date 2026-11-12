@@ -15,7 +15,7 @@ use crate::dstate::{
 };
 use crate::error::{Result, SeatError};
 use crate::hub::{Hub, HubConfig};
-use crate::identity::Bindings;
+use crate::identity::{bound_session, Bindings};
 use crate::msg;
 use crate::seat::{self, Flock};
 use crate::sleep::{self, WakeOutcome};
@@ -159,7 +159,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     }
     // Pull seats drain themselves: never `receive` for them. The
     // binding is re-read here, after any wake rewrote it.
-    let Some(session) = Bindings::load(root).session_id(seat).map(str::to_string) else {
+    let Some(session) = bound_session(root, seat) else {
         log_line(
             root,
             "failure",
@@ -294,14 +294,18 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     poll_round(root, seat, hub, &session, &mut state, &received, &texts)
 }
 
+/// The seat's inbox mail, oldest first; an unreadable inbox reads
+/// as empty. The wake key takes the oldest entry; the scan's asleep
+/// check and the fresh-work check ask only whether any is present.
+fn inbox_mail(dir: &Path) -> Vec<PathBuf> {
+    msg::list_msg_dir(&dir.join("inbox")).unwrap_or_default()
+}
+
 /// The delivery key that woke an asleep seat: its oldest present
 /// mail (the wake runs before `receive`, so the mail is still in the
 /// inbox), else the oldest in-flight key.
 fn wake_key(dir: &Path, seat: &str, state: &DispatchState) -> String {
-    if let Some(first) = msg::list_msg_dir(&dir.join("inbox"))
-        .unwrap_or_default()
-        .first()
-    {
+    if let Some(first) = inbox_mail(dir).first() {
         return direct_key(
             seat,
             first
@@ -542,9 +546,7 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
             if !hapi_seats.contains(name)
                 && crate::dstate::is_asleep(root, name)
                 && (crate::dstate::pending_sleep(root, name)
-                    || !msg::list_msg_dir(&seat::seat_dir(root, name).join("inbox"))
-                        .unwrap_or_default()
-                        .is_empty())
+                    || !inbox_mail(&seat::seat_dir(root, name)).is_empty())
             {
                 hapi_seats.push(name.clone());
                 webhook_seats.retain(|s| s != name);
@@ -608,14 +610,11 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
 /// flight.
 fn fresh_work(root: &Path, seat: &str) -> bool {
     let dir = seat::seat_dir(root, seat);
-    if !msg::list_msg_dir(&dir.join("inbox"))
-        .unwrap_or_default()
-        .is_empty()
-    {
+    if !inbox_mail(&dir).is_empty() {
         return true;
     }
     let state = load_state(&dir);
-    if Bindings::load(root).session_id(seat).map(str::to_string) != state.session {
+    if bound_session(root, seat) != state.session {
         return true;
     }
     false
@@ -712,5 +711,82 @@ mod tests {
             (PROD_WAITS.first, PROD_WAITS.max),
             (Duration::from_secs(5), Duration::from_secs(300))
         );
+    }
+
+    /// `wake_key`'s full outputs, pinned: the oldest inbox mail's
+    /// key, else the first in-flight key, else the empty string, and
+    /// an unreadable inbox reading as empty (the in-flight key).
+    #[test]
+    fn wake_key_outputs_are_pinned() {
+        use crate::testutil::temp_root;
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("dispatch-wake-key");
+        let dir = seat::seat_dir(&root, "opus");
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        let mut state = DispatchState::default();
+        // Nothing owed, nothing in flight: the empty string.
+        assert_eq!(wake_key(&dir, "opus", &state), "");
+        // An empty inbox: the first key whose phase is not Done.
+        state
+            .items
+            .insert("seat:opus:late.msg".into(), ItemState::default());
+        state.items.insert(
+            "seat:opus:done.msg".into(),
+            ItemState {
+                phase: Phase::Done,
+                ..Default::default()
+            },
+        );
+        assert_eq!(wake_key(&dir, "opus", &state), "seat:opus:late.msg");
+        // Inbox mail outranks in-flight: the oldest file name wins.
+        std::fs::write(dir.join("inbox/20260101T000000.000000-old.msg"), "x").unwrap();
+        std::fs::write(dir.join("inbox/20260102T000000.000000-new.msg"), "x").unwrap();
+        assert_eq!(
+            wake_key(&dir, "opus", &state),
+            direct_key("opus", "20260101T000000.000000-old.msg")
+        );
+        // An unreadable inbox reads as empty: the in-flight key again.
+        let inbox = dir.join("inbox");
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&inbox).is_err() {
+            assert_eq!(wake_key(&dir, "opus", &state), "seat:opus:late.msg");
+        }
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `fresh_work`'s full outputs, pinned: inbox presence first,
+    /// then the fresh binding read against the recorded session,
+    /// every comparison outcome.
+    #[test]
+    fn fresh_work_outputs_are_pinned() {
+        use crate::testutil::{temp_root, write_bindings};
+        let root = temp_root("dispatch-fresh-work");
+        let dir = seat::seat_dir(&root, "opus");
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        // No mail, no binding, no recorded session: not fresh.
+        assert!(!fresh_work(&root, "opus"));
+        // Inbox mail alone is fresh work.
+        std::fs::write(dir.join("inbox/20260101T000000.000000-old.msg"), "x").unwrap();
+        assert!(fresh_work(&root, "opus"));
+        std::fs::remove_file(dir.join("inbox/20260101T000000.000000-old.msg")).unwrap();
+        // A binding with no recorded session is fresh.
+        write_bindings(&root, &[("opus", "s1")]);
+        assert!(fresh_work(&root, "opus"));
+        // The recorded session matching the binding is not.
+        store_state(
+            &dir,
+            &DispatchState {
+                session: Some("s1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!fresh_work(&root, "opus"));
+        // A moved binding is fresh.
+        write_bindings(&root, &[("opus", "s2")]);
+        assert!(fresh_work(&root, "opus"));
+        // A recorded session with no binding at all is fresh too.
+        std::fs::remove_file(root.join(crate::identity::BINDINGS_FILE)).unwrap();
+        assert!(fresh_work(&root, "opus"));
     }
 }

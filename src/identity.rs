@@ -109,6 +109,14 @@ impl Bindings {
     }
 }
 
+/// The hapi session id a seat is bound to, owned, from a fresh read
+/// of the bindings file — the one read the dispatcher's pass, its
+/// fresh-work check, and the sleep settlement share. Each caller
+/// re-reads; the file may have been rewritten between any two calls.
+pub fn bound_session(root: &Path, seat: &str) -> Option<String> {
+    Bindings::load(root).session_id(seat).map(str::to_string)
+}
+
 /// The resolved sender for one outgoing message.
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -237,6 +245,29 @@ mod tests {
         assert!(!b.contains("alpha"));
         assert_eq!(b.session_id("opus-main"), Some(OPUS));
         assert_eq!(b.session_id("alpha"), None);
+    }
+
+    /// The owned read the dispatcher's pass, its fresh-work check,
+    /// and the sleep settlement share: re-read fresh from the file
+    /// each call, so a rewritten binding is picked up at once.
+    #[test]
+    fn bound_session_is_read_fresh_each_call() {
+        let root = temp_root("identity-bound-session");
+        // No file at all.
+        assert_eq!(bound_session(&root, "opus-main"), None);
+        write_bindings(&root, &[("opus-main", OPUS)]);
+        assert_eq!(
+            bound_session(&root, "opus-main"),
+            Some(OPUS.to_string()),
+            "an owned String, not a borrow into a thrown-away load"
+        );
+        assert_eq!(bound_session(&root, "alpha"), None);
+        // A moved binding is the next read's answer.
+        write_bindings(&root, &[("opus-main", FACTORY)]);
+        assert_eq!(bound_session(&root, "opus-main"), Some(FACTORY.to_string()));
+        // An unparseable file means no bindings.
+        write_bindings_file(&root, "{ nope");
+        assert_eq!(bound_session(&root, "opus-main"), None);
     }
 
     // The identity-rule cases themselves (bound as self, bound as
