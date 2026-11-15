@@ -45,7 +45,7 @@ pub(crate) enum RingOutcome {
     Idle,    // nothing to ring: the bot's drain took everything
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct WebhookConfig {
     pub(crate) url: String,
     pub(crate) key: String,
