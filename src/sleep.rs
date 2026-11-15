@@ -413,22 +413,19 @@ pub(crate) fn try_sleep(
     // Down through the same path `cmd_down` runs for one pane, never
     // a signal by pid and never a pane the board did not start — and
     // only the pane the clock timed (a replacement that snuck in
-    // under the same seat name is left standing): a kill that names
-    // nothing is decided by the shared kill-then-verify tail, and
-    // only a cancelled sleep answers false.
+    // under the same seat name is left standing). The shared
+    // kill-then-verify tail decides a refused kill, and only a
+    // cancelled sleep answers false.
     let recorded = state.pane_id.clone();
-    Ok(!matches!(
-        kill_then_verify(
-            root,
-            seat,
-            state,
-            recorded.as_deref(),
-            &reason,
-            "pane_killed=false pending=1",
-            "",
-        )?,
-        KillVerified::Cancelled
-    ))
+    Ok(kill_then_verify(
+        root,
+        seat,
+        state,
+        recorded.as_deref(),
+        &reason,
+        "pane_killed=false pending=1",
+        "",
+    )?)
 }
 
 /// Settle a sleep whose kill never landed: `try_sleep` records the
@@ -569,21 +566,6 @@ fn cancel_sleep(
     Ok(())
 }
 
-/// What the shared kill-then-verify tail decided, for the caller's
-/// own verdict: `try_sleep` answers `false` only for `Cancelled`.
-enum KillVerified {
-    /// The pane is killed or verifiably gone: the sleep stands with
-    /// the pane fact cleared and the completing line logged.
-    Complete,
-    /// The multiplexer cannot be asked again: the mark stays beside
-    /// the fact — a pending kill the next pass settles — and the
-    /// pending line was logged.
-    Pending,
-    /// A live pane the decision never named: the sleep was cancelled
-    /// through `cancel_sleep`, and nothing dies.
-    Cancelled,
-}
-
 /// The tail `try_sleep` and `settle_pending_sleep` share: kill the
 /// recorded pane and, when the kill names nothing — the pane set moved
 /// between the decision and the kill — ask the multiplexer once more.
@@ -596,7 +578,9 @@ enum KillVerified {
 /// fact clears, and the next pane starts a fresh clock). The two
 /// callers word their pending and completing lines differently, so
 /// each passes its own `pending_tail` and `done_suffix` for the
-/// `reason=` line — the cancel line they already share.
+/// `reason=` line — the cancel line they already share. The returned
+/// bool is `try_sleep`'s verdict verbatim — `false` only for the
+/// cancel; `settle_pending_sleep` needs only the tail's effects.
 fn kill_then_verify(
     root: &Path,
     seat: &str,
@@ -605,7 +589,7 @@ fn kill_then_verify(
     reason: &str,
     pending_tail: &str,
     done_suffix: &str,
-) -> Result<KillVerified> {
+) -> Result<bool> {
     let killed = crate::session::kill_seat_pane_if(seat, recorded)?;
     if !killed {
         match crate::session::live_pane_id(seat) {
@@ -616,7 +600,7 @@ fn kill_then_verify(
             // clock on the pane that stands.
             Some(Some(id)) if Some(id.as_str()) != recorded => {
                 cancel_sleep(root, seat, state, reason, "pane-replaced")?;
-                return Ok(KillVerified::Cancelled);
+                return Ok(false);
             }
             // The multiplexer cannot be asked again: the stored mark
             // stays beside the fact — a pending kill the next pass
@@ -628,7 +612,7 @@ fn kill_then_verify(
                     seat,
                     &format!("reason={reason} {pending_tail}"),
                 );
-                return Ok(KillVerified::Pending);
+                return Ok(true);
             }
             // The pane the mark named is gone: the sleep is complete —
             // the mark stands, only the fact clears, below.
@@ -644,7 +628,7 @@ fn kill_then_verify(
         seat,
         &format!("reason={reason} pane_killed={killed}{done_suffix}"),
     );
-    Ok(KillVerified::Complete)
+    Ok(true)
 }
 
 #[cfg(test)]
