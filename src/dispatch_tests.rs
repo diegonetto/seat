@@ -3185,6 +3185,468 @@ fn a_sleep_is_cancelled_when_a_different_live_pane_remains() {
     );
 }
 
+/// `try_sleep`'s kill-then-verify tail pinned in full, all four
+/// outcomes: the kill lands (the mark stands, the fact clears); the
+/// timed pane died on its own before the kill (a refused kill whose
+/// re-query finds no live pane completes the sleep with
+/// `pane_killed=false`); a replacement stands (a refused kill whose
+/// re-query names a pane the decision never named cancels the sleep);
+/// and a multiplexer that cannot be asked again leaves the stored
+/// mark pending beside the fact. Every block pins the call's return,
+/// its one sleep line, and the whole resulting dispatch.json.
+#[test]
+fn try_sleeps_kill_then_verify_tail_full_outputs_are_pinned() {
+    // The kill lands: the sleep stands, only the fact clears.
+    {
+        let kit_dir = stub_kit(
+            "sleep-tail-pin-landed",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut st = dstate::load_state(&dir);
+        assert_eq!(
+            crate::sleep::try_sleep(&root, "opus", "s1", &mut st, &mut client).unwrap(),
+            true
+        );
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pane_killed=true"
+        );
+        let at = dstate::load_state(&dir).asleep.unwrap().at;
+        assert_eq!(
+            masked_state(&dir, &[at.as_str()]),
+            concat!(
+                "{\n",
+                "  \"items\": {},\n",
+                "  \"asleep\": {\n",
+                "    \"at\": \"<ts>\",\n",
+                "    \"reason\": \"idle 30m\"\n",
+                "  }\n",
+                "}\n"
+            )
+        );
+    }
+
+    // The timed pane died on its own before the kill: the kill names
+    // nothing, the re-query finds no live pane, the sleep completes.
+    {
+        let kit_dir = stub_kit(
+            "sleep-tail-pin-gone",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        crate::session::cmd_down(&root, &["opus".to_string()]).unwrap();
+        let mut st = dstate::load_state(&dir);
+        st.pane_id = Some("%0".into()); // never a live id: ids start at %1
+        dstate::store_state(&dir, &st).unwrap();
+        let mut st = dstate::load_state(&dir);
+        assert_eq!(
+            crate::sleep::try_sleep(&root, "opus", "s1", &mut st, &mut client).unwrap(),
+            true
+        );
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pane_killed=false"
+        );
+        let at = dstate::load_state(&dir).asleep.unwrap().at;
+        assert_eq!(
+            masked_state(&dir, &[at.as_str()]),
+            concat!(
+                "{\n",
+                "  \"items\": {},\n",
+                "  \"asleep\": {\n",
+                "    \"at\": \"<ts>\",\n",
+                "    \"reason\": \"idle 30m\"\n",
+                "  }\n",
+                "}\n"
+            )
+        );
+    }
+
+    // A replacement stands: the refused kill's re-query names a pane
+    // the decision never named, and the sleep is cancelled.
+    {
+        let kit_dir = stub_kit(
+            "sleep-tail-pin-replaced",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut st = dstate::load_state(&dir);
+        st.pane_id = Some("%0".into()); // never a live id: ids start at %1
+        dstate::store_state(&dir, &st).unwrap();
+        let mut st = dstate::load_state(&dir);
+        assert_eq!(
+            crate::sleep::try_sleep(&root, "opus", "s1", &mut st, &mut client).unwrap(),
+            false
+        );
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m cancelled=1 cause=pane-replaced"
+        );
+        assert_eq!(
+            masked_state(&dir, &[]),
+            concat!("{\n", "  \"items\": {}\n", "}\n"),
+            "the cancel cleared every fact"
+        );
+        assert!(
+            crate::session::running_seats(&fake_tmux())
+                .unwrap()
+                .contains("opus"),
+            "the replacement was never killed"
+        );
+    }
+
+    // The multiplexer cannot be asked again: the refused kill's
+    // re-query cannot even run, and the stored mark stays pending
+    // beside the fact for the next pass. The wrapper delegates the
+    // kill's own query and deletes itself right after, so the next
+    // spawn — the re-query — finds no program to run (a failing
+    // `list-panes` answer reads as an empty pane set, not as an
+    // unanswerable multiplexer).
+    {
+        let kit_dir = stub_kit(
+            "sleep-tail-pin-pending",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut st = dstate::load_state(&dir);
+        st.pane_id = Some("%0".into()); // never a live id: ids start at %1
+        st.pane_seen_at = Some("2026-10-22T00:00:00Z".into());
+        dstate::store_state(&dir, &st).unwrap();
+        let fake = fake_tmux();
+        let script = r#"
+if [ "$1" = "list-panes" ]; then
+    'FAKE' "$@"
+    status=$?
+    rm -f "$0"
+    exit $status
+fi
+'FAKE' "$@"
+"#
+        .replace("FAKE", &fake);
+        stub(&root, "vanish-tmux.sh", &script);
+        env.set("SEAT_TMUX", root.join("vanish-tmux.sh").into_os_string());
+        let mut st = dstate::load_state(&dir);
+        assert_eq!(
+            crate::sleep::try_sleep(&root, "opus", "s1", &mut st, &mut client).unwrap(),
+            true
+        );
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pane_killed=false pending=1"
+        );
+        let at = dstate::load_state(&dir).asleep.unwrap().at;
+        assert_eq!(
+            masked_state(&dir, &[at.as_str()]),
+            concat!(
+                "{\n",
+                "  \"items\": {},\n",
+                "  \"pane_seen_at\": \"2026-10-22T00:00:00Z\",\n",
+                "  \"pane_id\": \"%0\",\n",
+                "  \"asleep\": {\n",
+                "    \"at\": \"<ts>\",\n",
+                "    \"reason\": \"idle 30m\"\n",
+                "  }\n",
+                "}\n"
+            )
+        );
+        assert!(
+            crate::session::running_seats(&fake_tmux())
+                .unwrap()
+                .contains("opus"),
+            "the refused kill never stopped the pane"
+        );
+    }
+}
+
+/// `settle_pending_sleep`'s kill-then-verify tail — the same tail
+/// `try_sleep` runs — pinned in full, all four outcomes: the kill
+/// lands; the pane dies between recovery's own query and its kill (a
+/// refused kill whose re-query finds no live pane completes with
+/// `pane_killed=false`); a replacement lands between the same two
+/// queries (a refused kill whose re-query names it cancels); and a
+/// re-query the multiplexer cannot answer leaves the mark and the
+/// fact untouched. Every block pins the settlement's one sleep line
+/// and the whole resulting dispatch.json; the pane moves between the
+/// queries are driven by a wrapper around the fake multiplexer, as
+/// the mid-swap case already is.
+#[test]
+fn settlements_kill_then_verify_tail_full_outputs_are_pinned() {
+    // The kill lands: the sleep stands, only the fact clears.
+    {
+        let kit_dir = stub_kit(
+            "settle-tail-pin-landed",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut state = dstate::load_state(&dir);
+        state.asleep = Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        });
+        state.pane_seen_at = Some("2026-10-22T00:00:00Z".into());
+        dstate::store_state(&dir, &state).unwrap();
+        let mut st = dstate::load_state(&dir);
+        crate::sleep::settle_pending_sleep(&root, "opus", &mut st, &mut client).unwrap();
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pane_killed=true finished=1"
+        );
+        assert_eq!(
+            masked_state(&dir, &[]),
+            concat!(
+                "{\n",
+                "  \"items\": {},\n",
+                "  \"asleep\": {\n",
+                "    \"at\": \"2026-10-23T00:00:00Z\",\n",
+                "    \"reason\": \"idle 30m\"\n",
+                "  }\n",
+                "}\n"
+            )
+        );
+        assert!(
+            !crate::session::running_seats(&fake_tmux())
+                .unwrap()
+                .contains("opus"),
+            "the kill landed"
+        );
+    }
+
+    // The pane dies between recovery's query and its kill: the kill
+    // names nothing, the re-query finds no live pane, the sleep
+    // completes. The wrapper kills the recorded pane right after the
+    // first `list-panes` and delegates everything else.
+    {
+        let kit_dir = stub_kit(
+            "settle-tail-pin-gone",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut state = dstate::load_state(&dir);
+        let old_pane = state.pane_id.clone().unwrap();
+        state.asleep = Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        });
+        state.pane_seen_at = Some("2026-10-22T00:00:00Z".into());
+        dstate::store_state(&dir, &state).unwrap();
+        let fake = fake_tmux();
+        let count = root.join("tmux-calls");
+        let script = r#"
+n=0
+if [ "$1" = "list-panes" ]; then
+    n=$(( $(cat 'COUNT' 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > 'COUNT'
+fi
+if [ "$1" = "list-panes" ] && [ "$n" -eq 1 ]; then
+    'FAKE' "$@"
+    status=$?
+    'FAKE' kill-pane -t 'OLD'
+    exit $status
+fi
+'FAKE' "$@"
+"#
+        .replace("FAKE", &fake)
+        .replace("COUNT", &count.display().to_string())
+        .replace("OLD", &old_pane);
+        stub(&root, "dying-tmux.sh", &script);
+        env.set("SEAT_TMUX", root.join("dying-tmux.sh").into_os_string());
+        let mut st = dstate::load_state(&dir);
+        crate::sleep::settle_pending_sleep(&root, "opus", &mut st, &mut client).unwrap();
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pane_killed=false finished=1"
+        );
+        assert_eq!(
+            masked_state(&dir, &[]),
+            concat!(
+                "{\n",
+                "  \"items\": {},\n",
+                "  \"asleep\": {\n",
+                "    \"at\": \"2026-10-23T00:00:00Z\",\n",
+                "    \"reason\": \"idle 30m\"\n",
+                "  }\n",
+                "}\n"
+            )
+        );
+    }
+
+    // A replacement lands between recovery's query and its kill: the
+    // refused kill's re-query names it, and the sleep is cancelled —
+    // the same swap wrapper the mid-swap case drives.
+    {
+        let kit_dir = stub_kit(
+            "settle-tail-pin-replaced",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut state = dstate::load_state(&dir);
+        let old_pane = state.pane_id.clone().unwrap();
+        state.asleep = Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        });
+        state.pane_seen_at = Some("2026-10-22T00:00:00Z".into());
+        dstate::store_state(&dir, &state).unwrap();
+        let fake = fake_tmux();
+        let count = root.join("tmux-calls");
+        let script = r#"
+n=0
+if [ "$1" = "list-panes" ]; then
+    n=$(( $(cat 'COUNT' 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > 'COUNT'
+fi
+'FAKE' "$@"
+status=$?
+if [ "$1" = "list-panes" ] && [ "$n" -eq 1 ]; then
+    new=$('FAKE' new-window -d -t swarm -n opus -P -F '#{pane_id}' -- /usr/bin/env -- /bin/sleep 30)
+    'FAKE' set-option -p -t "$new" @seat opus
+    'FAKE' kill-pane -t 'OLD'
+fi
+exit $status
+"#
+        .replace("FAKE", &fake)
+        .replace("COUNT", &count.display().to_string())
+        .replace("OLD", &old_pane);
+        stub(&root, "swap-tmux.sh", &script);
+        env.set("SEAT_TMUX", root.join("swap-tmux.sh").into_os_string());
+        let mut st = dstate::load_state(&dir);
+        crate::sleep::settle_pending_sleep(&root, "opus", &mut st, &mut client).unwrap();
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m cancelled=1 cause=pane-replaced"
+        );
+        assert_eq!(
+            masked_state(&dir, &[]),
+            concat!("{\n", "  \"items\": {}\n", "}\n"),
+            "the cancel cleared every fact"
+        );
+        assert!(
+            crate::session::running_seats(&fake_tmux())
+                .unwrap()
+                .contains("opus"),
+            "the replacement was never killed"
+        );
+    }
+
+    // The multiplexer cannot be asked again after the refused kill:
+    // the mark, the fact, and the clock all stand untouched. The
+    // wrapper kills the recorded pane right after the first
+    // `list-panes`, delegates the kill's own query, and deletes
+    // itself right after that, so the re-query's spawn finds no
+    // program to run.
+    {
+        let kit_dir = stub_kit(
+            "settle-tail-pin-pending",
+            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            None,
+        );
+        let mut env = lock_env(&[
+            ("PATH", path_with(&kit_dir)),
+            ("SEAT_KIT", OsString::from("")),
+            ("SEAT_TMUX", OsString::from(fake_tmux())),
+        ]);
+        let (root, _hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+        let dir = seat::seat_dir(&root, "opus");
+        let mut state = dstate::load_state(&dir);
+        let old_pane = state.pane_id.clone().unwrap();
+        state.asleep = Some(dstate::Asleep {
+            at: "2026-10-23T00:00:00Z".into(),
+            reason: "idle 30m".into(),
+        });
+        state.pane_seen_at = Some("2026-10-22T00:00:00Z".into());
+        dstate::store_state(&dir, &state).unwrap();
+        let before = std::fs::read_to_string(dir.join("dispatch.json")).unwrap();
+        let fake = fake_tmux();
+        let count = root.join("tmux-calls");
+        let script = r#"
+n=0
+if [ "$1" = "list-panes" ]; then
+    n=$(( $(cat 'COUNT' 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > 'COUNT'
+fi
+if [ "$1" = "list-panes" ] && [ "$n" -eq 1 ]; then
+    'FAKE' "$@"
+    status=$?
+    'FAKE' kill-pane -t 'OLD'
+    exit $status
+fi
+if [ "$1" = "list-panes" ] && [ "$n" -eq 2 ]; then
+    'FAKE' "$@"
+    status=$?
+    rm -f "$0"
+    exit $status
+fi
+'FAKE' "$@"
+"#
+        .replace("FAKE", &fake)
+        .replace("COUNT", &count.display().to_string())
+        .replace("OLD", &old_pane);
+        stub(&root, "vanish-tmux.sh", &script);
+        env.set("SEAT_TMUX", root.join("vanish-tmux.sh").into_os_string());
+        let mut st = dstate::load_state(&dir);
+        crate::sleep::settle_pending_sleep(&root, "opus", &mut st, &mut client).unwrap();
+        assert_eq!(
+            masked_log(&root),
+            "<ts> sleep seat=opus reason=idle 30m pending=1 cause=pane-unknown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+            before,
+            "the unanswerable re-query wrote nothing"
+        );
+    }
+}
+
 /// The mail re-check guards the initial sleep's record too, and it
 /// reads the pass's whole owed set: mail in `inbox/` or already in
 /// `draining/` stops the store — no mark, no kill, the pane stands.
