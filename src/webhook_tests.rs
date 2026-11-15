@@ -11,6 +11,7 @@ use crate::testutil::fakewebhook::FakeWebhook;
 use crate::testutil::{lock_env, temp_root, wait_for, write_bindings};
 use crate::webhook::{self, RingOutcome, RingWaits, WebhookConfig};
 use crate::{board, msg, seat, verbs};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1162,6 +1163,280 @@ fn a_readable_expired_deadline_rewritten_on_disk_never_wakes_the_wait() {
         alarms == "{\"causes\":[\"undelivered:kotek-grokbot\"]}\n" || alarms == "{\"causes\":[]}\n",
         "the first ring's latch, or cleared by the race pass: {alarms}"
     );
+}
+
+/// The env seam that lets a disk-loaded config point at the local
+/// plaintext receiver: `WebhookConfig::load` refuses an `http://`
+/// URL unless this is set, and only these tests set it.
+const HTTP_ENV: &str = "SEAT_WEBHOOK_ALLOW_HTTP";
+
+/// kotek's board without the payload marker: a signal-mode seat whose
+/// `webhook.url` is loaded from disk (see `HTTP_ENV`).
+fn signal_board(hook_url: &str) -> PathBuf {
+    let root = kotek_board(hook_url);
+    std::fs::remove_file(kotek_dir(&root).join("webhook.payload")).unwrap();
+    root
+}
+
+/// Mail young enough that no `undelivered` alarm fires while a case
+/// runs: the file name's ts is now. Signal mode never reads the
+/// bytes, only the name.
+fn fresh_mail(root: &Path, id: &str) -> String {
+    let name = format!(
+        "{}-{id}.msg",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.6f")
+    );
+    std::fs::write(kotek_dir(root).join("inbox").join(&name), "ring me\n").unwrap();
+    name
+}
+
+/// Rewind the burst's deadline so the next `ring_pass` is due at once
+/// (the clock never waits in a test).
+fn rewind_deadline(dir: &Path) {
+    let mut state = load_state(dir);
+    state.ring.as_mut().unwrap().next_at = Some("2000-01-01T00:00:00Z".into());
+    crate::dstate::store_state(dir, &state).unwrap();
+}
+
+/// `wait_for` with a ceiling wide enough for a failed signal ring:
+/// the script's 3 attempts sleep 2 s then 4 s between them, so the
+/// ring — and the re-ring behind it — takes real seconds.
+fn wait_for_slow(pred: impl Fn() -> bool, msg: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !pred() {
+        assert!(std::time::Instant::now() < deadline, "{msg}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A corrected file takes effect at the next ring: the worker re-reads
+/// the seat's webhook files before every pass, so a first ring refused
+/// 401 (no `webhook.auth` staged) followed by `webhook.auth` written
+/// while the message is still in `inbox/` — the bot never drained, the
+/// burst stayed open — sends the next ring with the Authorization
+/// header, and it succeeds. Fails on main, where the worker loads its
+/// config once at spawn and reuses it for the whole burst: every later
+/// ring goes out bearer-less and fails again.
+#[test]
+fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
+    let _env = lock_env(&[(HTTP_ENV, OsString::from("1"))]);
+    let hook = FakeWebhook::start();
+    hook.ctl.lock().unwrap().status = 401; // the receiver refuses a bearer-less ring
+    let root = signal_board(&hook.url());
+    let dir = kotek_dir(&root);
+    fresh_mail(&root, "authfix1");
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    // The re-ring deadline is stamped from the pass's start, and the
+    // first ring's retries sleep 6 s before the pass ends, so the
+    // first wait — and the max that caps it — must outlast them:
+    // the re-ring stays in the future after the retries, giving the
+    // correction a window to land before the worker's re-read.
+    let waits = RingWaits {
+        first: Duration::from_secs(8),
+        max: Duration::from_secs(8),
+    };
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, waits, None);
+        d.store(true, Ordering::SeqCst);
+    });
+    // The first ring: the script's 3 attempts, every one 401, none
+    // authorized (waited one attempt at a time — the retries sleep
+    // 2 s then 4 s, past a single `wait_for` ceiling). Only the
+    // first two are waited out before the correction: the third
+    // attempt returns with the deadline already close, and the pass
+    // must not end before the file is on disk.
+    for wanted in 1..=2 {
+        wait_for_slow(
+            || hook.hits().len() == wanted,
+            "the first ring's attempts never finished",
+        );
+    }
+    for (headers, _) in &hook.hits() {
+        assert!(
+            !headers.contains("authorization:"),
+            "no auth staged: {headers}"
+        );
+    }
+    // The correction, written mid-burst with the mail still in
+    // inbox/, inside the 4 s retry sleep that follows the second
+    // attempt: on disk well before the pass ends, so the re-read
+    // before the next ring cannot miss it.
+    std::fs::write(dir.join("webhook.auth"), "Bearer tok-123\n").unwrap();
+    wait_for_slow(
+        || hook.hits().len() == 3,
+        "the first ring's last attempt never finished",
+    );
+    // The receiver accepts again — only now, after the last attempt
+    // of the failed ring, so the burst stays open for the re-ring.
+    hook.ctl.lock().unwrap().status = 0;
+    wait_for_slow(
+        || hook.hits().len() == 4,
+        "the next ring never carried the correction",
+    );
+    let (headers, _) = hook.hits()[3].clone();
+    assert!(
+        headers.contains("authorization: Bearer tok-123\n"),
+        "the re-read config's auth header: {headers}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 4, "no further ring before the stop");
+    pin_log(
+        &root,
+        &[concat!(
+            "failure seat=kotek-grokbot ring attempt 1 failed: ",
+            "webhook failed after 3 attempt(s) (HTTP 401) ",
+            "(check webhook.auth: one line, \"Bearer <token>\")"
+        )],
+    );
+    assert!(
+        !root.join("dispatch-alarms.json").exists(),
+        "one failed ring alarms nothing"
+    );
+    let ring = load_state(&dir).ring.unwrap();
+    assert_eq!(ring.failures, 0, "the successful ring reset the ladder");
+}
+
+/// Every failed ring writes its `failure` line with its detail: four
+/// 401 rings in a row leave four lines (each ending in the auth hint),
+/// and the `webhook-failing` alarm still fires exactly once — strike
+/// 3 logs its line and fires the alarm, strike 4 logs its line and
+/// stays silent (the latch holds). On main strikes 3 and 4 log
+/// nothing: two lines and the alarm were the whole trace.
+#[test]
+fn four_failed_rings_log_four_failure_lines_and_fire_the_alarm_once() {
+    let hook = FakeWebhook::start();
+    hook.ctl.lock().unwrap().status = 401;
+    let root = signal_board(&hook.url());
+    let dir = kotek_dir(&root);
+    let name = fresh_mail(&root, "fourfail");
+    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false, None);
+    for n in 1..=4u32 {
+        if n > 1 {
+            rewind_deadline(&dir);
+        }
+        assert_eq!(
+            webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+            RingOutcome::Waiting,
+            "ring {n}: a failed ring is a waiting pass"
+        );
+        assert_eq!(hook.hits().len(), 3 * n as usize, "3 attempts per ring");
+    }
+    pin_log(
+        &root,
+        &[
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 1 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 2 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 3 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            concat!(
+                "alarm seat=kotek-grokbot cause=webhook-failing ",
+                "3 rings failed in a row (webhook failed after 3 attempt(s) (HTTP 401))"
+            ),
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 4 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatch-alarms.json")).unwrap(),
+        "{\"causes\":[\"webhook-failing:kotek-grokbot\"]}\n",
+        "the alarm latched once, cleared by nothing"
+    );
+    let ring = load_state(&dir).ring.unwrap();
+    assert_eq!(ring.failures, 4);
+    assert_eq!(
+        ring.backoff_ms, 3_600_000,
+        "the ladder kept doubling to the cap"
+    );
+    assert_eq!(ring.rung, [name]);
+}
+
+/// A reload that fails during an open burst skips the ring, not the
+/// worker: with the message still in `inbox/`, removing `bridge.key`
+/// makes the next due ring write one `failure` line naming the missing
+/// file, send nothing, and touch no state — the burst's rung list and
+/// backoff stand exactly as the last good ring left them — and once
+/// the file is restored the following ring succeeds. On main the
+/// worker never re-reads its files, so it rings on with the config it
+/// was spawned with and the missing-file line never appears.
+#[test]
+fn a_failed_reload_mid_burst_skips_the_ring_not_the_worker() {
+    let _env = lock_env(&[(HTTP_ENV, OsString::from("1"))]);
+    let hook = FakeWebhook::start();
+    let root = signal_board(&hook.url());
+    let dir = kotek_dir(&root);
+    let name = fresh_mail(&root, "reloadfix");
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    let waits = RingWaits {
+        first: Duration::from_secs(2),
+        max: Duration::from_secs(2),
+    };
+    std::thread::spawn(move || {
+        webhook::worker_loop(r, "kotek-grokbot".into(), s, waits, None);
+        d.store(true, Ordering::SeqCst);
+    });
+    wait_for(|| hook.hits().len() == 1, "the first ring never happened");
+    wait_for(
+        || load_state(&dir).ring.is_some(),
+        "the first pass never recorded its burst",
+    );
+    let state_after_pass1 = std::fs::read_to_string(dir.join("dispatch.json")).unwrap();
+    // The burst is open; the operator breaks the config.
+    std::fs::remove_file(dir.join("bridge.key")).unwrap();
+    wait_for(
+        || {
+            std::fs::read_to_string(root.join("dispatch.log"))
+                .unwrap_or_default()
+                .contains("no bridge.key staged")
+        },
+        "the broken reload never logged",
+    );
+    assert_eq!(hook.hits().len(), 1, "a skipped ring sends nothing");
+    assert!(!done.load(Ordering::SeqCst), "the worker must stay alive");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dispatch.json")).unwrap(),
+        state_after_pass1,
+        "the skipped ring touched no state: rung, backoff, deadline, failures"
+    );
+    // The file restored: the following ring succeeds.
+    std::fs::write(dir.join("bridge.key"), format!("{KEY}\n")).unwrap();
+    wait_for(
+        || hook.hits().len() == 2,
+        "the restored config never rang again",
+    );
+    stop.store(true, Ordering::SeqCst);
+    wait_for(|| done.load(Ordering::SeqCst), "the worker never exited");
+    assert_eq!(hook.hits().len(), 2);
+    pin_log(
+        &root,
+        &["failure seat=kotek-grokbot webhook: no bridge.key staged"],
+    );
+    assert!(
+        !root.join("dispatch-alarms.json").exists(),
+        "a skipped reload alarms nothing"
+    );
+    let ring = load_state(&dir).ring.unwrap();
+    assert_eq!(ring.failures, 0, "a skipped ring is not a failed ring");
+    assert_eq!(ring.backoff_ms, 2_000);
+    assert_eq!(ring.rung, [name]);
 }
 
 /// Write the ingest env file (`KEY=VALUE` lines) into the current

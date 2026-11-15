@@ -169,7 +169,9 @@ runs `receive` and never archives — it rings, and re-rings until every
 rung message has left `inbox/` and `draining/` (backoff from 1 min
 doubling to 1 h). A webhook worker rechecks its route before each pass
 and during its waits, and steps aside when its seat becomes
-hapi-bound. Two modes, byte for byte against the scripts they replace:
+hapi-bound; it also re-reads the seat's webhook files before each
+pass, so a corrected file takes effect at the next ring. Two modes,
+byte for byte against the scripts they replace:
 
 - **signal** (`wake-grokbot`): `webhook.url` (must start `https://`),
   `bridge.key`, optional `webhook.auth` (one line; an `Authorization:`
@@ -196,6 +198,34 @@ hapi-bound. Two modes, byte for byte against the scripts they replace:
   User-Agent `bll-seat-mail/1 (Slix)`, 5 s timeout. A missing env
   file or failed receipt is dropped — never resent — and the payload
   delivery stands; the secret values are never logged.
+
+### Staging a Grok bot seat
+
+A Grok bot seat is a webhook seat: the bot drains the board itself, so
+delivery rings its webhook instead of posting to a hub session. Stage
+the files, register the seat, and leave the dispatcher running:
+
+```sh
+seat --root "$ROOT" register --seat matter-grokbot --harness local
+printf 'https://panel.example/hook\n' > "$ROOT/seats/matter-grokbot/webhook.url"
+printf 'bridge-hmac-secret\n'       > "$ROOT/seats/matter-grokbot/bridge.key"
+printf 'Bearer bot-token\n'         > "$ROOT/seats/matter-grokbot/webhook.auth"
+```
+
+- `webhook.url` — one line, must start `https://`: where each ring is
+  POSTed.
+- `bridge.key` — one line, the HMAC secret behind `X-Memo-Signature`.
+- `webhook.auth` — one line, the `Authorization` value sent verbatim
+  (`Bearer <token>`). Without it a receiver that checks auth answers
+  401 or 403, and every failed ring's line in `dispatch.log` ends
+  with `(check webhook.auth: one line, "Bearer <token>")`.
+
+`seat dispatch` must be running on the machine that holds the board
+(the `seat-dispatch` user service). Ring results land in
+`<root>/dispatch.log`: one `failure` line per failed ring — a
+corrected `webhook.url`, `bridge.key` or `webhook.auth` takes effect
+at the next ring — and the `webhook-failing` alarm fires once until a
+ring succeeds.
 
 ### Alarms
 

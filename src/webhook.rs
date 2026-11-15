@@ -45,6 +45,7 @@ pub(crate) enum RingOutcome {
     Idle,    // nothing to ring: the bot's drain took everything
 }
 
+#[derive(Clone)]
 pub(crate) struct WebhookConfig {
     pub(crate) url: String,
     pub(crate) key: String,
@@ -71,13 +72,30 @@ fn private_line(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Tests load a URL that points at the local plaintext receiver:
+/// with `SEAT_WEBHOOK_ALLOW_HTTP` set, an `http://` URL loads too.
+/// The seam is compile-time, like `WebhookConfig::mem`'s: only the
+/// test build reads the variable, and a shipped binary fails closed
+/// on anything but `https://` whatever its environment says.
+#[cfg(test)]
+fn http_allowed() -> bool {
+    std::env::var_os("SEAT_WEBHOOK_ALLOW_HTTP").is_some()
+}
+
+/// The production rule: no environment lets `http://` through.
+#[cfg(not(test))]
+fn http_allowed() -> bool {
+    false
+}
+
 impl WebhookConfig {
     /// Fail closed like the scripts: no URL/key staged, or a URL not
     /// starting `https://`, is an error and nothing is sent.
     pub(crate) fn load(dir: &Path) -> Result<WebhookConfig> {
         let url = private_line(&dir.join("webhook.url"))?
             .ok_or_else(|| SeatError::Webhook("no webhook.url staged".into()))?;
-        if !url.starts_with("https://") {
+        let plain_http = http_allowed() && url.starts_with("http://");
+        if !url.starts_with("https://") && !plain_http {
             return Err(SeatError::Webhook(
                 "webhook.url does not start https://".into(),
             ));
@@ -411,9 +429,31 @@ pub(crate) fn ring_once(
     }
 }
 
-/// Strikes 1 and 2 of the failed-ring ladder log one failure line
-/// each; strike 3 is the `webhook-failing` alarm (once per cause).
+/// What a failed ring's `failure` line adds when the receiver
+/// refused the auth: the file that fixes it and its one-line format.
+/// The hint names the shape, never a secret value.
+const AUTH_HINT: &str = "(check webhook.auth: one line, \"Bearer <token>\")";
+
+/// A failed ring's logged detail: an HTTP 401 or 403 ends with the
+/// `webhook.auth` hint; every other detail logs exactly as it failed.
+fn with_auth_hint(detail: &str) -> String {
+    if detail.contains("HTTP 401") || detail.contains("HTTP 403") {
+        format!("{detail} {AUTH_HINT}")
+    } else {
+        detail.to_string()
+    }
+}
+
+/// Every failed ring logs its `failure` line with the detail; strike
+/// 3 and beyond also fire the `webhook-failing` alarm (once per
+/// cause — later strikes log their line and stay silent).
 fn strike(root: &Path, seat: &str, n: u32, detail: &str) -> Result<()> {
+    log_line(
+        root,
+        "failure",
+        seat,
+        &format!("ring attempt {n} failed: {}", with_auth_hint(detail)),
+    );
     if n >= 3 {
         alarm::fire(
             root,
@@ -422,12 +462,6 @@ fn strike(root: &Path, seat: &str, n: u32, detail: &str) -> Result<()> {
             &format!("{n} rings failed in a row ({detail})"),
         )
     } else {
-        log_line(
-            root,
-            "failure",
-            seat,
-            &format!("ring attempt {n} failed: {detail}"),
-        );
         Ok(())
     }
 }
@@ -543,16 +577,49 @@ pub(crate) fn ring_pass(
     })
 }
 
+/// The wait after a ring skipped for a config that would not load:
+/// the skipped ring wrote no state, so the burst's own deadline —
+/// kept as it was, else its kept backoff, else the first wait —
+/// paces the next attempt. Only stop and a route change end the wait
+/// early; the worker neither spins on the broken files nor dies with
+/// mail still owed a ring.
+fn wait_skipped_ring(root: &Path, dir: &Path, seat: &str, stop: &AtomicBool, waits: RingWaits) {
+    let ring = load_state(dir).ring.unwrap_or_default();
+    let now = chrono::Utc::now();
+    let retry_in = ring_deadline(ring.next_at.as_deref())
+        .filter(|at| *at > now)
+        .map(|at| at - now)
+        .or_else(|| {
+            (ring.backoff_ms > 0).then(|| {
+                chrono::TimeDelta::from_std(Duration::from_millis(ring.backoff_ms))
+                    .unwrap_or_default()
+            })
+        })
+        .or_else(|| chrono::TimeDelta::from_std(waits.first).ok())
+        .unwrap_or_default();
+    let retry_at = now + retry_in;
+    while chrono::Utc::now() < retry_at {
+        if stop.load(Ordering::SeqCst) || !still_webhook(root, seat) {
+            return;
+        }
+        std::thread::sleep(SLICE);
+    }
+}
+
 /// The worker body: pass after pass while the burst is open, sleeping
-/// to the next re-ring and woken at once by new mail. Idle, a broken
-/// config or a route change (the seat became hapi-bound — the scan
-/// spawns the hapi worker instead — or `webhook.url` was removed, the
-/// seat falling back to pull) ends it; the scan retries in 2 s. The
-/// first pass always runs even with stop already set (`--once` sets
-/// stop immediately after spawning, and the worker it spawned must
-/// still ring once before it returns); stop ends the loop only after
-/// a completed pass. `cfg` overrides the on-disk config (tests point
-/// the POST at a local receiver).
+/// to the next re-ring and woken at once by new mail. Idle or a route
+/// change (the seat became hapi-bound — the scan spawns the hapi
+/// worker instead — or `webhook.url` was removed, the seat falling
+/// back to pull) ends it; the scan retries in 2 s. The first pass
+/// always runs even with stop already set (`--once` sets stop
+/// immediately after spawning, and the worker it spawned must still
+/// ring once before it returns); stop ends the loop only after a
+/// completed pass. `cfg` overrides the on-disk config (tests point
+/// the POST at a local receiver); without it the seat's webhook files
+/// are re-read before every pass, so a corrected file takes effect at
+/// the next ring — a load that fails logs one `failure` line, sends
+/// nothing, leaves the burst and its backoff exactly as they were,
+/// and the worker lives on to try the next due ring.
 pub(crate) fn worker_loop(
     root: PathBuf,
     seat: String,
@@ -561,21 +628,29 @@ pub(crate) fn worker_loop(
     cfg: Option<WebhookConfig>,
 ) {
     let dir = seat::seat_dir(&root, &seat);
-    let loaded = cfg.map_or_else(|| WebhookConfig::load(&dir), Ok);
-    let cfg = match loaded {
-        Ok(cfg) => cfg, // fail closed like the scripts: nothing is sent
-        Err(e) => {
-            log_line(&root, "failure", &seat, &e.to_string());
-            return;
-        }
-    };
     let sleeper = |d: Duration| std::thread::sleep(d);
     let mut first = true;
     loop {
         if (!first && stop.load(Ordering::SeqCst)) || !still_webhook(&root, &seat) {
             return;
         }
-        match ring_pass(&root, &seat, &cfg, waits, &sleeper) {
+        let loaded = match &cfg {
+            Some(override_cfg) => Ok(override_cfg.clone()),
+            None => WebhookConfig::load(&dir),
+        };
+        let pass_cfg = match loaded {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                if present_files(&dir).is_empty() {
+                    return; // the bot drained the burst: nothing owes a ring
+                }
+                log_line(&root, "failure", &seat, &e.to_string());
+                first = false; // a skipped pass counts: stop may end the loop
+                wait_skipped_ring(&root, &dir, &seat, &stop, waits);
+                continue;
+            }
+        };
+        match ring_pass(&root, &seat, &pass_cfg, waits, &sleeper) {
             Ok(RingOutcome::Idle) => return,
             Ok(_) => {}
             Err(e) => {
@@ -659,6 +734,58 @@ mod tests {
             next_at: next_at.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    /// The auth hint, the whole three-case rule, through `strike`
+    /// itself: a 401 detail and a 403 detail each end with the
+    /// `webhook.auth` hint — the file and its one-line format, never
+    /// a secret value — and a 500 (like every other detail) logs
+    /// exactly as it failed.
+    #[test]
+    fn the_failure_detail_carries_the_auth_hint_for_401_and_403_only() {
+        let root = temp_root("webhook-auth-hint");
+        strike(
+            &root,
+            "kotek-grokbot",
+            1,
+            "webhook failed after 3 attempt(s) (HTTP 401)",
+        )
+        .unwrap();
+        strike(
+            &root,
+            "kotek-grokbot",
+            1,
+            "abcdef12: webhook failed after 1 attempt(s) (HTTP 403)",
+        )
+        .unwrap();
+        strike(
+            &root,
+            "kotek-grokbot",
+            1,
+            "abcdef12: webhook failed after 1 attempt(s) (HTTP 500)",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        let tails: Vec<&str> = raw
+            .strip_suffix('\n')
+            .unwrap()
+            .split('\n')
+            .map(|l| l.split_once(' ').unwrap().1)
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                "failure seat=kotek-grokbot ring attempt 1 failed: webhook failed after 3 attempt(s) (HTTP 401) (check webhook.auth: one line, \"Bearer <token>\")",
+                "failure seat=kotek-grokbot ring attempt 1 failed: abcdef12: webhook failed after 1 attempt(s) (HTTP 403) (check webhook.auth: one line, \"Bearer <token>\")",
+                "failure seat=kotek-grokbot ring attempt 1 failed: abcdef12: webhook failed after 1 attempt(s) (HTTP 500)",
+            ],
+            "the complete log minus the stamps"
+        );
+        assert!(!raw.contains("Bearer tok-"), "no secret is ever logged");
+        assert!(
+            !root.join("dispatch-alarms.json").exists(),
+            "no alarm before strike 3"
+        );
     }
 
     /// `due_at`'s whole truth table, the ring-pass half of the wake
