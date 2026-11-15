@@ -1228,9 +1228,14 @@ fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (r, d, s) = (root.clone(), Arc::clone(&done), Arc::clone(&stop));
+    // The re-ring deadline is stamped from the pass's start, and the
+    // first ring's retries sleep 6 s before the pass ends, so the
+    // first wait — and the max that caps it — must outlast them:
+    // the re-ring stays in the future after the retries, giving the
+    // correction a window to land before the worker's re-read.
     let waits = RingWaits {
-        first: Duration::from_secs(1),
-        max: Duration::from_secs(2),
+        first: Duration::from_secs(8),
+        max: Duration::from_secs(8),
     };
     std::thread::spawn(move || {
         webhook::worker_loop(r, "kotek-grokbot".into(), s, waits, None);
@@ -1238,8 +1243,11 @@ fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
     });
     // The first ring: the script's 3 attempts, every one 401, none
     // authorized (waited one attempt at a time — the retries sleep
-    // 2 s then 4 s, past a single `wait_for` ceiling).
-    for wanted in 1..=3 {
+    // 2 s then 4 s, past a single `wait_for` ceiling). Only the
+    // first two are waited out before the correction: the third
+    // attempt returns with the deadline already close, and the pass
+    // must not end before the file is on disk.
+    for wanted in 1..=2 {
         wait_for_slow(
             || hook.hits().len() == wanted,
             "the first ring's attempts never finished",
@@ -1251,8 +1259,17 @@ fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
             "no auth staged: {headers}"
         );
     }
-    // The correction, written mid-burst with the mail still in inbox/.
+    // The correction, written mid-burst with the mail still in
+    // inbox/, inside the 4 s retry sleep that follows the second
+    // attempt: on disk well before the pass ends, so the re-read
+    // before the next ring cannot miss it.
     std::fs::write(dir.join("webhook.auth"), "Bearer tok-123\n").unwrap();
+    wait_for_slow(
+        || hook.hits().len() == 3,
+        "the first ring's last attempt never finished",
+    );
+    // The receiver accepts again — only now, after the last attempt
+    // of the failed ring, so the burst stays open for the re-ring.
     hook.ctl.lock().unwrap().status = 0;
     wait_for_slow(
         || hook.hits().len() == 4,

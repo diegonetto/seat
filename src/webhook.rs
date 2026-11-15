@@ -74,10 +74,18 @@ fn private_line(path: &Path) -> Result<Option<String>> {
 
 /// Tests load a URL that points at the local plaintext receiver:
 /// with `SEAT_WEBHOOK_ALLOW_HTTP` set, an `http://` URL loads too.
-/// Nothing on a live board sets this — the production rule below
-/// still refuses anything but `https://`.
+/// The seam is compile-time, like `WebhookConfig::mem`'s: only the
+/// test build reads the variable, and a shipped binary fails closed
+/// on anything but `https://` whatever its environment says.
+#[cfg(test)]
 fn http_allowed() -> bool {
     std::env::var_os("SEAT_WEBHOOK_ALLOW_HTTP").is_some()
+}
+
+/// The production rule: no environment lets `http://` through.
+#[cfg(not(test))]
+fn http_allowed() -> bool {
+    false
 }
 
 impl WebhookConfig {
