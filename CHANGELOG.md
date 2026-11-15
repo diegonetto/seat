@@ -2,6 +2,37 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.8.5] - 2026-11-14
+
+### Fixed
+
+- A webhook seat's corrected files take effect at the next ring, every
+  failed ring says why, and the staging steps are written down. On
+  11-14 a new webhook seat was staged with no `webhook.auth`; every
+  ring got HTTP 401, and three defects made that slow to find and slow
+  to fix. The worker loaded the seat's webhook files once and reused
+  them for the whole burst (`webhook::worker_loop` lived until every
+  rung message drained), so the added `webhook.auth` was ignored and
+  the next ring failed again — only a hand-made POST, which let the
+  bot drain, ended the burst; the worker now re-reads the files before
+  every ring pass, and a load that fails (a file removed mid-burst)
+  logs one `failure` line naming it, sends nothing, leaves the burst,
+  its rung list and its backoff exactly as they were, and keeps the
+  worker alive for the next due ring. `strike` logged the `failure`
+  detail for the first two failed rings only — from the third the
+  once-per-cause `webhook-failing` alarm fired and later rings logged
+  nothing, so `dispatch.json` showed `failures: 6` while
+  `dispatch.log` held two lines; every failed ring now writes its line
+  (an HTTP 401 or 403 detail ends with
+  `(check webhook.auth: one line, "Bearer <token>")`; no secret is
+  ever logged), and the alarm still fires once per cause. The README
+  gained "Staging a Grok bot seat": the exact files and formats
+  (`webhook.url` starting `https://`; `bridge.key`, the HMAC secret
+  for `X-Memo-Signature`; `webhook.auth`, one line, the Authorization
+  value), the register command, that `seat dispatch` (the
+  `seat-dispatch` user service) must run on the machine that holds
+  the board, and that ring results are in `<root>/dispatch.log`.
+
 ## [0.8.4] - 2026-10-30
 
 ### Changed

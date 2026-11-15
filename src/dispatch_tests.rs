@@ -886,9 +886,10 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     assert_eq!(log_text(&root).matches("cause=undelivered").count(), 2);
     assert_eq!(alarm_mail(&root).len(), 8);
 
-    // webhook-failing: strikes 1 and 2 log one failure line each,
-    // strike 3 alarms once, further failures stay silent, and a
-    // successful ring clears.
+    // webhook-failing: every failed ring logs one failure line with
+    // its detail, strike 3 also alarms once, further failures keep
+    // logging their line and stay silent on the alarm (the latch
+    // holds), and a successful ring clears.
     let hook = FakeWebhook::start();
     verbs::cmd_register(&root, "grok", "sb", None, None, Vec::new(), None).unwrap();
     let gdir = seat::seat_dir(&root, "grok");
@@ -908,7 +909,8 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
             log_text(&root)
                 .matches(&format!("ring attempt {i} failed"))
                 .count(),
-            usize::from(i <= 2)
+            1,
+            "every failed ring writes its own line"
         );
     }
     assert_eq!(
