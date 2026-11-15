@@ -412,59 +412,20 @@ pub(crate) fn try_sleep(
     dstate::store_state(&seat::seat_dir(root, seat), state)?;
     // Down through the same path `cmd_down` runs for one pane, never
     // a signal by pid and never a pane the board did not start — and
-    // only the pane the clock timed (a replacement that snuck in under
-    // the same seat name is left standing).
+    // only the pane the clock timed (a replacement that snuck in
+    // under the same seat name is left standing). The shared
+    // kill-then-verify tail decides a refused kill, and only a
+    // cancelled sleep answers false.
     let recorded = state.pane_id.clone();
-    let killed = crate::session::kill_seat_pane_if(seat, recorded.as_deref())?;
-    if !killed {
-        match crate::session::live_pane_id(seat) {
-            // A live pane the decision never named took the seat
-            // between the pass's pane check and the kill: the sleep
-            // just recorded is cancelled — nothing dies, the mark
-            // clears with the fact, and the next pass's pane fact
-            // starts a fresh clock on the pane that stands.
-            Some(Some(id)) if Some(id.as_str()) != recorded.as_deref() => {
-                state.asleep = None;
-                state.wake_hold = None;
-                state.pane_seen_at = None;
-                state.pane_id = None;
-                dstate::store_state(&seat::seat_dir(root, seat), state)?;
-                dstate::log_line(
-                    root,
-                    "sleep",
-                    seat,
-                    &format!("reason={reason} cancelled=1 cause=pane-replaced"),
-                );
-                return Ok(false);
-            }
-            // The multiplexer cannot be asked again: the stored mark
-            // stays beside the fact — a pending kill the next pass
-            // settles (`settle_pending_sleep`).
-            None => {
-                dstate::log_line(
-                    root,
-                    "sleep",
-                    seat,
-                    &format!("reason={reason} pane_killed=false pending=1"),
-                );
-                return Ok(true);
-            }
-            // The pane the mark named is gone (it died between the
-            // pass's pane check and here): the sleep is complete —
-            // the mark stands, only the fact clears, below.
-            _ => {}
-        }
-    }
-    state.pane_seen_at = None; // the pane is gone; the next pane starts a fresh clock
-    state.pane_id = None;
-    dstate::store_state(&seat::seat_dir(root, seat), state)?;
-    dstate::log_line(
+    Ok(kill_then_verify(
         root,
-        "sleep",
         seat,
-        &format!("reason={reason} pane_killed={killed}"),
-    );
-    Ok(true)
+        state,
+        recorded.as_deref(),
+        &reason,
+        "pane_killed=false pending=1",
+        "",
+    )?)
 }
 
 /// Settle a sleep whose kill never landed: `try_sleep` records the
@@ -564,43 +525,17 @@ pub(crate) fn settle_pending_sleep(
             // Only the pane the decision named, verified quiet. A
             // refusal means the pane set moved between the pane query
             // above and here, and the re-query decides — the same way
-            // the first sleep's refusal does: a different live pane
-            // cancels, an unanswerable multiplexer settles nothing
-            // this pass, and only a gone pane completes below.
-            let killed = crate::session::kill_seat_pane_if(seat, Some(id.as_str()))?;
-            if !killed {
-                match crate::session::live_pane_id(seat) {
-                    // A replacement that snuck in under the same seat
-                    // name after the query that verified it: nothing
-                    // dies, the same cancel as the first check's.
-                    Some(Some(other)) if Some(other.as_str()) != recorded.as_deref() => {
-                        return cancel_sleep(root, seat, state, &reason, "pane-replaced");
-                    }
-                    // The multiplexer cannot be asked again: the mark
-                    // and the fact stay — the next pass settles.
-                    None => {
-                        dstate::log_line(
-                            root,
-                            "sleep",
-                            seat,
-                            &format!("reason={reason} pending=1 cause=pane-unknown"),
-                        );
-                        return Ok(());
-                    }
-                    // The pane the mark named is gone: the sleep is
-                    // complete, below.
-                    _ => {}
-                }
-            }
-            state.pane_seen_at = None;
-            state.pane_id = None;
-            dstate::store_state(&seat::seat_dir(root, seat), state)?;
-            dstate::log_line(
+            // the first sleep's refusal does, through the shared
+            // kill-then-verify tail.
+            kill_then_verify(
                 root,
-                "sleep",
                 seat,
-                &format!("reason={reason} pane_killed={killed} finished=1"),
-            );
+                state,
+                Some(id.as_str()),
+                &reason,
+                "pending=1 cause=pane-unknown",
+                " finished=1",
+            )?;
         }
     }
     Ok(())
@@ -629,6 +564,71 @@ fn cancel_sleep(
         &format!("reason={reason} cancelled=1 cause={cause}"),
     );
     Ok(())
+}
+
+/// The tail `try_sleep` and `settle_pending_sleep` share: kill the
+/// recorded pane and, when the kill names nothing — the pane set moved
+/// between the decision and the kill — ask the multiplexer once more.
+/// The three answers are the sleep safety rules themselves, written
+/// once: a live pane the decision never named cancels the sleep
+/// through `cancel_sleep` (nothing dies, and the next pass's pane fact
+/// starts a fresh clock on the pane that stands); a multiplexer that
+/// cannot be asked settles nothing this pass (the mark and the fact
+/// stay pending); a pane that is gone completes the sleep (only the
+/// fact clears, and the next pane starts a fresh clock). The two
+/// callers word their pending and completing lines differently, so
+/// each passes its own `pending_tail` and `done_suffix` for the
+/// `reason=` line — the cancel line they already share. The returned
+/// bool is `try_sleep`'s verdict verbatim — `false` only for the
+/// cancel; `settle_pending_sleep` needs only the tail's effects.
+fn kill_then_verify(
+    root: &Path,
+    seat: &str,
+    state: &mut DispatchState,
+    recorded: Option<&str>,
+    reason: &str,
+    pending_tail: &str,
+    done_suffix: &str,
+) -> Result<bool> {
+    let killed = crate::session::kill_seat_pane_if(seat, recorded)?;
+    if !killed {
+        match crate::session::live_pane_id(seat) {
+            // A live pane the decision never named took the seat
+            // between the pass's pane check and the kill: the sleep
+            // is cancelled — nothing dies, the mark clears with the
+            // fact, and the next pass's pane fact starts a fresh
+            // clock on the pane that stands.
+            Some(Some(id)) if Some(id.as_str()) != recorded => {
+                cancel_sleep(root, seat, state, reason, "pane-replaced")?;
+                return Ok(false);
+            }
+            // The multiplexer cannot be asked again: the stored mark
+            // stays beside the fact — a pending kill the next pass
+            // settles.
+            None => {
+                dstate::log_line(
+                    root,
+                    "sleep",
+                    seat,
+                    &format!("reason={reason} {pending_tail}"),
+                );
+                return Ok(true);
+            }
+            // The pane the mark named is gone: the sleep is complete —
+            // the mark stands, only the fact clears, below.
+            _ => {}
+        }
+    }
+    state.pane_seen_at = None; // the pane is gone; the next pane starts a fresh clock
+    state.pane_id = None;
+    dstate::store_state(&seat::seat_dir(root, seat), state)?;
+    dstate::log_line(
+        root,
+        "sleep",
+        seat,
+        &format!("reason={reason} pane_killed={killed}{done_suffix}"),
+    );
+    Ok(true)
 }
 
 #[cfg(test)]
