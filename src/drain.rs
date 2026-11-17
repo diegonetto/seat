@@ -19,9 +19,7 @@ pub const LEASE: Duration = Duration::from_secs(30 * 60);
 /// leftovers and the hapi dispatcher's staged items are never leased.
 /// Used in exactly two places: `receive` skips a leased file (not
 /// printed, not quarantined, not committed) and `present_files`
-/// leaves it out, so held mail is owed by nobody — no ring, no scan
-/// worker, no alarm — until its deadline passes, and owed again the
-/// moment after.
+/// leaves it out.
 pub(crate) fn leased(path: &Path) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -30,28 +28,12 @@ pub(crate) fn leased(path: &Path) -> bool {
         .is_some()
 }
 
-/// Set a file's mtime, leaving its atime alone. The lease deadline
-/// lives in the mtime and nowhere else.
+/// Set a file's mtime, leaving its atime alone.
 pub(crate) fn set_mtime(path: &Path, at: SystemTime) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let since_epoch = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: since_epoch.as_secs() as libc::time_t,
-            tv_nsec: since_epoch.subsec_nanos() as libc::c_long,
-        },
-    ];
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_times(std::fs::FileTimes::new().set_modified(at))
 }
 
 /// One verified direct message, staged in `draining/` and awaiting
@@ -102,6 +84,13 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 
     commit(root, seat_name, &received)?;
 
+    report_failures(&received)
+}
+
+/// Report `receive`'s failures the way every drain verb does: the
+/// first bad mark is the named error, an unreadable quarantine is its
+/// own, and good mail has already been handled.
+fn report_failures(received: &Received) -> Result<()> {
     if !received.bad_marks.is_empty() {
         // The error names the first sender. Name any further ones here so
         // the process prints each claimed from once.
@@ -147,16 +136,7 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
         write!(out, "{}", dstate::direct_text(d))?;
     }
 
-    if !received.bad_marks.is_empty() {
-        for from in &received.bad_marks[1..] {
-            eprintln!("drain: message from '{from}' failed mark verification; not delivered");
-        }
-        return Err(SeatError::BadMark(received.bad_marks[0].clone()));
-    }
-    if received.unreadable {
-        return Err(SeatError::Unreadable);
-    }
-    Ok(())
+    report_failures(&received)
 }
 
 /// The `drain --done` verb: under the seat lock, archive exactly the
@@ -201,6 +181,7 @@ pub fn done(root: &Path, seat_name: &str, ids: &[String]) -> Result<()> {
     };
     // The whole command is decided before the first rename: an
     // ambiguous id archives nothing.
+    let mut picks: Vec<PathBuf> = Vec::new();
     for id in ids {
         let matches = matching(id);
         if matches.len() > 1 {
@@ -218,18 +199,19 @@ pub fn done(root: &Path, seat_name: &str, ids: &[String]) -> Result<()> {
                 "--done id {id} matches two files: {both}"
             )));
         }
+        if let Some(p) = matches.into_iter().next() {
+            picks.push(p);
+        }
     }
-    for id in ids {
-        if let Some(p) = matching(id).first() {
-            let to = dir.join("archive").join(p.file_name().unwrap_or_default());
-            // The staged listing is a snapshot, so an id repeated in
-            // one command renames its file once and then, like a file
-            // taken by a later drain, finds it gone: success, not an
-            // error (commit_invoked tolerates the same race).
-            if let Err(e) = std::fs::rename(p, to) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(e.into());
-                }
+    for p in picks {
+        let to = dir.join("archive").join(p.file_name().unwrap_or_default());
+        // The staged listing is a snapshot, so an id repeated in
+        // one command renames its file once and then, like a file
+        // taken by a later drain, finds it gone: success, not an
+        // error (commit_invoked tolerates the same race).
+        if let Err(e) = std::fs::rename(&p, to) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e.into());
             }
         }
     }
