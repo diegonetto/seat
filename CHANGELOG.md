@@ -48,7 +48,7 @@ Notable changes to this crate. Versions follow semantic versioning.
   existing units; the unit name is load-bearing (run 1b keys hq
   liveness on it), and stopping the dispatcher on purpose now means
   stopping the timer first. `tests/watchdog-drill.sh` (also run from
-  `tests/smoke.sh`) drills the six failure shapes with real seat verbs
+  `tests/smoke.sh`) drills the failure shapes with real seat verbs
   and a stub systemctl. `src/alarm.rs` and its mail keep working
   unchanged.
 
