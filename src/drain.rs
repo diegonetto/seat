@@ -222,7 +222,15 @@ pub fn done(root: &Path, seat_name: &str, ids: &[String]) -> Result<()> {
     for id in ids {
         if let Some(p) = matching(id).first() {
             let to = dir.join("archive").join(p.file_name().unwrap_or_default());
-            std::fs::rename(p, to)?;
+            // The staged listing is a snapshot, so an id repeated in
+            // one command renames its file once and then, like a file
+            // taken by a later drain, finds it gone: success, not an
+            // error (commit_invoked tolerates the same race).
+            if let Err(e) = std::fs::rename(p, to) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
         }
     }
     seat::update_meta(&dir, |meta| {
@@ -918,5 +926,25 @@ mod tests {
         done(&root, "beta", &[id_of(&staged[0])]).unwrap();
         assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+    }
+
+    /// An id repeated in one `--done` is success, like an id with no
+    /// file: the file archives once and the command still stamps
+    /// `last_drained` and exits 0.
+    #[test]
+    fn done_with_a_repeated_id_archives_once_and_succeeds() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "repeat me", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let id = id_of(&staged[0]);
+
+        done(&root, "beta", &[id.clone(), id.clone()]).unwrap();
+        assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+        assert!(seat::read_meta(&dir).unwrap().last_drained.is_some());
     }
 }
