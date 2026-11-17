@@ -52,7 +52,7 @@ the inbox.
 seat init
 seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [-- CMD...]
 seat send [--from <from>] <to> <body>
-seat drain --seat <name>
+seat drain --seat <name> [--hold | --done <ID>...]
 seat dispatch [--once]
 seat up [name...]
 seat down [name...]
@@ -74,7 +74,41 @@ running, and it does not move any other pane.
 
 `drain` takes a per-seat lock (`<seat>/lock`) for its whole run: a
 second drain of the same seat waits, and gives up after 30 seconds with
-an error naming the seat. Drains of other seats never wait.
+an error naming the seat. Drains of other seats never wait. `--hold`
+and `--done` take the same lock the same way.
+
+### Hold, then done
+
+A bot that acts on its mail before it can safely say it used it — a
+Grok bot run that dies after reading its drain — holds instead of
+draining. The bot's loop: `drain --hold`, act, `drain --done` the ids
+it finished.
+
+`drain --hold` receives exactly as `drain` does, sets each staged
+file's mtime to the lease deadline (`now + 30 minutes`), prints the
+mail exactly as `drain` prints it, and archives nothing. Order per
+file: staged, deadline set, printed; a file whose deadline cannot be
+set is not printed and the command fails naming it. `drain --done
+<ID>...` (each id 8 lowercase hex, else the whole command is refused
+before anything is archived; two staged files matching one id is
+refused naming both) archives exactly the one `*-<id>.msg` file in
+`draining/`, leased or not, never touches `inbox/`, stamps
+`last_drained`, and prints nothing. An id with no file in `draining/`
+is success — already archived, or taken by a later drain.
+
+Held mail is leased: a plain `drain`, a second `--hold` and the hapi
+pass all leave it alone until its deadline passes, and no ring, no
+scan worker and no `undelivered` alarm count it as owed — the 2 s
+scan starts a worker and the ring fires the moment the deadline
+passes, with no new mail. A bot run that dies after its hold loses no
+mail: the mail is rung and printed again after the 30 minutes. A
+duplicate after a clock jump is possible and a loss is not. The lease
+clock is the file's mtime; the alarm's is the header `ts`.
+
+`status` counts `inbox/` only, so held mail in `draining/` is not
+counted. A payload-mode seat that holds marks hq mail done by id
+after acting on the payload — the payload carries each message's id,
+and `--done <that id>` retires it.
 
 ## Deliver to a hub session
 
@@ -170,7 +204,11 @@ rung message has left `inbox/` and `draining/` (backoff from 1 min
 doubling to 1 h). A webhook worker rechecks its route before each pass
 and during its waits, and steps aside when its seat becomes
 hapi-bound; it also re-reads the seat's webhook files before each
-pass, so a corrected file takes effect at the next ring. Two modes,
+pass, so a corrected file takes effect at the next ring. Each
+successful signal ring writes one line to `<root>/dispatch.log`:
+`rung seat=<seat> id=<id>[,<id>...]`, the ids of the files that ring
+newly covers (present minus the previous rung set), or of every
+present file when a re-ring found nothing new. Two modes,
 byte for byte against the scripts they replace:
 
 - **signal** (`wake-grokbot`): `webhook.url` (must start `https://`),
@@ -296,7 +334,9 @@ no mark, with a delivery the dispatcher recorded for this seat's bound
 session within the last 10 minutes (read from
 `<seat>/dispatch.json`; status never asks the hub). `unattended` is
 everything else. `mail=<N>` is the number of files in that seat's
-inbox. It is printed on every row. Mail does not change presence.
+inbox — held mail sitting in `draining/` under a `--hold` lease is
+not counted. It is printed on every row. Mail does not change
+presence.
 
 `seat reset` removes the marker, `seats/`, and any leftover `rooms/`.
 It removes the root directory only when that leaves the directory
@@ -310,7 +350,7 @@ empty.
 <root>/alarm-seat             the seat alarms are mailed to (one line;
                               absent or empty: the log line only)
 <root>/dispatch.lock          one dispatcher per board (non-blocking)
-<root>/dispatch.log           one line per delivery, failure, alarm
+<root>/dispatch.log           one line per delivery, failure, alarm, rung
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
 ```

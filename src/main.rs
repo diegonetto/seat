@@ -56,10 +56,21 @@ enum Command {
         to: String,
         body: String,
     },
-    /// Print a seat's unread inbox
+    /// Print a seat's unread inbox. Plain drain prints and archives;
+    /// `--hold` prints but leases the mail in `draining/` for 30
+    /// minutes instead of archiving, and `--done <ID>...` archives
+    /// exactly the held ids the bot finished with.
     Drain {
         #[arg(long)]
         seat: String,
+        /// Print the mail but hold it (leased in `draining/` for 30
+        /// minutes) instead of archiving it
+        #[arg(long)]
+        hold: bool,
+        /// Archive exactly these held message ids (each 8 lowercase
+        /// hex characters)
+        #[arg(long, value_name = "ID", num_args = 1.., conflicts_with = "hold")]
+        done: Vec<String>,
     },
     /// Deliver every routed seat's mail (hapi session or webhook;
     /// `--once` runs one scan pass; unrouted seats are pull)
@@ -133,9 +144,16 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         Command::Send { from, to, body } => {
             verbs::cmd_send(root, from.as_deref(), &to, &body, session)
         }
-        Command::Drain { seat } => {
-            let mut out = std::io::stdout().lock();
-            drain::drain(root, &seat, &mut out)
+        Command::Drain { seat, hold, done } => {
+            if hold {
+                let mut out = std::io::stdout().lock();
+                drain::hold(root, &seat, &mut out)
+            } else if !done.is_empty() {
+                drain::done(root, &seat, &done)
+            } else {
+                let mut out = std::io::stdout().lock();
+                drain::drain(root, &seat, &mut out)
+            }
         }
         Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
         Command::Up { names } => session::cmd_up(root, &names),
@@ -169,4 +187,33 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drain flags parse exactly as the verb is spelled: `--hold`
+    /// alone, `--done` with one or many ids; `--hold` and `--done`
+    /// together are refused by the parser, and `--done` with no id is
+    /// a parse error, not an empty done.
+    #[test]
+    fn drain_hold_and_done_flags_parse_as_spelled() {
+        let ok = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("seat").chain(args.iter().copied())).is_ok()
+        };
+        assert!(ok(&["drain", "--seat", "a", "--hold"]));
+        assert!(ok(&["drain", "--seat", "a", "--done", "ab12cd34"]));
+        assert!(ok(&[
+            "drain", "--seat", "a", "--done", "ab12cd34", "ef567890"
+        ]));
+        assert!(
+            !ok(&["drain", "--seat", "a", "--hold", "--done", "ab12cd34"]),
+            "--hold and --done together must be refused by the parser"
+        );
+        assert!(
+            !ok(&["drain", "--seat", "a", "--done"]),
+            "--done with no id is a parse error"
+        );
+    }
 }

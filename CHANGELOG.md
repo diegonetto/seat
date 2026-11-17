@@ -2,6 +2,54 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.9.0] - 2026-11-17
+
+### Added
+
+- `seat drain --seat X --hold` and `seat drain --seat X --done ID...`,
+  so a bot run that dies after reading its mail loses none of it. A
+  plain `drain` receives, prints and commits in one call, so a Grok
+  bot run that died after its drain left the mail in `archive/`:
+  nothing rang again and nobody was told. `--hold` receives exactly
+  as `drain` does, sets each staged file's mtime to the lease
+  deadline (`now + LEASE`, one constant, 30 minutes — the Matter
+  bot's longest run waits up to 20 minutes on an approval), prints
+  the mail exactly as `drain` prints it, and commits nothing; the
+  order per file is staged, deadline set, printed, and a file whose
+  deadline cannot be set is not printed and fails the command naming
+  it. `--done ID...` (each id 8 lowercase hex, else refused before
+  anything is archived; two staged files matching one id refused,
+  naming both) archives exactly the one `*-<id>.msg` file in
+  `draining/`, leased or not, never touches `inbox/`, stamps
+  `last_drained` and prints nothing; an id with no file is success,
+  and `--hold` together with `--done` is refused by the parser. One
+  predicate, `leased` — a file in `draining/` whose mtime is later
+  than now; nothing else ever sets a future mtime — is used in
+  exactly two places: `drain::receive` skips leased files (not
+  printed, not quarantined, not committed, so a plain `drain`, a
+  second `--hold` and the hapi pass all leave held mail alone until
+  its deadline passes) and `webhook::present_files` leaves them out,
+  so the 2 s scan, `ring_pass`, the worker's waits, the sleep checks
+  and the `undelivered` alarm all see held mail as not owed until
+  the deadline and as owed again after it — the scan starts a worker
+  and the ring fires with no new mail. On 11-17's ping (eeb38468,
+  sent 17:38:59Z, drained 17:39:11Z): with the bot on `--hold` the
+  mail stays in `draining/` until its `--done`, and had the run
+  died the scan would ring again at 18:09:11Z. The README gains
+  "Hold, then done" (the bot's loop; a duplicate after a clock jump
+  is possible and a loss is not; the lease clock is the file's
+  mtime, the alarm's the header `ts`) and the verbs table.
+
+### Changed
+
+- A successful signal ring now leaves one line in
+  `<root>/dispatch.log`: `rung seat=<seat> id=<id>[,<id>...]`, the
+  ids of the files the ring newly covers (present minus the previous
+  rung set), or of every present file when a re-ring found nothing
+  new. Before, the `Ok(true)` arm logged nothing in signal mode and
+  only `strike` wrote, so the 11-17 ring of message eeb38468 had no
+  line. Payload mode keeps its `delivered` lines and adds nothing.
+
 ## [0.8.5] - 2026-11-14
 
 ### Fixed
