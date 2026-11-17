@@ -2,6 +2,56 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.10.0] - 2026-11-17
+
+### Added
+
+- A dispatcher heartbeat and a mail watchdog that notices what the
+  dispatcher cannot report about itself. `seat dispatch` writes
+  `<root>/dispatch-heartbeat` (one `seat::now_ts()` timestamp plus a
+  newline, via `atomic_write_private`) after the webhook spawn loop on
+  every pass, `--once` included; a failed write never stops the loop
+  and is not logged — the stale heartbeat is the report. The watchdog,
+  `kit/scripts/seat-mail-watchdog.py` (stdlib only, run as
+  `python3 -I`, root by `--root`/`SEAT_ROOT`/`~/.local/share/seat`),
+  reads files only: it never opens a `.msg` file, takes no lock, runs
+  no `seat` verb and calls no hub. Its checks: a heartbeat absent or
+  older than 60 s; `hapi-sessions.json` present but not schema 1 with
+  `seats` of objects holding a string `url` (such a file silently
+  drops every binding, identity.rs's fallback); per-seat overdue mail —
+  `inbox/*.msg` plus unleased `draining/*.msg`, aged by the name's `ts`
+  and, unlike the alarm, by the file's mtime when the name carries no
+  ts — under the seat's `--mail-limit` (a new register flag with
+  `--idle-after`'s grammar, refusal (`BadMailLimit`) and keep-when-
+  omitted rule, stored as `mail_limit` on meta.json), else 15 minutes
+  for seats the dispatcher routes as hapi (bound or asleep) or webhook,
+  with pull seats unchecked unless a limit is set; and any file in
+  `seats/<seat>/quarantine/`, a problem while it stays (a rename keeps
+  the send-time mtime, so "newer than the last run" cannot be told —
+  the owner accepted the always-open reading). Recovery before
+  reporting: the first stale pass runs `systemctl --user restart
+  seat-dispatch.service` once (by name from PATH, output private,
+  120 s timeout) and records `{incident, restarted_at, exit}` in
+  `<root>/watchdog-state.json` — reporting nothing that run when the
+  exit is 0, the problem naming the restart on the next stale pass,
+  no second restart, and a fresh heartbeat clearing the incident.
+  Output is one atomic `<root>/watchdog-status.json` (temp in the same
+  directory, fsync, `os.replace`, mode 0600):
+  `{checked_at, ok, problems: [{key, seat, kind, since, detail}]}`
+  sorted by key, details carrying counts, ages, routes, limits and
+  file names only — never a body, header, token or clock time — and
+  one stdout line, `seat mail watchdog pass ok: N problems` (plus `;
+  restarted seat-dispatch.service`). Units
+  `kit/systemd/seat-mail-watchdog.service` (oneshot,
+  `TimeoutStartSec=180`) and `.timer` (`OnBootSec=2min`,
+  `OnUnitActiveSec=2min`, `AccuracySec=10s`) install beside the
+  existing units; the unit name is load-bearing (run 1b keys hq
+  liveness on it), and stopping the dispatcher on purpose now means
+  stopping the timer first. `tests/watchdog-drill.sh` (also run from
+  `tests/smoke.sh`) drills the six failure shapes with real seat verbs
+  and a stub systemctl. `src/alarm.rs` and its mail keep working
+  unchanged.
+
 ## [0.9.0] - 2026-11-17
 
 ### Added

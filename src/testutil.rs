@@ -542,7 +542,7 @@ pub mod dispatchkit {
         let root = temp_root("dispatch");
         board::init(&root).unwrap();
         for (seat, _) in seats {
-            verbs::cmd_register(&root, seat, "sb", None, None, Vec::new(), None).unwrap();
+            verbs::cmd_register(&root, seat, "sb", None, None, Vec::new(), None, None).unwrap();
         }
         write_bindings(&root, seats);
         root

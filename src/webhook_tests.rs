@@ -252,7 +252,7 @@ fn kotek_board(hook_url: &str) -> PathBuf {
     let root = temp_root("kotek");
     board::init(&root).unwrap();
     for name in ["kotek-grokbot", "inbox", "other"] {
-        verbs::cmd_register(&root, name, "sb", None, None, Vec::new(), None).unwrap();
+        verbs::cmd_register(&root, name, "sb", None, None, Vec::new(), None, None).unwrap();
     }
     let dir = kotek_dir(&root);
     std::fs::write(dir.join("webhook.url"), format!("{hook_url}\n")).unwrap();

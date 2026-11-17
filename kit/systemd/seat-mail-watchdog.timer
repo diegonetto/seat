@@ -1,0 +1,17 @@
+# The seat mail watchdog's schedule: one pass 2 minutes after boot,
+# then every 2 minutes (10 s accuracy). The dispatcher's heartbeat is
+# written every 2 s pass, so a pass finds it stale only when the
+# dispatcher has been hung or dead for over a minute.
+# Install (with the service):
+#   cp ~/Projects/seat/kit/systemd/seat-mail-watchdog.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now seat-mail-watchdog.timer
+[Unit]
+Description=Run the seat mail watchdog every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

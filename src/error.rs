@@ -72,6 +72,9 @@ pub enum SeatError {
     #[error("register: --idle-after must be a duration like 30m or 2h, got {0:?}")]
     BadIdleAfter(String),
 
+    #[error("register: --mail-limit must be a duration like 30m or 2h, got {0:?}")]
+    BadMailLimit(String),
+
     #[error("up: seat {0} has no command stored")]
     NoCmd(String),
 

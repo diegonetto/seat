@@ -29,6 +29,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const SCAN_EVERY: Duration = Duration::from_secs(2);
+/// The dispatcher's heartbeat at the board root: one timestamp per
+/// pass, the mail watchdog's liveness fact.
+const HEARTBEAT_FILE: &str = "dispatch-heartbeat";
 /// localIds per queued-state call (hub limit).
 pub(crate) const QUEUED_CHUNK: usize = 1000;
 
@@ -469,6 +472,13 @@ pub(crate) fn run(root: &Path, once: bool, stop: &Arc<AtomicBool>, waits: Waits)
                 live.lock().unwrap().insert(seat, h);
             }
         }
+        // The heartbeat: every pass, `--once` included. A failed
+        // write never stops the loop and is not logged — the stale
+        // heartbeat is the report.
+        let _ = seat::atomic_write_private(
+            &root.join(HEARTBEAT_FILE),
+            format!("{}\n", seat::now_ts()).as_bytes(),
+        );
         if once {
             stop.store(true, Ordering::SeqCst); // workers finish this pass, then stop
             break;

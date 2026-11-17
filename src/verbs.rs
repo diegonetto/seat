@@ -14,10 +14,10 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 /// Register a seat: layout + one-time token mint (O_EXCL) + meta. A
 /// duplicate register keeps that seat's token, inbox, and meta — only
 /// launch fields actually passed change, and a refused register (a
-/// relative or empty `--cwd`, or an unreadable `--idle-after`)
-/// writes nothing. `--idle-after` follows the same rule as the launch
-/// fields: omitted keeps the stored value, a passed value updates it
-/// even when cwd and command are omitted.
+/// relative or empty `--cwd`, or an unreadable `--idle-after` or
+/// `--mail-limit`) writes nothing. Each follows the same rule as the
+/// launch fields: omitted keeps the stored value, a passed value
+/// updates it even when cwd and command are omitted.
 pub fn cmd_register(
     root: &Path,
     name: &str,
@@ -26,6 +26,7 @@ pub fn cmd_register(
     cwd: Option<String>,
     cmd: Vec<String>,
     idle_after: Option<String>,
+    mail_limit: Option<String>,
 ) -> Result<()> {
     board::ensure_board(root)?;
     valid_name(name)?;
@@ -42,16 +43,23 @@ pub fn cmd_register(
             return Err(SeatError::BadIdleAfter(d.to_string()));
         }
     }
+    if let Some(d) = mail_limit.as_deref() {
+        if seat::parse_idle_after(d).is_none() {
+            return Err(SeatError::BadMailLimit(d.to_string()));
+        }
+    }
     let dir = seat::seat_dir(root, name);
     if seat::meta_path(&dir).exists() || seat::token_path(&dir).exists() {
         // Zero words after `--` means the command was omitted, not
         // cleared (contract: register). Nothing passed changes nothing.
-        if cwd.is_none() && cmd.is_empty() && idle_after.is_none() {
+        if cwd.is_none() && cmd.is_empty() && idle_after.is_none() && mail_limit.is_none() {
             println!("seat '{name}' already registered (token and mail kept)");
             return Ok(());
         }
         let launch_changed = cwd.is_some() || !cmd.is_empty();
-        seat::update_meta(&dir, |m| apply_launch_fields(m, cwd, cmd, idle_after))?;
+        seat::update_meta(&dir, |m| {
+            apply_launch_fields(m, cwd, cmd, idle_after, mail_limit)
+        })?;
         println!("seat '{name}' already registered (token and mail kept)");
         if launch_changed {
             println!("seat '{name}' launch updated");
@@ -66,7 +74,7 @@ pub fn cmd_register(
         last_seen: Some(seat::now_ts()),
         ..Default::default()
     };
-    apply_launch_fields(&mut meta, cwd, cmd, idle_after);
+    apply_launch_fields(&mut meta, cwd, cmd, idle_after, mail_limit);
     seat::write_meta(&dir, &meta)?;
     println!("registered seat '{name}' (harness={harness})");
     println!("token: {}", seat::token_path(&dir).display());
@@ -75,14 +83,15 @@ pub fn cmd_register(
 
 /// Register's one rule, stated once: a launch field the call omitted
 /// keeps the meta's stored value; a field it passed updates it
-/// (`--cwd`, the command words after `--`, `--idle-after`). Both of
-/// register's paths apply it — a duplicate's read-modify-write and a
-/// new seat's first meta.
+/// (`--cwd`, the command words after `--`, `--idle-after`,
+/// `--mail-limit`). Both of register's paths apply it — a duplicate's
+/// read-modify-write and a new seat's first meta.
 fn apply_launch_fields(
     meta: &mut seat::Meta,
     cwd: Option<String>,
     cmd: Vec<String>,
     idle_after: Option<String>,
+    mail_limit: Option<String>,
 ) {
     if let Some(c) = cwd {
         meta.cwd = Some(c);
@@ -92,6 +101,9 @@ fn apply_launch_fields(
     }
     if let Some(d) = idle_after {
         meta.idle_after = Some(d);
+    }
+    if let Some(d) = mail_limit {
+        meta.mail_limit = Some(d);
     }
 }
 

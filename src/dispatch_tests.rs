@@ -594,8 +594,8 @@ fn alarm_mail(root: &std::path::Path) -> Vec<String> {
 /// The alarm sink's board: `sb-watch` registered with a token, plus a
 /// watcher seat named in `<root>/alarm-seat`.
 fn watch_board(root: &std::path::Path, watcher: &str) {
-    verbs::cmd_register(root, alarm::SEAT, "sb", None, None, Vec::new(), None).unwrap();
-    verbs::cmd_register(root, watcher, "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(root, alarm::SEAT, "sb", None, None, Vec::new(), None, None).unwrap();
+    verbs::cmd_register(root, watcher, "sb", None, None, Vec::new(), None, None).unwrap();
     std::fs::write(root.join("alarm-seat"), format!("{watcher}\n")).unwrap();
 }
 
@@ -891,7 +891,7 @@ fn alarm_matrix_once_per_cause_and_recovery_isolated() {
     // logging their line and stay silent on the alarm (the latch
     // holds), and a successful ring clears.
     let hook = FakeWebhook::start();
-    verbs::cmd_register(&root, "grok", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "grok", "sb", None, None, Vec::new(), None, None).unwrap();
     let gdir = seat::seat_dir(&root, "grok");
     std::fs::write(gdir.join("webhook.url"), format!("{}\n", hook.url())).unwrap();
     std::fs::write(gdir.join("bridge.key"), "k\n").unwrap();
@@ -1341,7 +1341,7 @@ fn dispatch_state_and_alarms_survive_a_reload() {
 fn dispatch_state_and_alarms_survive_a_reload_isolated() {
     use std::os::unix::fs::PermissionsExt;
     let root = crate::testutil::dispatchkit::board_with(&[]);
-    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None, None).unwrap();
     let dir = seat::seat_dir(&root, "alpha");
     let mut state = dstate::DispatchState::default();
     state.session = Some("s1".into());
@@ -1387,7 +1387,7 @@ fn dispatch_state_and_alarms_survive_a_reload_isolated() {
 #[test]
 fn dispatch_json_full_bytes_are_pinned() {
     let root = crate::testutil::dispatchkit::board_with(&[]);
-    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None, None).unwrap();
     let dir = seat::seat_dir(&root, "alpha");
     let mut state = dstate::DispatchState {
         session: Some("s1".into()),
@@ -1500,8 +1500,8 @@ fn dispatch_alarms_json_full_bytes_are_pinned() {
 #[test]
 fn without_alarm_seat_the_log_line_is_the_whole_alarm() {
     let root = crate::testutil::dispatchkit::board_with(&[]);
-    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
-    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None, None).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new(), None, None).unwrap();
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "again").unwrap();
     assert_eq!(
@@ -1533,8 +1533,8 @@ fn without_alarm_seat_the_log_line_is_the_whole_alarm() {
 #[test]
 fn an_alarm_seat_naming_a_missing_seat_is_a_failed_sink() {
     let root = crate::testutil::dispatchkit::board_with(&[]);
-    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None).unwrap();
-    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None, None).unwrap();
+    verbs::cmd_register(&root, alarm::SEAT, "sb", None, None, Vec::new(), None, None).unwrap();
     std::fs::write(root.join("alarm-seat"), "ghost\n").unwrap();
     alarm::fire(&root, Some("alpha"), alarm::SESSION_INACTIVE, "s1 gone").unwrap();
     let log = log_text(&root);
@@ -1764,8 +1764,7 @@ fn up_and_seen(
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     crate::session::cmd_up(&root, &[seat.to_string()]).unwrap();
@@ -2071,8 +2070,7 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        None,
-    )
+        None, None)
     .unwrap();
     verbs::cmd_register(
         &root,
@@ -2081,8 +2079,7 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     // opus's pane is up and its clock is 31 minutes old: without the
@@ -2239,7 +2236,7 @@ fn a_failed_wake_leaves_the_seat_asleep() {
     ];
     for case in cases {
         let root = board_with(&[]);
-        verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None).unwrap();
+        verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
         let kit_dir = stub_kit(
             "wake-fail",
             Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
@@ -2312,7 +2309,7 @@ fn a_failed_wake_leaves_the_seat_asleep() {
 #[test]
 fn the_scan_wakes_an_asleep_seat_the_binding_no_longer_names() {
     let root = board_with(&[]); // no bindings file at all
-    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
     let kit_dir = stub_kit(
         "scan-wake",
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
@@ -2377,7 +2374,7 @@ fn the_scan_wakes_an_asleep_seat_the_binding_no_longer_names() {
 #[test]
 fn the_scan_wakes_an_asleep_seat_that_also_holds_a_webhook_url() {
     let root = board_with(&[]); // no bindings file at all
-    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
     // A leftover hook file must not capture the wake retry.
     std::fs::write(
         seat::seat_dir(&root, "opus").join("webhook.url"),
@@ -2571,8 +2568,7 @@ fn mail_to_an_unfinished_sleep_cancels_the_kill_and_delivers() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     crate::session::cmd_up(&root, &["opus".to_string()]).unwrap();
     let pane_id = crate::session::live_pane_id("opus")
@@ -2716,8 +2712,7 @@ fn a_pending_sleep_never_kills_a_replacement_pane() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        None,
-    )
+        None, None)
     .unwrap();
     crate::session::cmd_up(&root, &["stay".to_string()]).unwrap();
     let dir = seat::seat_dir(&root, "opus");
@@ -3074,8 +3069,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
         None,
         Some(root.display().to_string()),
         vec!["seat-die".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     env.set("SEAT_FAKE_STATE", root.join("tmux.state").into_os_string());
     assert!(crate::session::cmd_up(&root, &["opus".to_string()]).is_err());
@@ -3087,8 +3081,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     crate::session::cmd_up(&root, &["opus".to_string()]).unwrap();
     let live = crate::session::live_pane_id("opus")
@@ -3916,8 +3909,7 @@ fn an_up_answer_is_held_not_retried_while_the_pane_stands() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        None,
-    )
+        None, None)
     .unwrap();
     let counter = root.join("wake-calls");
     let body = r#"
@@ -4167,8 +4159,8 @@ fn a_successful_wake_pass_full_outputs_are_pinned() {
 #[test]
 fn failed_and_up_wake_passes_full_outputs_are_pinned() {
     let root = board_with(&[]);
-    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None).unwrap();
-    verbs::cmd_register(&root, "bll", "sb", None, None, Vec::new(), None).unwrap();
+    verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
+    verbs::cmd_register(&root, "bll", "sb", None, None, Vec::new(), None, None).unwrap();
     let body = r#"
 [ "$1" = "wake" ] || { echo "stub: expected wake, got $*" >&2; exit 9; }
 if [ "$2" = "opus" ]; then
@@ -4276,8 +4268,7 @@ fn held_wake_resume_and_settle_passes_full_outputs_are_pinned() {
             None,
             Some(root.display().to_string()),
             vec!["/bin/sleep".into(), "30".into()],
-            None,
-        )
+            None, None)
         .unwrap();
     }
     let counter = root.join("wake-calls");
@@ -4600,8 +4591,7 @@ fn the_scan_settles_a_pending_sleep_with_no_binding_and_no_mail() {
         None,
         Some(root.display().to_string()),
         vec!["/bin/sleep".into(), "30".into()],
-        None,
-    )
+        None, None)
     .unwrap();
     // No kit is stubbed and PATH is left alone: the cancel path never
     // wakes, so nothing in this pass consults the kit.
@@ -4763,4 +4753,47 @@ fn a_stored_working_item_returns_to_posted_when_the_session_stops_thinking() {
         !log.contains("cause=undelivered"),
         "no page before the item's own threshold: {log}"
     );
+}
+
+/// The heartbeat: every `--once` pass writes
+/// `<root>/dispatch-heartbeat` — one rfc3339 timestamp and a
+/// newline — even on a board whose every seat is pull (no workers
+/// spawned at all), leaves no temp file behind, and stays at mode
+/// 0600. The mail watchdog's liveness fact is written by the loop
+/// itself, not by any worker.
+#[test]
+fn a_pass_writes_the_heartbeat_on_a_pull_board() {
+    let root = crate::testutil::temp_root("dispatch-heartbeat");
+    crate::board::init(&root).unwrap();
+    // A registered seat with no binding and no webhook.url: pull.
+    verbs::cmd_register(&root, "parked", "sb", None, None, Vec::new(), None, None).unwrap();
+    let beat = root.join("dispatch-heartbeat");
+    assert!(!beat.exists(), "nothing before the first pass");
+    let stop = Arc::new(AtomicBool::new(false));
+    dispatch::run(
+        &root,
+        true,
+        &stop,
+        Waits {
+            first: Duration::from_millis(5),
+            max: Duration::from_millis(5),
+        },
+    )
+    .unwrap();
+    let raw = std::fs::read_to_string(&beat).unwrap();
+    let stamp = raw.strip_suffix('\n').unwrap_or(raw.as_str());
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(stamp).is_ok(),
+        "an rfc3339 timestamp: {raw:?}"
+    );
+    assert_eq!(raw.matches('\n').count(), 1, "exactly one newline: {raw:?}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&beat).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "no temp left: {leftovers:?}");
 }

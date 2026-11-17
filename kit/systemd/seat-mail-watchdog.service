@@ -1,0 +1,18 @@
+# The seat mail watchdog: one read-only pass over the board every 2
+# minutes (seat-mail-watchdog.timer). It checks the dispatcher's
+# heartbeat, mail owed past each seat's limit, quarantine files and the
+# bindings file, restarting seat-dispatch.service once per stale
+# heartbeat, and writes <root>/watchdog-status.json. Stopping the
+# dispatcher on purpose means stopping this timer first.
+# Install:
+#   cp ~/Projects/seat/kit/systemd/seat-mail-watchdog.service ~/Projects/seat/kit/systemd/seat-mail-watchdog.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now seat-mail-watchdog.timer
+[Unit]
+Description=seat mail watchdog: one read-only board check per run
+After=seat-dispatch.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/Projects/seat/kit/scripts/seat-mail-watchdog.py
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=180

@@ -28,6 +28,11 @@ pub struct Meta {
     /// to do before sleeping it (`--idle-after`). Omitted means never.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_after: Option<String>,
+    /// How long mail may sit owed to this seat before the mail
+    /// watchdog reports it (`--mail-limit`, the same grammar as
+    /// `--idle-after`). Omitted means the watchdog's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_limit: Option<String>,
 }
 
 /// Parse an `--idle-after` duration: one integer followed by exactly
@@ -358,6 +363,7 @@ mod tests {
                 cwd: Some("/w".into()),
                 cmd: Some(vec!["/bin/sleep".into(), "9".into()]),
                 idle_after: Some("30m".into()),
+                mail_limit: Some("90m".into()),
             },
         )
         .unwrap();
@@ -374,11 +380,34 @@ mod tests {
                 "    \"/bin/sleep\",\n",
                 "    \"9\"\n",
                 "  ],\n",
-                "  \"idle_after\": \"30m\"\n",
+                "  \"idle_after\": \"30m\",\n",
+                "  \"mail_limit\": \"90m\"\n",
                 "}\n",
             ),
             "pretty JSON, every field in order, exactly one trailing newline"
         );
+    }
+
+    /// A meta written before `mail_limit` existed keeps its bytes: a
+    /// meta without the field neither gains it on read nor needs it
+    /// to parse, and a rewrite that still omits it changes nothing.
+    #[test]
+    fn meta_without_mail_limit_keeps_its_bytes() {
+        let root = temp_root("seat-meta-no-limit");
+        board::init(&root).unwrap();
+        let dir = create(&root, "alpha").unwrap();
+        let old = concat!(
+            "{\n",
+            "  \"harness\": \"h\",\n",
+            "  \"idle_after\": \"30m\"\n",
+            "}\n",
+        );
+        std::fs::write(meta_path(&dir), old).unwrap();
+        let meta = read_meta(&dir).unwrap();
+        assert_eq!(meta.mail_limit, None);
+        assert_eq!(meta.idle_after.as_deref(), Some("30m"));
+        write_meta(&dir, &meta).unwrap();
+        assert_eq!(std::fs::read_to_string(meta_path(&dir)).unwrap(), old);
     }
 
     #[test]
