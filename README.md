@@ -50,7 +50,7 @@ the inbox.
 
 ```
 seat init
-seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [-- CMD...]
+seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [--mail-limit DUR] [-- CMD...]
 seat send [--from <from>] <to> <body>
 seat drain --seat <name> [--hold | --done <ID>...]
 seat dispatch [--once]
@@ -64,7 +64,12 @@ seat reset
 `--idle-after` takes a duration (`30m`, `2h` — one integer plus
 `s`/`m`/`h`). Omitted on a first register it means never; a later
 register that omits it keeps the stored value, and a passed value
-updates it even when the launch fields are omitted.
+updates it even when the launch fields are omitted. `--mail-limit`
+takes the same grammar and follows the same rule: how long mail may
+sit owed to this seat (in `inbox/` or unleased in `draining/`) before
+the mail watchdog reports it — omitted means the watchdog's 15 minute
+default for hapi and webhook seats and no check for pull seats, and a
+set limit is checked whatever the route.
 
 `gallery` prints the names that have a live pane in `swarm`, joins those
 panes into one window named `gallery`, tiles it, and attaches. Each
@@ -290,6 +295,47 @@ session), `hub-auth` (the hub refuses auth — board-wide), and
 in `<root>/dispatch-alarms.json`; a successful hub response clears
 `no-answer` and `hub-auth` even when it reports the session inactive.
 
+### The mail watchdog
+
+Alarms ride the dispatcher they watch, so a hung dispatcher says
+nothing. `kit/scripts/seat-mail-watchdog.py` (the
+`seat-mail-watchdog.service`/`.timer` user units run it every 2
+minutes) reads the board's files only — it never opens a `.msg` file,
+takes no lock, runs no `seat` verb and calls no hub — and each
+dispatcher pass writes `<root>/dispatch-heartbeat` (one timestamp per
+pass; a write that fails is not logged, the stale file is the report).
+It checks four things:
+
+- **heartbeat** — absent or its mtime older than 60 s. The first stale
+  pass restarts `seat-dispatch.service` once (`systemctl --user`,
+  120 s timeout, output private; the incident and its exit land in
+  `<root>/watchdog-state.json`) and reports nothing that run when the
+  restart exits 0; if the next pass is still stale the problem is
+  reported, naming the restart, with no second restart. A fresh
+  heartbeat clears the incident.
+- **bindings** — `hapi-sessions.json` present but not schema 1 with
+  `seats` of objects holding a string `url` (a bad file silently
+  drops every binding, so every bound seat goes undelivered).
+- **overdue mail** — per seat routed as the dispatcher routes it
+  (hapi when bound or asleep, webhook when `webhook.url` exists, else
+  pull): owed mail is `inbox/*.msg` plus unleased `draining/*.msg`,
+  aged by the name's `ts` (else its mtime — a name without one is
+  still counted). The limit is the seat's `--mail-limit`, else 15
+  minutes for hapi and webhook seats; pull seats are not checked
+  without a set limit.
+- **quarantine** — any file in `seats/<name>/quarantine/` is a
+  problem while it stays (nothing reads that directory, and a rename
+  keeps the send-time mtime, so "new since last run" cannot be told).
+
+One status file, `<root>/watchdog-status.json` (atomic, mode 0600):
+`{checked_at, ok, problems: [{key, seat, kind, since, detail}]}`
+sorted by key — `heartbeat`, `bindings`, `overdue:<seat>`,
+`quarantine:<seat>`; details carry counts, ages, routes, limits and
+file names only, never a body, header, token or clock time. One
+stdout line ends each pass (`seat mail watchdog pass ok: N problems`),
+so the journal stays greppable. Stopping the dispatcher on purpose
+means stopping the timer first.
+
 ### The identity rule on `--from`
 
 `send` accepts an optional `--from`. Who the message is from is
@@ -353,6 +399,11 @@ empty.
 <root>/dispatch.log           one line per delivery, failure, alarm, rung
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
+<root>/dispatch-heartbeat     one timestamp per dispatcher pass (watchdog fact)
+<root>/watchdog-state.json    the watchdog's restart record for the one
+                              stale-heartbeat incident it is handling
+<root>/watchdog-status.json   the watchdog's last pass: checked_at, ok,
+                              problems sorted by key
 ```
 
 A command other than `init` refuses a directory it does not recognize
@@ -384,8 +435,14 @@ behaviour from the agent-skills library. One line each:
 - `kit/scripts/pane-door` — one localhost ttyd per seat pane plus the
   root grid on `127.0.0.1:7700`; its vendored xterm files are in
   `kit/assets/pane-door/`.
-- `kit/systemd/` — the user units: `seat-gallery.service` (boot) and
-  `pane-door.service` (the doors).
+- `kit/scripts/seat-mail-watchdog.py` — the board's read-only mail
+  watchdog (see "The mail watchdog"): heartbeat, bindings, overdue
+  mail, quarantine, one restart per stale-heartbeat incident, one
+  status file.
+- `kit/systemd/` — the user units: `seat-gallery.service` (boot),
+  `pane-door.service` (the doors), and
+  `seat-mail-watchdog.service`/`.timer` (the watchdog's oneshot and
+  its 2-minute timer).
 - `kit/tests/` — the kit's unittest suites; run each `*_test.py` with
   `python3`.
 

@@ -366,6 +366,11 @@ out="$("$S" --root "$R2" drain --seat X 2>&1)"; rc=$?
 R3="$(mktemp -d)"; EXTRA_ROOTS="$EXTRA_ROOTS $R3"
 "$S" --root "$R3" init >/dev/null 2>&1;              note $? "an empty directory is not refused"
 
+## mail watchdog drill -----------------------------------------------------
+# Real seat verbs on throwaway boards, a stub systemctl, and one
+# watchdog pass per case (see tests/watchdog-drill.sh).
+"$SMOKE_DIR/watchdog-drill.sh" "$SEAT" >/dev/null 2>&1; note $? "watchdog drill"
+
 ## summary ----------------------------------------------------------------
 echo "smoke: $PASS passed, $FAIL failed (SEAT=$S)"
 [ "$FAIL" -eq 0 ] || exit 1

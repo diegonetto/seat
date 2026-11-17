@@ -118,6 +118,12 @@ struct RegisterArgs {
     /// that omits it keeps the stored value
     #[arg(long, value_name = "DURATION")]
     idle_after: Option<String>,
+    /// How long mail may sit owed to this seat before the mail
+    /// watchdog reports it (e.g. 30m, 2h); omitting means the
+    /// watchdog's default, and a later register that omits it keeps
+    /// the stored value
+    #[arg(long, value_name = "DURATION")]
+    mail_limit: Option<String>,
 }
 
 /// The caller's session id, read once at the CLI edge (empty means
@@ -140,6 +146,7 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             args.cwd,
             args.cmd,
             args.idle_after,
+            args.mail_limit,
         ),
         Command::Send { from, to, body } => {
             verbs::cmd_send(root, from.as_deref(), &to, &body, session)

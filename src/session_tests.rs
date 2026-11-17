@@ -31,8 +31,7 @@ fn status_prints_asleep_from_the_record() {
         None,
         Some(cwd),
         vec!["/bin/sleep".into(), "30".into()],
-        Some("30m".into()),
-    )
+        Some("30m".into()), None)
     .unwrap();
     let state = root.join("tmux.state");
     let _env = lock_env(&[
@@ -82,11 +81,10 @@ fn status_presence_and_mail_are_separate() {
         None,
         Some(cwd),
         vec!["/bin/sleep".into(), "30".into()],
-        None,
-    )
+        None, None)
     .unwrap();
-    verbs::cmd_register(&root, "quiet", "sb", None, None, vec![], None).unwrap();
-    verbs::cmd_register(&root, "stocked", "sb", None, None, vec![], None).unwrap();
+    verbs::cmd_register(&root, "quiet", "sb", None, None, vec![], None, None).unwrap();
+    verbs::cmd_register(&root, "stocked", "sb", None, None, vec![], None, None).unwrap();
     let state = root.join("tmux.state");
     let _env = lock_env(&[
         ("SEAT_TMUX", fake_tmux().into()),
@@ -135,8 +133,7 @@ fn session_verbs_drive_the_fake_multiplexer() {
             None,
             Some(cwd.clone()),
             vec!["/bin/sleep".into(), "30".into()],
-            None,
-        )
+            None, None)
         .unwrap();
     }
     let state = root.join("tmux.state");
@@ -400,7 +397,7 @@ fn up_starts_the_stored_command() {
     board::init(&root).unwrap();
     let cwd = root.display().to_string();
     let reg = |name: &str, cwd: Option<String>, cmd: Vec<String>| {
-        verbs::cmd_register(&root, name, "sb", None, cwd, cmd, None).unwrap();
+        verbs::cmd_register(&root, name, "sb", None, cwd, cmd, None, None).unwrap();
     };
     let sleep30 = || vec!["/bin/sleep".to_string(), "30".to_string()];
     reg("runner", Some(cwd.clone()), sleep30());
@@ -537,8 +534,7 @@ fn up_failure_message_pins_the_start_seat_refusal() {
         None,
         Some(cwd.clone()),
         vec!["seat-fail".to_string()],
-        None,
-    )
+        None, None)
     .unwrap();
     let state = root.join("tmux.state");
     let _env = lock_env(&[
