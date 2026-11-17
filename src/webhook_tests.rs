@@ -1285,11 +1285,14 @@ fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
     assert_eq!(hook.hits().len(), 4, "no further ring before the stop");
     pin_log(
         &root,
-        &[concat!(
-            "failure seat=kotek-grokbot ring attempt 1 failed: ",
-            "webhook failed after 3 attempt(s) (HTTP 401) ",
-            "(check webhook.auth: one line, \"Bearer <token>\")"
-        )],
+        &[
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 1 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            "rung seat=kotek-grokbot id=authfix1",
+        ],
     );
     assert!(
         !root.join("dispatch-alarms.json").exists(),
@@ -1427,7 +1430,11 @@ fn a_failed_reload_mid_burst_skips_the_ring_not_the_worker() {
     assert_eq!(hook.hits().len(), 2);
     pin_log(
         &root,
-        &["failure seat=kotek-grokbot webhook: no bridge.key staged"],
+        &[
+            "rung seat=kotek-grokbot id=reloadfix",
+            "failure seat=kotek-grokbot webhook: no bridge.key staged",
+            "rung seat=kotek-grokbot id=reloadfix",
+        ],
     );
     assert!(
         !root.join("dispatch-alarms.json").exists(),
@@ -1651,4 +1658,177 @@ fn a_missing_ingest_env_names_the_home_path() {
             "the error names the HOME-derived path"
         );
     });
+}
+
+/// One `rung` line per successful signal ring, and none for anything
+/// else: the first ring names the ids it newly covers (in send-time
+/// order), a failed ring writes only its `failure` line, a re-ring
+/// with nothing new names the present ids, and new mail mid-burst is
+/// the only id the next ring's line carries. On main the `Ok(true)`
+/// arm logged nothing in signal mode.
+#[test]
+fn a_successful_signal_ring_logs_one_rung_line() {
+    let hook = FakeWebhook::start();
+    let root = signal_board(&hook.url());
+    let dir = kotek_dir(&root);
+    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false, None);
+    fresh_mail(&root, "aaaabbbb");
+    fresh_mail(&root, "ccccdddd");
+
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Rang
+    );
+    pin_log(&root, &["rung seat=kotek-grokbot id=aaaabbbb,ccccdddd"]);
+
+    // A failed ring writes its failure line and no rung line.
+    hook.ctl.lock().unwrap().status = 401;
+    rewind_deadline(&dir);
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Waiting
+    );
+    pin_log(
+        &root,
+        &[
+            "rung seat=kotek-grokbot id=aaaabbbb,ccccdddd",
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 1 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+        ],
+    );
+
+    // A re-ring with nothing new names the present ids again.
+    hook.ctl.lock().unwrap().status = 0;
+    rewind_deadline(&dir);
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Rang
+    );
+    pin_log(
+        &root,
+        &[
+            "rung seat=kotek-grokbot id=aaaabbbb,ccccdddd",
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 1 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            "rung seat=kotek-grokbot id=aaaabbbb,ccccdddd",
+        ],
+    );
+
+    // New mail mid-burst: the next ring newly covers only it.
+    fresh_mail(&root, "eeeeffff");
+    rewind_deadline(&dir);
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Rang
+    );
+    pin_log(
+        &root,
+        &[
+            "rung seat=kotek-grokbot id=aaaabbbb,ccccdddd",
+            concat!(
+                "failure seat=kotek-grokbot ring attempt 1 failed: ",
+                "webhook failed after 3 attempt(s) (HTTP 401) ",
+                "(check webhook.auth: one line, \"Bearer <token>\")"
+            ),
+            "rung seat=kotek-grokbot id=aaaabbbb,ccccdddd",
+            "rung seat=kotek-grokbot id=eeeeffff",
+        ],
+    );
+}
+
+/// Held mail is owed by nobody until its lease passes, and owed again
+/// the moment it does. While the lease holds, `present_files` is
+/// empty, `ring_pass` is idle (no POST, the burst never opens) and
+/// `alarm::undelivered` does not fire even for mail whose header `ts`
+/// is a month old. Once the file's mtime moves into the past the same
+/// file is present again, a `ring_pass` rings it though no new mail
+/// arrived, and the next `--hold` prints it again. On main a hold did
+/// not exist and the month-old mail paged and rang at once.
+#[test]
+fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
+    let hook = FakeWebhook::start();
+    let root = signal_board(&hook.url());
+    let dir = kotek_dir(&root);
+    let cfg = WebhookConfig::mem(hook.url(), KEY.into(), None, false, None);
+    let file = hq_mail(&root, "old held", "abcdef12", "inbox", false);
+
+    // The bot holds: printed, leased in draining/, archived by nobody.
+    let mut printed = Vec::new();
+    crate::drain::hold(&root, "kotek-grokbot", &mut printed).unwrap();
+    assert!(String::from_utf8(printed).unwrap().contains("old held"));
+    let staged = dir.join("draining").join(file.file_name().unwrap());
+    assert!(crate::drain::leased(&staged));
+    assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
+
+    // While the lease holds: nothing present, the pass is idle, no
+    // POST, and no undelivered alarm for the month-old held message.
+    assert!(webhook::present_files(&dir).is_empty());
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Idle
+    );
+    assert!(hook.hits().is_empty());
+    pin_log(&root, &[]);
+    assert!(!root.join("dispatch-alarms.json").exists());
+
+    // The deadline passes (the lease clock is the file's mtime): the
+    // same file is present again and the ring fires with no new mail.
+    crate::drain::set_mtime(
+        &staged,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(!crate::drain::leased(&staged));
+    let mut present = std::collections::BTreeSet::new();
+    present.insert(file.file_name().unwrap().to_str().unwrap().to_string());
+    assert_eq!(webhook::present_files(&dir), present);
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Rang
+    );
+    assert_eq!(hook.hits().len(), 1, "the ring fired with no new mail");
+    // Owed again: the month-old mail pages, then the ring's line.
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "rung seat=kotek-grokbot id=abcdef12",
+        ],
+    );
+
+    // And the next --hold prints it again.
+    let mut printed2 = Vec::new();
+    crate::drain::hold(&root, "kotek-grokbot", &mut printed2).unwrap();
+    assert!(String::from_utf8(printed2).unwrap().contains("old held"));
+    assert!(crate::drain::leased(&staged), "re-leased by the new hold");
+}
+
+/// Payload mode keeps its `delivered` line and adds no `rung` line: a
+/// successful payload ring logs exactly the `undelivered` alarm it
+/// inherited (the fixture mail is a month old) plus one `delivered`
+/// line per carried id — and never a `rung`.
+#[test]
+fn a_payload_ring_logs_no_rung_line() {
+    let hook = FakeWebhook::start();
+    let root = kotek_board(&hook.url());
+    hq_mail(&root, "payload only", "abcdef12", "inbox", false);
+    let cfg = payload_cfg(&hook.url());
+    assert_eq!(
+        webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
+        RingOutcome::Rang
+    );
+    assert_eq!(hook.hits().len(), 1);
+    pin_log(
+        &root,
+        &[
+            "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
+            "delivered seat=kotek-grokbot id=abcdef12 mode=payload",
+        ],
+    );
 }

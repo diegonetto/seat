@@ -36,6 +36,9 @@ pub enum SeatError {
     #[error("drain: unreadable message was not delivered")]
     Unreadable,
 
+    #[error("drain: {0}")]
+    Drain(String),
+
     #[error("seat {0} has no token on this board")]
     GhostSeat(String),
 

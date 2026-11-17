@@ -247,13 +247,32 @@ pub(crate) fn hq_receipt(
 }
 
 /// File names in `inbox/` and `draining/`: work the bot's own drain
-/// owes (it removes both).
+/// owes (it removes both). Held mail — a file in `draining/` inside
+/// its `--hold` lease, a future mtime — is left out: every caller
+/// (the 2 s scan, `ring_pass`, the worker's waits,
+/// `alarm::undelivered`, the sleep checks) then sees held mail as
+/// not owed until its deadline passes, and as owed again after it.
 pub(crate) fn present_files(dir: &Path) -> BTreeSet<String> {
-    ["inbox", "draining"]
-        .iter()
-        .flat_map(|stage| msg::list_msg_dir(&dir.join(stage)).unwrap_or_default())
-        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
-        .collect()
+    let mut present = BTreeSet::new();
+    for stage in ["inbox", "draining"] {
+        for p in msg::list_msg_dir(&dir.join(stage)).unwrap_or_default() {
+            if stage == "draining" && crate::drain::leased(&p) {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                present.insert(name.to_string());
+            }
+        }
+    }
+    present
+}
+
+/// The message id a mail file name carries: the `<id>` of
+/// `<ts>-<id>.msg` — everything after the name's last `-`, with its
+/// `.msg` suffix gone.
+fn file_id(name: &str) -> &str {
+    let stem = name.strip_suffix(".msg").unwrap_or(name);
+    stem.rsplit_once('-').map(|(_, id)| id).unwrap_or(stem)
 }
 
 /// Is this seat still webhook-routed? The full routing rule, not just
@@ -522,6 +541,10 @@ pub(crate) fn ring_pass(
         BTreeSet::new()
     };
     alarm::undelivered(root, seat, &delivered, &present)?;
+    // The previous rung set, read before the prune below: a
+    // successful ring's `rung` line names what this ring newly
+    // covers, so the covered-before set must survive the prune.
+    let prev_rung: BTreeSet<String> = ring.rung.iter().cloned().collect();
     // Prune what the bot's drain took; an empty rung set closes the
     // burst and resets the backoff.
     ring.rung.retain(|f| present.contains(f));
@@ -545,6 +568,24 @@ pub(crate) fn ring_pass(
         Ok(true) => {
             ring.failures = 0;
             alarm::clear(root, Some(seat), alarm::WEBHOOK_FAILING)?;
+            // One `rung` line per successful signal ring: the ids of
+            // the files this ring newly covers (present minus the
+            // previous rung set), or of every present file when a
+            // re-ring found nothing new. Payload mode keeps its
+            // `delivered` lines and adds nothing.
+            if !cfg.payload_mode {
+                let mut covered: Vec<&String> =
+                    present.iter().filter(|f| !prev_rung.contains(*f)).collect();
+                if covered.is_empty() {
+                    covered = present.iter().collect();
+                }
+                let ids = covered
+                    .iter()
+                    .map(|f| file_id(f))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log_line(root, "rung", seat, &format!("id={ids}"));
+            }
             rang = true;
         }
         Err(detail) => {
