@@ -27,8 +27,8 @@ Notable changes to this crate. Versions follow semantic versioning.
   for seats the dispatcher routes as hapi (bound or asleep) or webhook,
   with pull seats unchecked unless a limit is set; and any file in
   `seats/<seat>/quarantine/`, a problem while it stays (a rename keeps
-  the send-time mtime, so "newer than the last run" cannot be told —
-  the owner accepted the always-open reading). Recovery before
+  the send-time mtime, so "newer than the last run" cannot be told).
+  Recovery before
   reporting: the first stale pass runs `systemctl --user restart
   seat-dispatch.service` once (by name from PATH, output private,
   120 s timeout) and records `{incident, restarted_at, exit}` in

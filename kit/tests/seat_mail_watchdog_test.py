@@ -139,7 +139,8 @@ class WatchdogTest(unittest.TestCase):
     # -- grammar ----------------------------------------------------------
 
     def test_duration_grammar(self):
-        for good, seconds in [("45s", 45), ("30m", 1800), ("2h", 7200), ("1s", 1)]:
+        for good, seconds in [("45s", 45), ("30m", 1800), ("2h", 7200), ("1s", 1),
+                              ("+5m", 300)]:
             self.assertEqual(DOG.parse_duration(good), seconds, good)
         for bad in ["1.5h", "10", "10d", "m", "", None, "30x", "h2", "-5m", "0x10", "９０"]:
             self.assertIsNone(DOG.parse_duration(bad), bad)

@@ -38,7 +38,9 @@ def iso(moment):
 
 
 def parse_duration(raw):
-    """`30m`, `2h`, `45s` — one integer plus one unit — else None (register's grammar)."""
+    """`30m`, `2h`, `45s` — one integer plus one unit, an optional
+    leading `+` (u64::from_str takes one, so register stores `+90m`)
+    — else None (register's grammar)."""
     if not isinstance(raw, str) or not raw:
         return None
     unit = raw[-1:]
@@ -46,6 +48,8 @@ def parse_duration(raw):
     if per_s is None:
         return None
     digits = raw[:-1]
+    if digits.startswith("+"):
+        digits = digits[1:]
     if not digits.isdigit() or not digits.isascii():
         return None
     seconds = int(digits) * per_s

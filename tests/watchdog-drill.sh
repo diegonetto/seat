@@ -63,8 +63,9 @@ note() {
 }
 
 # One throwaway board per case, fresh heartbeat, $1 = case tag.
+# Under DRILL_DIR so the EXIT trap removes it (smoke.sh's rule).
 new_board() {
-    R="$(mktemp -d)"
+    R="$(mktemp -d "$DRILL_DIR/board.XXXXXX")"
     "$S" --root "$R" init >/dev/null 2>&1
     printf 'beat\n' >"$R/dispatch-heartbeat"
     touch -d 'now' "$R/dispatch-heartbeat"
@@ -144,12 +145,15 @@ out="$(dog)"; rc=$?
                                                  note $? "draining: 20m unleased mail is overdue"
 
 # (4) leased: nothing (a hold's deadline is still in the future).
+# The mail is aged past the limit by name first, so only the lease
+# can be what keeps it unreported.
 new_board leased
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 printf 'https://127.0.0.1:9/hook\n' >"$R/seats/B/webhook.url"
 "$S" --root "$R" send --from A B 'drill mail' >/dev/null 2>&1
 "$S" --root "$R" drain --seat B --hold >/dev/null 2>&1
+age_name "$R/seats/B/draining" '20 minutes ago'
 touch -d '+20 min' "$R/seats/B/draining/"*.msg
 out="$(dog)"; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys)" = "" ] && ok_is true
@@ -210,7 +214,7 @@ before="$(cat "$R/seats/A/meta.json")"
                                                  note $? "register refuses a bad --mail-limit"
 
 # (10) no marker: one Error line, exit 1, no status written.
-R="$(mktemp -d)"
+R="$(mktemp -d "$DRILL_DIR/board.XXXXXX")"
 mkdir -p "$R/bin"
 out="$(PATH="$STUBBIN:$PATH" python3 -I "$WATCHDOG" --root "$R" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && [ "$(printf '%s\n' "$out" | wc -l)" -eq 1 ] \
