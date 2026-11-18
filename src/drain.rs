@@ -85,21 +85,26 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     let received = receive(root, seat_name)?;
 
     for d in &received.directs {
-        // Mail that may have been shown before says so first: the
-        // reader checks whether it already did this.
-        if d.redelivery {
-            write!(
-                out,
-                "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
-                d.header.id
-            )?;
-        }
-        write!(out, "{}", dstate::direct_text(d))?;
+        write_direct(d, out)?;
     }
 
     commit(root, seat_name, &received)?;
 
     report_failures(&received)
+}
+
+/// Print one delivered message the way `drain` and `hold` do: mail
+/// that may have been shown before says so first — the reader checks
+/// whether it already did this — then the direct text.
+fn write_direct(d: &ReceivedDirect, out: &mut dyn Write) -> std::io::Result<()> {
+    if d.redelivery {
+        write!(
+            out,
+            "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
+            d.header.id
+        )?;
+    }
+    write!(out, "{}", dstate::direct_text(d))
 }
 
 /// Report `receive`'s failures the way every drain verb does: the
@@ -150,16 +155,7 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
                 staged.display()
             ))
         })?;
-        // Mail that may have been shown before says so first: the
-        // reader checks whether it already did this.
-        if d.redelivery {
-            write!(
-                out,
-                "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
-                d.header.id
-            )?;
-        }
-        write!(out, "{}", dstate::direct_text(d))?;
+        write_direct(d, out)?;
     }
 
     // The hold itself is a read: stamp the reader alive (as `commit`
@@ -208,17 +204,10 @@ pub fn done(root: &Path, ids: &[String]) -> Result<()> {
         let mut found = Vec::new();
         for seat_name in &seats {
             for p in msg::list_msg_dir(&seat::seat_dir(root, seat_name).join(sub))? {
-                if p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(&suffix))
-                {
-                    found.push((
-                        seat_name.clone(),
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                    ));
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(&suffix) {
+                        found.push((seat_name.clone(), name.to_string()));
+                    }
                 }
             }
         }

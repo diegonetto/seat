@@ -167,7 +167,7 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             } else if !done.is_empty() {
                 // `--done` is `seat done`: the `--seat` is still
                 // checked (an unknown or corrupt seat keeps its named
-                // error), then the ids are found board-wide.
+                // error).
                 board::ensure_board(root)?;
                 seat::read_meta(&seat::seat_dir(root, &seat))?;
                 drain::done(root, &done)
