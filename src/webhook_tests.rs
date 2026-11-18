@@ -1802,10 +1802,18 @@ fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
         ],
     );
 
-    // And the next --hold prints it again.
+    // And the next --hold prints it again — under the redelivery
+    // line first, since it was shown before.
     let mut printed2 = Vec::new();
     crate::drain::hold(&root, "kotek-grokbot", &mut printed2).unwrap();
-    assert!(String::from_utf8(printed2).unwrap().contains("old held"));
+    let reprint = String::from_utf8(printed2).unwrap();
+    assert!(reprint.contains("old held"));
+    assert!(
+        reprint.starts_with(
+            "[redelivery] check whether you already did this; if so, only run: seat done abcdef12\n"
+        ),
+        "the reprint starts with the redelivery line: {reprint}"
+    );
     assert!(crate::drain::leased(&staged), "re-leased by the new hold");
 }
 

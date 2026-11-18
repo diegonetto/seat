@@ -44,7 +44,7 @@ the inbox.
 
 ## Verbs
 
-`init`, `register`, `send`, `drain`, `dispatch`, `up`, `down`,
+`init`, `register`, `send`, `drain`, `done`, `dispatch`, `up`, `down`,
 `gallery`, `status`, `reset`. An unknown verb exits 2 with
 `error: unrecognized subcommand '<verb>'` and a usage line.
 
@@ -53,6 +53,7 @@ seat init
 seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [--mail-limit DUR] [-- CMD...]
 seat send [--from <from>] <to> <body>
 seat drain --seat <name> [--hold | --done <ID>...]
+seat done <ID>...
 seat dispatch [--once]
 seat up [name...]
 seat down [name...]
@@ -86,34 +87,55 @@ and `--done` take the same lock the same way.
 
 A bot that acts on its mail before it can safely say it used it — a
 Grok bot run that dies after reading its drain — holds instead of
-draining. The bot's loop: `drain --hold`, act, `drain --done` the ids
-it finished.
+draining. The bot's loop: `drain --hold`, act, `seat done` the ids it
+finished.
 
 `drain --hold` receives exactly as `drain` does, sets each staged
 file's mtime to the lease deadline (`now + 30 minutes`), prints the
 mail exactly as `drain` prints it, and archives nothing. Order per
 file: staged, deadline set, printed; a file whose deadline cannot be
-set is not printed and the command fails naming it. `drain --done
-<ID>...` (each id 8 lowercase hex, else the whole command is refused
-before anything is archived; two staged files matching one id is
-refused naming both) archives exactly the one `*-<id>.msg` file in
-`draining/`, leased or not, never touches `inbox/`, stamps
-`last_drained`, and prints nothing. An id with no file in `draining/`
-is success — already archived, or taken by a later drain.
+set is not printed and the command fails naming it. A hold stamps
+`last_drained` on every call — including one that printed nothing: a
+reader that only holds still reads.
+
+`seat done <ID>...` (and `drain --seat X --done <ID>...`, the same
+command — the seat is still checked) archives each id's mail found
+anywhere on the board, so an ack under the wrong `--seat` or a
+mistyped id can never succeed silently. Each id is 8 lowercase hex,
+else the whole command is refused before anything is archived. Per
+id, every seat is searched for `*-<id>.msg` in `draining/`,
+`archive/`, `inbox/` and `quarantine/`: two or more matches in
+`draining/` is refused naming both; exactly one is archived, leased
+or not, under that seat's lock, and `last_drained` is stamped on each
+seat a file was archived for; a match already in `archive/` is
+success (nothing moves); a match in `inbox/` is refused (`drain it
+first`); a match in `quarantine/` is refused (never delivered); an id
+the board cannot account for anywhere is refused (`not on this
+board`). Done prints nothing.
 
 Held mail is leased: a plain `drain`, a second `--hold` and the hapi
 pass all leave it alone until its deadline passes, and no ring, no
 scan worker and no `undelivered` alarm count it as owed — the 2 s
 scan starts a worker and the ring fires the moment the deadline
 passes, with no new mail. A bot run that dies after its hold loses no
-mail: the mail is rung and printed again after the 30 minutes. A
-duplicate after a clock jump is possible and a loss is not. The lease
-clock is the file's mtime; the alarm's is the header `ts`.
+mail: the mail is rung and printed again after the 30 minutes, under
+the redelivery line first:
+
+```
+[redelivery] check whether you already did this; if so, only run: seat done <id>
+```
+
+`drain` and `drain --hold` print that line (with the real id) before
+any message that was already in `draining/` when they ran — an
+expired hold, a crashed drain, or mail the dispatcher staged and
+pushed — so mail shown twice never looks like new mail. A duplicate
+after a clock jump is possible and a loss is not. The lease clock is
+the file's mtime; the alarm's is the header `ts`.
 
 `status` counts `inbox/` only, so held mail in `draining/` is not
 counted. A payload-mode seat that holds marks hq mail done by id
 after acting on the payload — the payload carries each message's id,
-and `--done <that id>` retires it.
+and `seat done <that id>` retires it.
 
 ## Deliver to a hub session
 

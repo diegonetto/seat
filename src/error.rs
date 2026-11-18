@@ -39,6 +39,9 @@ pub enum SeatError {
     #[error("drain: {0}")]
     Drain(String),
 
+    #[error("done: {0}")]
+    Done(String),
+
     #[error("seat {0} has no token on this board")]
     GhostSeat(String),
 
