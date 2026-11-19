@@ -2,6 +2,28 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- A claude seat may launch through the `hapi-chrome` wrapper (Flight's
+  Claude-for-Chrome launcher: it exports `CLAUDE_CODE_ENABLE_CFC=1` and
+  execs `hapi claude`; the script itself stays outside the repo). It is
+  accepted wherever `hapi-glm` already is for glm, with the same shape —
+  exact basename, one kind, and the wrapped `claude` word following it:
+  `seat-role`'s `is_wrapped` (`kit/scripts/seat-role.py`) treats a
+  claude seat recorded as `<dir>/hapi-chrome claude …` as wrapped, so a
+  wake finds and records its live phone session over the up pane
+  instead of failing on the down-seat branch, and `seat-supervise`'s
+  `is_wrapped` (`kit/scripts/seat-supervise`) runs the HAPI readiness
+  wait — and the closed-hub-port launch retries — for it as for `hapi`
+  and `hapi-glm`. A `hapi-chrome` argv on a codex or glm seat is not
+  wrapped, nothing else changed: the `("env", "hapi")` cutover
+  refusals and `wrapper_model` (already generic over `hapi-*` names)
+  behave exactly as before. `kit/tests/role_wake_test.py` and
+  `kit/tests/seat_launch_test.py` cover the linked wake, the
+  kind-scoped rule and the readiness wait.
+
 ## [0.11.0] - 2026-11-18
 
 ### Added

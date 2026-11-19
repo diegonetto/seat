@@ -403,11 +403,15 @@ class Wake:
         return state
 
     def is_wrapped(self, argv):
-        """True when the seat runs under the phone link: `hapi <cli> …`, or glm's `hapi-glm` wrapper, which sets Z.ai's
-        endpoint and key and then execs `hapi claude`."""
+        """True when the seat runs under the phone link: `hapi <cli> …`, or a one-kind wrapper that execs `hapi
+        claude` — glm's `hapi-glm` (sets Z.ai's endpoint and key) or claude's `hapi-chrome` (enables Claude for
+        Chrome)."""
         if argv[:2] == [self.hapi, "claude" if self.kind == "glm" else self.kind]:
             return True
-        return self.kind == "glm" and bool(argv) and Path(argv[0]).name == "hapi-glm"
+        if self.kind == "glm" and bool(argv) and Path(argv[0]).name == "hapi-glm":
+            return True
+        return (self.kind == "claude" and bool(argv) and Path(argv[0]).name == "hapi-chrome"
+                and argv[1:2] == ["claude"])
 
     def wrap_blocker(self):
         """Plain reason this plain harness cannot be moved under HAPI, or None."""

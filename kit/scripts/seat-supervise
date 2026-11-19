@@ -6,9 +6,9 @@ this supervisor while the harness runs as the pane's foreground process group:
 tmux still reports the harness as the pane's current command (the wake path's
 pane check depends on that), and killing the pane stops the harness with it.
 
-A HAPI-wrapped harness (argv beginning `hapi` or `hapi-glm`) first runs the
-same readiness wait the seat-gallery unit uses (seat-hub-wait). A harness that
-exits at launch — inside the launch window — leaves harness-exit.log in the
+A HAPI-wrapped harness (argv beginning `hapi`, `hapi-glm` or `hapi-chrome`) first
+runs the same readiness wait the seat-gallery unit uses (seat-hub-wait). A harness
+that exits at launch — inside the launch window — leaves harness-exit.log in the
 seat's runtime directory on every exit: the argv words (never environment
 values), the exit code, and the pane's last 20 lines. While the hub port is
 closed, such an exit is retried up to three times before the code is returned;
@@ -59,8 +59,8 @@ def hub_wait(script):
 
 
 def is_wrapped(argv):
-    """True for a HAPI-wrapped harness: `hapi <cli> ...` or glm's `hapi-glm`."""
-    return bool(argv) and Path(argv[0]).name in ("hapi", "hapi-glm")
+    """True for a HAPI-wrapped harness: `hapi <cli> ...`, glm's `hapi-glm`, or claude's `hapi-chrome`."""
+    return bool(argv) and Path(argv[0]).name in ("hapi", "hapi-glm", "hapi-chrome")
 
 
 def spawn(argv):

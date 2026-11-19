@@ -85,9 +85,9 @@ class SeatSitTest(unittest.TestCase):
         self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"],
                         capture_output=True)
 
-    def harness(self, argv, cwd):
+    def harness(self, argv, cwd, kind="codex"):
         (self.runtime / "harness.json").write_text(json.dumps({
-            "harness": "codex", "argv": argv, "cwd": cwd, "expect_cmds": ["hapi"],
+            "harness": kind, "argv": argv, "cwd": cwd, "expect_cmds": ["hapi"],
         }))
 
     def sit(self, extra_env=""):
@@ -159,6 +159,32 @@ class SeatSitTest(unittest.TestCase):
         body = trace.read_text()
         self.assertIn("exit: 3", body)
         self.assertIn("hapi: cannot reach the hub", body)
+
+    def test_hapi_chrome_wrapper_runs_the_readiness_wait_and_retries(self):
+        # claude under the phone link launches through the hapi-chrome wrapper; the supervisor treats it as
+        # HAPI-wrapped, so the hub readiness wait runs before the launch and a launch death on a closed hub
+        # port is retried, exactly as for `hapi` itself.
+        runs = self.root / "runs.log"
+        stub = self.bin / "hapi-chrome"
+        write_exec(stub, """\
+            #!/bin/sh
+            echo run >>"$RUNS_LOG"
+            echo "hapi-chrome: cannot reach the hub"
+            exit 3
+            """)
+        self.harness([str(stub), "claude", "--model", "claude-fable-5-1"], str(self.root), kind="claude")
+        pane, _ = self.sit(extra_env=(
+            f"RUNS_LOG={runs} SEAT_HUB_PORT={free_port()} "
+            "SEAT_HUB_WAIT_TIMEOUT=1 SEAT_RETRY_GAP=0.5"))
+        trace = self.runtime / "harness-exit.log"
+        self.assertTrue(self.wait_for(trace.exists), "harness-exit.log never appeared")
+        self.assertTrue(self.wait_for(lambda: not self.pane_alive(pane)),
+                        "the pane never closed after the retries ran out")
+        self.assertEqual(runs.read_text(), "run\n" * 4)  # one launch, three readiness-waited retries
+        body = trace.read_text()
+        self.assertIn("argv: " + str(stub) + " claude --model claude-fable-5-1", body)
+        self.assertIn("exit: 3", body)
+        self.assertIn("hapi-chrome: cannot reach the hub", body)
 
 
 if __name__ == "__main__":
