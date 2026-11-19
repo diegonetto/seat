@@ -3,6 +3,7 @@ use crate::dstate;
 use crate::error::{Result, SeatError};
 use crate::msg;
 use crate::seat;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -44,6 +45,11 @@ pub struct ReceivedDirect {
     pub file_name: String,
     pub header: msg::Header,
     pub body: String,
+    /// The file was already in `draining/` before this receive staged
+    /// the inbox (an expired hold, a crashed drain, or mail the hapi
+    /// dispatcher staged and pushed), so it may have been shown
+    /// before. `check_direct` leaves it false; `receive` sets it.
+    pub redelivery: bool,
 }
 
 /// What one `receive` found: the verified mail worth delivering and
@@ -79,12 +85,26 @@ pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     let received = receive(root, seat_name)?;
 
     for d in &received.directs {
-        write!(out, "{}", dstate::direct_text(d))?;
+        write_direct(d, out)?;
     }
 
     commit(root, seat_name, &received)?;
 
     report_failures(&received)
+}
+
+/// Print one delivered message the way `drain` and `hold` do: mail
+/// that may have been shown before says so first — the reader checks
+/// whether it already did this — then the direct text.
+fn write_direct(d: &ReceivedDirect, out: &mut dyn Write) -> std::io::Result<()> {
+    if d.redelivery {
+        write!(
+            out,
+            "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
+            d.header.id
+        )?;
+    }
+    write!(out, "{}", dstate::direct_text(d))
 }
 
 /// Report `receive`'s failures the way every drain verb does: the
@@ -108,12 +128,14 @@ fn report_failures(received: &Received) -> Result<()> {
 /// The `drain --hold` verb: the same lock and the same receive as
 /// `drain`, then for each good message set the staged file's mtime to
 /// the lease deadline (`now + LEASE`), print it exactly as `drain`
-/// prints, and commit nothing — the mail stays in `draining/` until
-/// the bot that held it names its ids done (`done`) or the deadline
-/// passes. Order per file: staged, deadline set, printed; a file
-/// whose deadline cannot be set is not printed and the command fails
-/// naming it. Mail leased by an earlier hold is left alone by
-/// `receive` and printed by nobody. `last_drained` is not stamped.
+/// prints it (redelivery line included), and commit nothing — the
+/// mail stays in `draining/` until the bot that held it names its ids
+/// done (`done`) or the deadline passes. Order per file: staged,
+/// deadline set, printed; a file whose deadline cannot be set is not
+/// printed and the command fails naming it. Mail leased by an earlier
+/// hold is left alone by `receive` and printed by nobody. A hold
+/// stamps `last_drained` on every call — after printing, including a
+/// call that printed nothing: a reader that only holds still reads.
 pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -133,92 +155,253 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
                 staged.display()
             ))
         })?;
-        write!(out, "{}", dstate::direct_text(d))?;
+        write_direct(d, out)?;
     }
+
+    // The hold itself is a read: stamp the reader alive (as `commit`
+    // does), even when nothing was printed.
+    seat::update_meta(&dir, |meta| {
+        meta.last_drained = Some(seat::now_ts());
+    })?;
 
     report_failures(&received)
 }
 
-/// The `drain --done` verb: under the seat lock, archive exactly the
-/// staged files named by id — `*-<id>.msg` in `draining/`, leased or
-/// not — and stamp `last_drained`. `inbox/` is never touched. Every
-/// id is checked (8 lowercase hex) and every id's file count decided
-/// before the first rename, so a malformed or ambiguous id refuses
-/// the whole command and archives nothing. An id with no file in
-/// `draining/` is success (already archived, or taken by a later
-/// drain). Two files matching one id is refused, naming both. Prints
-/// nothing.
-pub fn done(root: &Path, seat_name: &str, ids: &[String]) -> Result<()> {
+/// The `done` verb (`seat done <ID>...`, and `drain --seat X --done
+/// ID...`): find each id anywhere on the board and settle it on its
+/// own — every id that can be archived is archived, and a refused or
+/// erroring id (malformed, ambiguous, unread, quarantined, unknown, or
+/// an error settling it: a busy seat, failed io) never blocks the
+/// others: the error is recorded as that id's refusal and the loop
+/// settles the ids that follow. Each id is checked (8 lowercase hex)
+/// and its owner
+/// seat found by a board-wide scan; the decision and the rename then
+/// happen under the owner's lock alone (never two seats' locks at
+/// once), where the id's current folder is re-resolved: a drain or
+/// hold that moved the file between the scan and the lock is
+/// accounted for, and an id that reached `draining/` by then is
+/// archived from there. Decision order per id: two or more
+/// `*-<id>.msg` files in any seat's `draining/` is refused, naming
+/// both as `<seat>/draining/<file>`; exactly one is the pick, leased
+/// or not; else a file already in some `archive/` is success (already
+/// done, nothing moves); else a file in `inbox/` names the owner —
+/// archived only for a `webhook.payload` seat whose
+/// `webhook-delivered.json` records the id (payload mode's delivered
+/// mail), else refused (`drain it first`); else one in `quarantine/`
+/// is refused (never delivered); else the id is not on this board.
+/// Each archived id appends one line to `dispatch.log` (`done
+/// seat=<owner> id=<id> by=<--seat if given, else "unknown">`), and
+/// when the caller's `--seat` is a different seat, one line to `err`
+/// names both. Refused ids come back as one error for `main` to
+/// print — each reason exactly once — so the command exits nonzero
+/// when any id was refused. A `last_drained` stamp that fails after
+/// the rename never hides the archive: the trace line stands and the
+/// stamp's failure is that id's refusal. Prints nothing on stdout.
+pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
-    let dir = seat::seat_dir(root, seat_name);
-    seat::read_meta(&dir)?; // unknown/corrupt seat is a named error
 
-    // Refused before the lock, before the listing, before anything
-    // moves: one malformed id must not archive the others.
+    let seats = crate::verbs::sorted_seat_names(root)?;
+    // Every seat's `*-<id>.msg` in one directory, as (seat, file)
+    // pairs.
+    let find = |id: &str, sub: &str| -> Result<Vec<(String, String)>> {
+        let mut found = Vec::new();
+        for seat_name in &seats {
+            for name in matching(&seat::seat_dir(root, seat_name), id, sub)? {
+                found.push((seat_name.clone(), name));
+            }
+        }
+        Ok(found)
+    };
+
+    // Each id settles on its own: a refusal records its reason and
+    // never blocks the other ids.
+    let mut refusals: Vec<String> = Vec::new();
     for id in ids {
         if !msg::valid_msg_id(id) {
-            return Err(SeatError::Drain(format!(
-                "--done id {id:?} is not 8 lowercase hex characters"
-            )));
+            refusals.push(format!("id {id:?} is not 8 lowercase hex characters"));
+            continue;
         }
-    }
-
-    // One drain of this seat at a time, exactly as `drain`.
-    let _lock = seat::Flock::seat(&dir, seat_name)?;
-
-    let staged = msg::list_msg_dir(&dir.join("draining"))?;
-    let matching = |id: &str| -> Vec<PathBuf> {
-        let suffix = format!("-{id}.msg");
-        staged
-            .iter()
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(&suffix))
-            })
-            .cloned()
-            .collect()
-    };
-    // The whole command is decided before the first rename: an
-    // ambiguous id archives nothing.
-    let mut picks: Vec<PathBuf> = Vec::new();
-    for id in ids {
-        let matches = matching(id);
-        if matches.len() > 1 {
-            let both = matches
+        // The owner: the seat whose `draining/` (a hold to retire) or
+        // `inbox/` (payload mode's delivered mail) holds the id right
+        // now, before any lock. The listings run in lifecycle order
+        // (a file only moves forward: inbox, draining, archive), so
+        // one that moves between two listings is still caught by one
+        // of them instead of slipping past the draining and inbox
+        // scans and refusing as unknown. Which folder it is in — and
+        // whether it may be archived — is decided under the owner's
+        // lock.
+        // The four listings; an io error in one is that id's
+        // refusal, never the end of the whole command.
+        let listings = |id: &str| -> Result<_> {
+            Ok((
+                find(id, "inbox")?,
+                find(id, "draining")?,
+                !find(id, "archive")?.is_empty(),
+                find(id, "quarantine")?,
+            ))
+        };
+        let (inbox, staged, archived, quarantined) = match listings(id) {
+            Ok(found) => found,
+            Err(e) => {
+                refusals.push(format!("id {id}: {e}"));
+                continue;
+            }
+        };
+        let owner = if staged.len() > 1 {
+            let both = staged
                 .iter()
-                .map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default()
-                        .to_string()
-                })
+                .map(|(s, f)| format!("{s}/draining/{f}"))
                 .collect::<Vec<_>>()
                 .join(" and ");
-            return Err(SeatError::Drain(format!(
-                "--done id {id} matches two files: {both}"
-            )));
-        }
-        if let Some(p) = matches.into_iter().next() {
-            picks.push(p);
+            refusals.push(format!("id {id} matches two files: {both}"));
+            continue;
+        } else if let Some((seat_name, _)) = staged.into_iter().next() {
+            seat_name
+        } else if archived {
+            continue; // already done: success, nothing moves
+        } else if let Some((seat_name, _)) = inbox.into_iter().next() {
+            seat_name
+        } else if let Some((seat_name, _)) = quarantined.into_iter().next() {
+            refusals.push(format!(
+                "id {id} is in {seat_name}/quarantine; it was never delivered"
+            ));
+            continue;
+        } else {
+            refusals.push(format!("id {id} is not on this board"));
+            continue;
+        };
+        match settle(root, &owner, id) {
+            Ok(Settled::Archived(stamp)) => {
+                dstate::log_line(
+                    root,
+                    "done",
+                    &owner,
+                    &format!("id={id} by={}", caller.unwrap_or("unknown")),
+                );
+                if let Some(by) = caller.filter(|c| *c != owner) {
+                    writeln!(
+                        err,
+                        "done: id {id} archived from seat {owner}, acked by seat {by}"
+                    )?;
+                }
+                if let Some(failure) = stamp {
+                    refusals.push(format!(
+                        "id {id} was archived, but stamping last_drained failed: {failure}"
+                    ));
+                }
+            }
+            Ok(Settled::AlreadyDone) => {}
+            Ok(Settled::Refused(reason)) => refusals.push(reason),
+            // A settle error (a busy seat, failed io) is that id's
+            // refusal too: the ids that follow still settle.
+            Err(e) => refusals.push(format!("id {id}: {e}")),
         }
     }
-    for p in picks {
-        let to = dir.join("archive").join(p.file_name().unwrap_or_default());
-        // The staged listing is a snapshot, so an id repeated in
-        // one command renames its file once and then, like a file
-        // taken by a later drain, finds it gone: success, not an
-        // error (commit_invoked tolerates the same race).
-        if let Err(e) = std::fs::rename(&p, to) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e.into());
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(SeatError::Done(refusals.join("; ")))
+    }
+}
+
+/// The `*-<id>.msg` file names in one seat's `sub` folder — a
+/// missing directory is an empty list.
+fn matching(dir: &Path, id: &str, sub: &str) -> Result<Vec<String>> {
+    let suffix = format!("-{id}.msg");
+    let mut found = Vec::new();
+    for p in msg::list_msg_dir(&dir.join(sub))? {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(&suffix) {
+                found.push(name.to_string());
             }
         }
     }
-    seat::update_meta(&dir, |meta| {
+    Ok(found)
+}
+
+/// How one id settled under its owner seat's lock.
+enum Settled {
+    /// The file was renamed to `archive/` by this command. The string,
+    /// when present, is the `last_drained` stamp failing after the
+    /// rename: the archive stands and is traced, and the failure is
+    /// reported as that id's refusal.
+    Archived(Option<String>),
+    /// Nothing moved: already in `archive/`, or a racing done took it.
+    AlreadyDone,
+    /// Refused, with the reason.
+    Refused(String),
+}
+
+/// Settle one id under its owner seat's lock: re-resolve the id's
+/// folder there (a drain or hold may have moved the file between the
+/// board scan and this lock — an id that reached `draining/` by then
+/// is archived from there), archive what can be archived, and stamp
+/// `last_drained` on a rename — a stamp that fails after the rename
+/// never fails the settle: the archive stands and the failure rides
+/// `Archived`. The caller holds no other seat's lock.
+fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
+    let dir = seat::seat_dir(root, owner);
+    let _lock = seat::Flock::seat(&dir, owner)?;
+    let staged = matching(&dir, id, "draining")?;
+    if staged.len() > 1 {
+        let both = staged
+            .iter()
+            .map(|f| format!("{owner}/draining/{f}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        return Ok(Settled::Refused(format!(
+            "id {id} matches two files: {both}"
+        )));
+    }
+    if let Some(file) = staged.into_iter().next() {
+        let to = dir.join("archive").join(&file);
+        // The listing ran under the lock, so a NotFound here is a
+        // racing done that held the lock first: success, like an
+        // already-archived id (commit_invoked tolerates the same
+        // race).
+        return match std::fs::rename(dir.join("draining").join(&file), &to) {
+            Ok(()) => Ok(Settled::Archived(stamp_last_drained(&dir))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settled::AlreadyDone),
+            Err(e) => Err(e.into()),
+        };
+    }
+    if !matching(&dir, id, "archive")?.is_empty() {
+        return Ok(Settled::AlreadyDone); // already done: success, nothing moves
+    }
+    if let Some(file) = matching(&dir, id, "inbox")?.into_iter().next() {
+        // Payload retirement, and only that: a seat with the
+        // `webhook.payload` marker may retire an id its webhook
+        // recorded as delivered in the body (`webhook-delivered.json`
+        // — verified mail from the `inbox` seat). Any other inbox id
+        // is unread: peer mail, or mail not yet POSTed.
+        let delivered = crate::webhook::id_list(&dir.join("webhook-delivered.json"));
+        if !dir.join("webhook.payload").exists() || !delivered.iter().any(|d| d == id) {
+            return Ok(Settled::Refused(format!(
+                "id {id} is unread in {owner}/inbox; drain it first"
+            )));
+        }
+        let to = dir.join("archive").join(&file);
+        std::fs::rename(dir.join("inbox").join(&file), &to)?;
+        return Ok(Settled::Archived(stamp_last_drained(&dir)));
+    }
+    if !matching(&dir, id, "quarantine")?.is_empty() {
+        return Ok(Settled::Refused(format!(
+            "id {id} is in {owner}/quarantine; it was never delivered"
+        )));
+    }
+    // Nowhere under the lock: a racing done took it. Success.
+    Ok(Settled::AlreadyDone)
+}
+
+/// Stamp `last_drained`, reporting a failure instead of returning it:
+/// the rename already happened, so the archive stands and is traced —
+/// the failure rides `Settled::Archived` as that id's reported reason.
+fn stamp_last_drained(dir: &Path) -> Option<String> {
+    seat::update_meta(dir, |meta| {
         meta.last_drained = Some(seat::now_ts());
-    })?;
-    Ok(())
+    })
+    .err()
+    .map(|e| e.to_string())
 }
 
 /// Stage and verify everything the seat owes one delivery pass. The
@@ -236,6 +419,14 @@ pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
 
     let draining = dir.join("draining");
     std::fs::create_dir_all(&draining)?;
+    // What was already staged before this receive: a leftover from a
+    // crashed drain, an expired hold, or mail the hapi dispatcher
+    // staged and pushed — any of it may have been shown before, so
+    // its file name is remembered for the redelivery line.
+    let redeliveries: BTreeSet<String> = msg::list_msg_dir(&draining)?
+        .iter()
+        .map(|p| file_name_of(p))
+        .collect();
     for p in msg::list_msg_dir(&dir.join("inbox"))? {
         let dest = draining.join(p.file_name().unwrap_or_default());
         std::fs::rename(&p, dest)?;
@@ -250,7 +441,10 @@ pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
             continue;
         }
         match check_direct(root, seat_name, &p) {
-            Ok(item) => received.directs.push(item),
+            Ok(mut item) => {
+                item.redelivery = redeliveries.contains(&item.file_name);
+                received.directs.push(item);
+            }
             Err(failure) => {
                 quarantine(root, seat_name, &p)?;
                 match failure {
@@ -323,6 +517,8 @@ fn check_direct(
         file_name: file_name_of(path),
         header,
         body,
+        // Set by `receive` when the file was staged before this pass.
+        redelivery: false,
     })
 }
 
@@ -379,6 +575,18 @@ mod tests {
         let mut buf = Vec::new();
         let r = hold(root, seat, &mut buf);
         (r, String::from_utf8(buf).unwrap())
+    }
+
+    /// Run `done` with a caller seat (or none), capturing its stderr
+    /// sink (the cross-seat notice); refusals ride the returned error.
+    fn done_run(
+        root: &std::path::Path,
+        caller: Option<&str>,
+        ids: &[String],
+    ) -> (Result<()>, String) {
+        let mut err = Vec::new();
+        let r = done(root, caller, ids, &mut err);
+        (r, String::from_utf8(err).unwrap())
     }
 
     /// The 8-hex id a staged file's name carries.
@@ -727,9 +935,9 @@ mod tests {
 
     /// `--hold` prints the mail exactly as `drain` prints it, sets
     /// each staged file's mtime to the lease deadline (a future
-    /// mtime), archives nothing and stamps nothing. Inside the lease a
-    /// second `--hold` and a plain `drain` print nothing and move
-    /// nothing.
+    /// mtime), archives nothing, and stamps `last_drained` (the
+    /// reader is alive). Inside the lease a second `--hold` and a
+    /// plain `drain` print nothing and move nothing.
     #[test]
     fn hold_prints_leases_and_moves_nothing() {
         let root = setup();
@@ -742,12 +950,12 @@ mod tests {
         assert!(text.contains("[direct]"));
 
         // Leased: one file in draining/ with a future mtime, an empty
-        // archive, no last_drained stamped.
+        // archive — and last_drained stamped: the reader is alive.
         let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
         assert_eq!(staged.len(), 1);
         assert!(leased(&staged[0]), "the deadline is the file's mtime");
         assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
-        assert!(seat::read_meta(&dir).unwrap().last_drained.is_none());
+        assert!(seat::read_meta(&dir).unwrap().last_drained.is_some());
 
         // Inside the lease nobody takes it: not a second hold...
         let (r2, text2) = hold_str(&root, "beta");
@@ -787,7 +995,8 @@ mod tests {
     /// A leftover from a receive without commit (no hold) is not
     /// leased — nothing ever set its mtime — so the next plain
     /// `drain` prints and archives it exactly as before the hold
-    /// existed.
+    /// existed, under the redelivery line first: it may have been
+    /// shown before.
     #[test]
     fn a_receive_leftover_is_not_leased() {
         let root = setup();
@@ -805,16 +1014,24 @@ mod tests {
 
         let (r, text) = drain_str(&root, "beta");
         r.unwrap();
+        // The leftover was in draining/ before this drain's receive:
+        // the redelivery line precedes its direct text.
+        let line = format!(
+            "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
+            id_of(&staged[0])
+        );
+        assert!(text.starts_with(&line), "the line comes first: {text}");
         assert!(text.contains("leftover"));
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
         assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
     }
 
-    /// `--done` archives exactly the named ids (leased or not), never
-    /// touches `inbox/`, stamps `last_drained`, and prints nothing. A
-    /// repeat exits 0 and moves nothing; an id found only in `inbox/`
-    /// is success and the inbox file stays there; a malformed id
-    /// refuses the whole command before anything moves.
+    /// `done` archives exactly the named ids (leased or not), never
+    /// touches `inbox/`, stamps `last_drained`, and prints nothing on
+    /// stdout. A repeat exits 0 and moves nothing; an id found only in
+    /// `inbox/` is refused (`drain it first`) and nothing moves; a
+    /// malformed id is refused on its own while the well-formed id
+    /// beside it still archives.
     #[test]
     fn done_archives_exactly_the_named_ids() {
         let root = setup();
@@ -830,40 +1047,46 @@ mod tests {
         assert_eq!(staged.len(), 3);
         let ids: Vec<String> = staged.iter().map(|p| id_of(p)).collect();
 
-        // Mail that is only in inbox/ names an id `--done` must not
+        // Mail that is only in inbox/ names an id `done` must not
         // touch, even when its id matches.
         verbs::cmd_send(&root, Some("alpha"), "beta", "still inbox", None).unwrap();
         let inbox = msg::list_msg_dir(&dir.join("inbox")).unwrap();
         assert_eq!(inbox.len(), 1);
 
-        done(&root, "beta", &ids[0..2]).unwrap();
+        done_run(&root, None, &ids[0..2]).0.unwrap();
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 2);
         assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 1);
         assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
         assert!(seat::read_meta(&dir).unwrap().last_drained.is_some());
 
         // A repeat of the same command exits 0 and moves nothing.
-        done(&root, "beta", &ids[0..2]).unwrap();
+        done_run(&root, None, &ids[0..2]).0.unwrap();
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 2);
         assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 1);
         assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
 
-        // An id only in inbox/ is success — and inbox/ is left alone.
-        done(&root, "beta", &[id_of(&inbox[0])]).unwrap();
+        // An id only in inbox/ is refused — and inbox/ is left alone.
+        let (r, notice) = done_run(&root, None, &[id_of(&inbox[0])]);
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("unread in beta/inbox"), "{msg}");
+        assert!(msg.contains("drain it first"), "{msg}");
+        assert_eq!(notice, "", "a refusal rides the error alone");
         assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 2);
         assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 1);
 
-        // A malformed id is refused before anything moves.
-        let err = done(&root, "beta", &[ids[2].clone(), "NOPE".into()]).unwrap_err();
+        // A malformed id is refused on its own: the well-formed id
+        // beside it still archives.
+        let (r, _) = done_run(&root, None, &[ids[2].clone(), "NOPE".into()]);
+        let err = r.unwrap_err();
         assert!(err.to_string().contains("8 lowercase hex"), "{err}");
-        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 2);
-        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 1);
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 3);
+        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 0);
     }
 
     /// Two staged files matching one id is refused naming both, and
-    /// the refusal is decided before the first rename: a command
-    /// naming one clean id and the ambiguous one archives neither.
+    /// each id settles on its own: a command naming one clean id and
+    /// the ambiguous one archives the clean id and refuses the other.
     #[test]
     fn two_files_matching_one_done_id_is_refused_naming_both() {
         let root = setup();
@@ -879,17 +1102,17 @@ mod tests {
         let dupe_name = format!("20200101T000000.000000-{}.msg", id_of(&staged[0]));
         std::fs::copy(&staged[0], dir.join("draining").join(&dupe_name)).unwrap();
 
-        let err = done(&root, "beta", &[id_of(&staged[1]), id_of(&staged[0])]).unwrap_err();
-        let msg = err.to_string();
+        let (r, _) = done_run(&root, None, &[id_of(&staged[1]), id_of(&staged[0])]);
+        let msg = r.unwrap_err().to_string();
         assert!(msg.contains("matches two files"), "{msg}");
         assert!(
             msg.contains(&dupe_name)
                 && msg.contains(staged[0].file_name().unwrap().to_str().unwrap()),
             "the refusal names both files: {msg}"
         );
-        // Decided before the first rename: neither id archived.
-        assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
-        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 3);
+        // The clean id archived; the ambiguous pair stayed.
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 2);
     }
 
     /// `--done` takes a leased file as happily as an expired one: the
@@ -905,7 +1128,7 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert!(leased(&staged[0]));
 
-        done(&root, "beta", &[id_of(&staged[0])]).unwrap();
+        done_run(&root, None, &[id_of(&staged[0])]).0.unwrap();
         assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
     }
@@ -924,9 +1147,538 @@ mod tests {
         assert_eq!(staged.len(), 1);
         let id = id_of(&staged[0]);
 
-        done(&root, "beta", &[id.clone(), id.clone()]).unwrap();
+        done_run(&root, None, &[id.clone(), id.clone()]).0.unwrap();
         assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
         assert!(seat::read_meta(&dir).unwrap().last_drained.is_some());
+    }
+
+    /// `seat done` names no seat: a held id is archived wherever the
+    /// board holds it, a repeat of an archived id succeeds, and an
+    /// already-archived id succeeds with nothing to move.
+    #[test]
+    fn done_without_a_seat_archives_a_held_id_board_wide() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "board wide", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let id = id_of(&staged[0]);
+
+        done_run(&root, None, &[id.clone()]).0.unwrap();
+        assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+
+        // A repeat (the file is now archived) succeeds and moves
+        // nothing.
+        done_run(&root, None, &[id]).0.unwrap();
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+    }
+
+    /// An unknown id, an inbox id and a quarantined id are each
+    /// refused with their words, and nothing moves.
+    #[test]
+    fn done_refuses_unknown_inbox_and_quarantined_ids() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "unread one", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let inbox = msg::list_msg_dir(&dir.join("inbox")).unwrap();
+        assert_eq!(inbox.len(), 1);
+
+        // Unknown: not on this board.
+        let (r, _) = done_run(&root, None, &["0000000f".into()]);
+        let err = r.unwrap_err();
+        assert!(
+            err.to_string().contains("0000000f is not on this board"),
+            "{err}"
+        );
+
+        // Unread: drain it first.
+        let (r, _) = done_run(&root, None, &[id_of(&inbox[0])]);
+        let text = r.unwrap_err().to_string();
+        assert!(text.contains("unread in beta/inbox"), "{text}");
+        assert!(text.contains("drain it first"), "{text}");
+        assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
+
+        // Quarantined: it was never delivered.
+        verbs::cmd_send(&root, Some("alpha"), "beta", "quarantine me", None).unwrap();
+        let files = msg::list_msg_dir(&dir.join("inbox")).unwrap();
+        let raw = std::fs::read_to_string(&files[1]).unwrap();
+        std::fs::write(&files[1], raw.replace("quarantine me", "tampered me")).unwrap();
+        let (r, _) = drain_str(&root, "beta");
+        r.unwrap_err(); // the bad mark is the named error
+        let qdir = dir.join("quarantine");
+        let quarantined = msg::list_msg_dir(&qdir).unwrap();
+        assert_eq!(quarantined.len(), 1);
+        let (r, _) = done_run(&root, None, &[id_of(&quarantined[0])]);
+        let text = r.unwrap_err().to_string();
+        assert!(
+            text.contains("is in beta/quarantine; it was never delivered"),
+            "{text}"
+        );
+        assert_eq!(msg::list_msg_dir(&qdir).unwrap().len(), 1);
+    }
+
+    /// Two `draining/` matches in two seats are refused naming both
+    /// as `<seat>/draining/<file>`; one `draining/` match beside an
+    /// archived one (an id collision) archives the `draining/` file.
+    #[test]
+    fn done_two_seats_matches_refuse_and_collisions_archive_the_draining_one() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "first", None).unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "second", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&beta_dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 2);
+        let name0 = staged[0].file_name().unwrap().to_str().unwrap().to_string();
+        let name1 = staged[1].file_name().unwrap().to_str().unwrap().to_string();
+
+        // The same file staged in another seat: two matches on the
+        // board.
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        std::fs::copy(&staged[0], alpha_dir.join("draining").join(&name0)).unwrap();
+        let (r, _) = done_run(&root, None, &[id_of(&staged[0])]);
+        let text = r.unwrap_err().to_string();
+        assert!(text.contains("matches two files"), "{text}");
+        assert!(
+            text.contains(&format!("alpha/draining/{name0}"))
+                && text.contains(&format!("beta/draining/{name0}")),
+            "the refusal names both seats' files: {text}"
+        );
+        // Nothing moved.
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("draining")).unwrap().len(), 2);
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("draining")).unwrap().len(),
+            1
+        );
+
+        // An id collision — the other staged file also exists,
+        // archived, under alpha — archives the draining one and
+        // leaves the archived file alone.
+        std::fs::copy(&staged[1], alpha_dir.join("archive").join(&name1)).unwrap();
+        done_run(&root, None, &[id_of(&staged[1])]).0.unwrap();
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("draining")).unwrap().len(), 1);
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("archive")).unwrap().len(),
+            1
+        );
+    }
+
+    /// One good id and one unknown id in one command: each id settles
+    /// on its own, so the good id archives while the unknown one is
+    /// refused — the held mail never rides back as a redelivery for
+    /// the unknown id's sake.
+    #[test]
+    fn done_with_one_good_and_one_unknown_id_archives_the_good_one() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "the good id", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+
+        let (r, _) = done_run(&root, None, &[id_of(&staged[0]), "0000000f".into()]);
+        let err = r.unwrap_err();
+        assert!(
+            err.to_string().contains("0000000f is not on this board"),
+            "{err}"
+        );
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 0);
+    }
+
+    /// `last_drained` is stamped on the seat whose file was archived,
+    /// only there; and a hold of an empty seat stamps it too — the
+    /// reader is alive even when it printed nothing.
+    #[test]
+    fn done_stamps_last_drained_on_the_archived_seat_and_a_hold_stamps_too() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "stamp me", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        let received = receive(&root, "beta").unwrap();
+        assert_eq!(received.directs.len(), 1);
+        // receive alone stamps nothing.
+        assert!(seat::read_meta(&beta_dir).unwrap().last_drained.is_none());
+        let staged = msg::list_msg_dir(&beta_dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+
+        done_run(&root, None, &[id_of(&staged[0])]).0.unwrap();
+        assert!(seat::read_meta(&beta_dir).unwrap().last_drained.is_some());
+        assert!(seat::read_meta(&alpha_dir).unwrap().last_drained.is_none());
+
+        // A hold of an empty seat prints nothing and still stamps.
+        let (r, text) = hold_str(&root, "alpha");
+        r.unwrap();
+        assert_eq!(text, "");
+        assert!(seat::read_meta(&alpha_dir).unwrap().last_drained.is_some());
+    }
+
+    /// Each archived id leaves one trace line in `dispatch.log` —
+    /// `done seat=<owner> id=<id> by=<--seat or unknown>` — and a
+    /// cross-seat ack adds exactly one stderr line naming both seats;
+    /// an ack without `--seat` traces `by=unknown` and prints no
+    /// stderr line.
+    #[test]
+    fn done_leaves_one_trace_line_and_names_a_cross_seat_ack() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "trace me", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let id = id_of(&staged[0]);
+
+        // `drain --seat alpha --done`: the file is beta's, so the
+        // trace names beta and the ack names alpha — plus one stderr
+        // line naming both.
+        let (r, notice) = done_run(&root, Some("alpha"), &[id.clone()]);
+        r.unwrap();
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        let line = log.strip_suffix('\n').unwrap().split('\n').next_back().unwrap();
+        assert_eq!(
+            line.split_once(' ').unwrap().1,
+            format!("done seat=beta id={id} by=alpha"),
+            "the trace line's content"
+        );
+        assert_eq!(
+            notice,
+            format!("done: id {id} archived from seat beta, acked by seat alpha\n"),
+            "one stderr line naming both seats"
+        );
+
+        // `seat done` with no --seat traces `by=unknown` and says
+        // nothing on stderr.
+        verbs::cmd_send(&root, Some("alpha"), "beta", "trace two", None).unwrap();
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged2 = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        let id2 = id_of(&staged2[0]);
+        let (r2, notice2) = done_run(&root, None, &[id2.clone()]);
+        r2.unwrap();
+        let log2 = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        let line2 = log2.strip_suffix('\n').unwrap().split('\n').next_back().unwrap();
+        assert_eq!(
+            line2.split_once(' ').unwrap().1,
+            format!("done seat=beta id={id2} by=unknown")
+        );
+        assert_eq!(notice2, "");
+    }
+
+    /// The id moves from `inbox/` to `draining/` between the caller's
+    /// request and the archive (a drain or hold staged it while done
+    /// waited on the seat lock): done re-resolves the folder under the
+    /// lock, archives it from `draining/` with its trace line, and
+    /// never exits 0 with the mail still leased.
+    #[test]
+    fn done_archives_from_draining_when_the_file_moves_before_the_lock() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "moved mid-flight", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        // Payload mode with the id delivered, so the file may retire
+        // straight out of inbox/.
+        std::fs::write(dir.join("webhook.payload"), "").unwrap();
+        let inbox = msg::list_msg_dir(&dir.join("inbox")).unwrap();
+        assert_eq!(inbox.len(), 1);
+        let id = id_of(&inbox[0]);
+        seat::atomic_write_json(
+            &dir.join("webhook-delivered.json"),
+            format!("[\"{id}\"]"),
+        )
+        .unwrap();
+
+        // Hold the seat lock so done's board scan finishes and it
+        // blocks before the settle; then a receive stages the file,
+        // exactly as a drain or hold would.
+        let held = seat::Flock::seat(&dir, "beta").unwrap();
+        let name = inbox[0].file_name().unwrap().to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<(Result<()>, String)>();
+        let root2 = root.clone();
+        let id2 = id.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut err = Vec::new();
+            let r = done(&root2, None, &[id2], &mut err);
+            let _ = tx.send((r, String::from_utf8(err).unwrap()));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::rename(dir.join("inbox").join(&name), dir.join("draining").join(&name)).unwrap();
+        drop(held);
+        let (r, notice) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        r.unwrap();
+        assert_eq!(notice, "");
+        // Archived from draining/ — never left leased — and traced.
+        assert!(msg::list_msg_dir(&dir.join("inbox")).unwrap().is_empty());
+        assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        let line = log.strip_suffix('\n').unwrap().split('\n').next_back().unwrap();
+        assert_eq!(
+            line.split_once(' ').unwrap().1,
+            format!("done seat=beta id={id} by=unknown")
+        );
+    }
+
+    /// A `webhook.payload` seat retires inbox mail its webhook
+    /// recorded as delivered: one rename under the seat lock, with the
+    /// trace line. Any other inbox id on that seat stays refused —
+    /// peer mail, mail not yet POSTed — and a seat without the marker
+    /// is refused outright.
+    #[test]
+    fn payload_seats_retire_delivered_inbox_mail() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "payload shown", None).unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "never POSTed", None).unwrap();
+        verbs::cmd_send(&root, Some("beta"), "alpha", "no marker here", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        std::fs::write(beta_dir.join("webhook.payload"), "").unwrap();
+        let delivered_id = id_of(&msg::list_msg_dir(&beta_dir.join("inbox")).unwrap()[0]);
+        seat::atomic_write_json(
+            &beta_dir.join("webhook-delivered.json"),
+            format!("[\"{delivered_id}\"]"),
+        )
+        .unwrap();
+
+        // The delivered id retires from inbox/ with a trace line.
+        let (r, _) = done_run(&root, None, &[delivered_id.clone()]);
+        r.unwrap();
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("inbox")).unwrap().len(), 1);
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        let line = log.strip_suffix('\n').unwrap().split('\n').next_back().unwrap();
+        assert_eq!(
+            line.split_once(' ').unwrap().1,
+            format!("done seat=beta id={delivered_id} by=unknown")
+        );
+
+        // An inbox id NOT in webhook-delivered.json stays unread.
+        let undelivered_id = id_of(&msg::list_msg_dir(&beta_dir.join("inbox")).unwrap()[0]);
+        let (r, _) = done_run(&root, None, &[undelivered_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        assert!(
+            text.contains(&format!(
+                "id {undelivered_id} is unread in beta/inbox; drain it first"
+            )),
+            "{text}"
+        );
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("inbox")).unwrap().len(), 1);
+
+        // A seat without the marker is refused even with a delivered
+        // record staged: the marker gates the whole path.
+        let no_marker_id = id_of(&msg::list_msg_dir(&alpha_dir.join("inbox")).unwrap()[0]);
+        seat::atomic_write_json(
+            &alpha_dir.join("webhook-delivered.json"),
+            format!("[\"{no_marker_id}\"]"),
+        )
+        .unwrap();
+        let (r, _) = done_run(&root, None, &[no_marker_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        assert!(
+            text.contains(&format!(
+                "id {no_marker_id} is unread in alpha/inbox; drain it first"
+            )),
+            "{text}"
+        );
+        assert_eq!(msg::list_msg_dir(&alpha_dir.join("inbox")).unwrap().len(), 1);
+    }
+
+    /// A mixed command settles each id: the valid ones archive, every
+    /// refused id is reported exactly once — in one error `main`
+    /// prints — and the command exits nonzero.
+    #[test]
+    fn a_mixed_command_archives_the_valid_ids_and_exits_nonzero() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "held good", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let good = id_of(&staged[0]);
+        verbs::cmd_send(&root, Some("alpha"), "beta", "still unread", None).unwrap();
+        let unread = id_of(&msg::list_msg_dir(&dir.join("inbox")).unwrap()[0]);
+
+        let (r, notice) = done_run(&root, None, &[good.clone(), "0000000f".into(), unread.clone()]);
+        let text = r.unwrap_err().to_string();
+        // The good id archived, in command order.
+        assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 1);
+        assert!(msg::list_msg_dir(&dir.join("draining")).unwrap().is_empty());
+        // Each refusal named exactly once, in command order, and
+        // nowhere else: the notice sink stayed empty.
+        assert_eq!(text.matches("0000000f is not on this board").count(), 1, "{text}");
+        assert_eq!(
+            text.matches(&format!(
+                "id {unread} is unread in beta/inbox; drain it first"
+            ))
+            .count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.find("0000000f").unwrap() < text.find(&unread).unwrap(),
+            "refusals keep command order: {text}"
+        );
+        assert_eq!(notice, "", "refusals ride the error alone");
+    }
+
+    /// A `last_drained` stamp that fails after a successful rename
+    /// never hides the archive: the id is archived WITH its trace
+    /// line, the stamp's failure is that id's refusal — reported
+    /// exactly once — and the ids after it still settle.
+    #[test]
+    fn a_stamp_failure_after_the_rename_still_traces_and_settles_the_rest() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "stamp fails", None).unwrap();
+        verbs::cmd_send(&root, Some("beta"), "alpha", "settles after", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let (r, _) = hold_str(&root, "alpha");
+        r.unwrap();
+        let beta_id = id_of(&msg::list_msg_dir(&beta_dir.join("draining")).unwrap()[0]);
+        let alpha_id = id_of(&msg::list_msg_dir(&alpha_dir.join("draining")).unwrap()[0]);
+
+        // The rename will succeed, the stamp cannot: corrupt meta.
+        std::fs::write(beta_dir.join("meta.json"), "{ nope").unwrap();
+
+        let (r, _) = done_run(&root, None, &[beta_id.clone(), alpha_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        // Both ids archived — the failure never ended the loop.
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("archive")).unwrap().len(),
+            1
+        );
+        // The archived id still has its trace line, failure or not.
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        assert!(
+            log.contains(&format!("done seat=beta id={beta_id} by=unknown")),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("done seat=alpha id={alpha_id} by=unknown")),
+            "{log}"
+        );
+        // The stamp's failure is that id's refusal, exactly once.
+        assert_eq!(text.matches(&beta_id).count(), 1, "{text}");
+        assert!(text.contains("corrupt seat meta"), "{text}");
+    }
+
+    /// An error settling one id — here the rename lands on a
+    /// directory, so it fails with an io error — is that id's refusal
+    /// alone: the file stays where it is, the reason is reported
+    /// exactly once, and the ids after it still settle. (A busy owner
+    /// seat reaches the same branch after its 30s wait.)
+    #[test]
+    fn an_error_settling_one_id_never_blocks_the_later_ones() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "cannot archive", None).unwrap();
+        verbs::cmd_send(&root, Some("beta"), "alpha", "archives fine", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let (r, _) = hold_str(&root, "alpha");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&beta_dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let beta_id = id_of(&staged[0]);
+        let alpha_id = id_of(&msg::list_msg_dir(&alpha_dir.join("draining")).unwrap()[0]);
+
+        // The rename's destination already exists as a directory: the
+        // rename fails with an io error, not NotFound.
+        let name = staged[0].file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::create_dir_all(beta_dir.join("archive").join(&name)).unwrap();
+
+        let (r, _) = done_run(&root, None, &[beta_id.clone(), alpha_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        // The blocked id's file stayed in draining/, refused exactly
+        // once.
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("draining")).unwrap().len(), 1);
+        assert_eq!(text.matches(&beta_id).count(), 1, "{text}");
+        assert!(text.contains("io error"), "{text}");
+        // The later id settled: archived with its trace line, and the
+        // blocked id never got one.
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("archive")).unwrap().len(),
+            1
+        );
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        assert!(
+            log.contains(&format!("done seat=alpha id={alpha_id} by=unknown")),
+            "{log}"
+        );
+        assert!(!log.contains(&format!("id={beta_id}")), "{log}");
+    }
+
+    /// A redelivery is exactly the redelivery line plus the direct
+    /// text: hold, expire the lease, hold again — byte for byte.
+    #[test]
+    fn an_expired_hold_reprints_under_the_redelivery_line() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "expired body", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, text) = hold_str(&root, "beta");
+        r.unwrap();
+        assert!(text.contains("expired body"));
+        assert!(!text.contains("[redelivery]"), "fresh mail: {text}");
+
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let id = id_of(&staged[0]);
+        set_mtime(&staged[0], SystemTime::now() - Duration::from_secs(1)).unwrap();
+
+        let (r2, text2) = hold_str(&root, "beta");
+        r2.unwrap();
+        // The first hold's output was exactly the direct text (pinned
+        // byte for byte by drain_prints_the_full_direct_text), so the
+        // reprint is the line plus that, byte for byte.
+        assert_eq!(
+            text2,
+            format!(
+                "[redelivery] check whether you already did this; if so, only run: seat done {id}\n{text}"
+            ),
+            "the reprint is the line plus the direct text"
+        );
+    }
+
+    /// A hold printing one fresh and one expired message marks only
+    /// the expired one: exactly one redelivery line, naming its id.
+    #[test]
+    fn a_hold_marks_only_the_expired_message_redelivery() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "old news", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let old_id = id_of(&staged[0]);
+        set_mtime(&staged[0], SystemTime::now() - Duration::from_secs(1)).unwrap();
+
+        verbs::cmd_send(&root, Some("alpha"), "beta", "fresh news", None).unwrap();
+        let (r2, text) = hold_str(&root, "beta");
+        r2.unwrap();
+        assert!(text.contains("old news") && text.contains("fresh news"));
+        let lines: Vec<&str> = text.lines().collect();
+        let redeliveries: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("[redelivery]"))
+            .collect();
+        assert_eq!(redeliveries.len(), 1, "one line only: {text}");
+        assert_eq!(
+            *redeliveries[0],
+            format!("[redelivery] check whether you already did this; if so, only run: seat done {old_id}"),
+            "the line names the expired message's id: {text}"
+        );
     }
 }

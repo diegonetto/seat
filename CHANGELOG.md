@@ -2,6 +2,64 @@
 
 Notable changes to this crate. Versions follow semantic versioning.
 
+## [0.11.0] - 2026-11-18
+
+### Added
+
+- `seat done <ID>...`: the ack by id, found anywhere on the board.
+  Before, `drain::done` skipped an id with no file in that seat's
+  `draining/`, so a mistyped id or the right id under the wrong
+  `--seat` exited 0 and the held mail came back 30 minutes later — a
+  wrong ack succeeded and moved nothing. The new verb (one or more
+  ids, each 8 lowercase hex) searches every seat's `inbox/`,
+  `draining/`, `archive/` and `quarantine/` per id — the four
+  listings taken in lifecycle order, so a file moving between
+  folders mid-scan is still found — and decides in this order: two
+  or more `*-<id>.msg` matches in `draining/` (across seats) is
+  refused naming both as `<seat>/draining/<file>`; exactly one is
+  archived, leased or not, under that seat's lock alone, where the
+  id's folder is re-resolved (an id that reached `draining/` by lock
+  time is archived from there; a NotFound on a rename is success);
+  a match already in `archive/` is success (nothing moves); a match
+  in `inbox/` is refused (`drain it first`) unless the seat carries
+  the `webhook.payload` marker and `webhook-delivered.json` records
+  the id as delivered in the webhook body — then it is retired by
+  one rename under the lock; a match in `quarantine/` is refused
+  (never delivered); an id nowhere is refused (`not on this board`).
+  Each id settles on its own: the archivable ids archive even when
+  others refuse, each refusal is reported exactly once in one
+  `SeatError::Done` that `main` prints (`done: ...`), and any
+  refusal exits nonzero. Every rename stamps `last_drained` on the
+  seat it archived for, and each archived id appends one trace line
+  to `dispatch.log` — `done seat=<owner> id=<id> by=<--seat or
+  unknown>` — with one stderr line naming both seats when the
+  caller's `--seat` differs from the owner.
+
+### Changed
+
+- `seat drain --seat X --done ID...` is the same command as
+  `seat done`: the `--seat` is still checked (an unknown or corrupt
+  seat keeps its named error) and the ids are then found board-wide,
+  so an ack under the wrong seat archives the right file. The
+  per-seat body it replaced treated an id with no file in that
+  seat's `draining/` as success.
+- A hold stamps the reader alive: `drain --hold` now stamps
+  `last_drained` on every call, after printing, including a call that
+  printed nothing — a reader that only holds no longer looks like it
+  never reads.
+- The redelivery line. A message already in `draining/` before this
+  drain's receive moved the inbox in — an expired hold, a crashed
+  drain, or mail today's hapi dispatcher staged and pushed — may have
+  been shown before, so `drain` and `drain --hold` print exactly
+  `[redelivery] check whether you already did this; if so, only run:
+  seat done <id>` (the real id) before that message's direct text.
+  `ReceivedDirect` carries the new `redelivery` flag (`receive` sets
+  it from a listing of `draining/` taken before the inbox loop;
+  `check_direct` leaves it false); `direct_text` and the
+  dispatcher's POST text are byte for byte unchanged. On 11-18
+  matter-grokbot's held dcf449d2 was rung and printed twice with
+  nothing saying it had been shown before; the line names it.
+
 ## [0.10.0] - 2026-11-17
 
 ### Added

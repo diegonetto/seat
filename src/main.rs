@@ -58,8 +58,8 @@ enum Command {
     },
     /// Print a seat's unread inbox. Plain drain prints and archives;
     /// `--hold` prints but leases the mail in `draining/` for 30
-    /// minutes instead of archiving, and `--done <ID>...` archives
-    /// exactly the held ids the bot finished with.
+    /// minutes instead of archiving, and `--done <ID>...` is
+    /// `seat done`: the ids are found board-wide.
     Drain {
         #[arg(long)]
         seat: String,
@@ -67,10 +67,19 @@ enum Command {
         /// minutes) instead of archiving it
         #[arg(long)]
         hold: bool,
-        /// Archive exactly these held message ids (each 8 lowercase
-        /// hex characters)
+        /// `seat done <ID>...`: archive these message ids, found
+        /// anywhere on the board (each id 8 lowercase hex characters)
         #[arg(long, value_name = "ID", num_args = 1.., conflicts_with = "hold")]
         done: Vec<String>,
+    },
+    /// Archive held messages by id, found anywhere on the board: each
+    /// id 8 lowercase hex, and each id settles on its own — a refused
+    /// id (unread, quarantined, ambiguous, unknown) never blocks the
+    /// others, and any refusal exits nonzero
+    Done {
+        /// Message ids to archive (each 8 lowercase hex characters)
+        #[arg(value_name = "ID", num_args = 1.., required = true)]
+        ids: Vec<String>,
     },
     /// Deliver every routed seat's mail (hapi session or webhook;
     /// `--once` runs one scan pass; unrouted seats are pull)
@@ -156,11 +165,21 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
                 let mut out = std::io::stdout().lock();
                 drain::hold(root, &seat, &mut out)
             } else if !done.is_empty() {
-                drain::done(root, &seat, &done)
+                // `--done` is `seat done`: the `--seat` is still
+                // checked (an unknown or corrupt seat keeps its named
+                // error), and its name rides the ack's trace line.
+                board::ensure_board(root)?;
+                seat::read_meta(&seat::seat_dir(root, &seat))?;
+                let mut err = std::io::stderr();
+                drain::done(root, Some(&seat), &done, &mut err)
             } else {
                 let mut out = std::io::stdout().lock();
                 drain::drain(root, &seat, &mut out)
             }
+        }
+        Command::Done { ids } => {
+            let mut err = std::io::stderr();
+            drain::done(root, None, &ids, &mut err)
         }
         Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
         Command::Up { names } => session::cmd_up(root, &names),
@@ -203,7 +222,8 @@ mod tests {
     /// The drain flags parse exactly as the verb is spelled: `--hold`
     /// alone, `--done` with one or many ids; `--hold` and `--done`
     /// together are refused by the parser, and `--done` with no id is
-    /// a parse error, not an empty done.
+    /// a parse error, not an empty done. `seat done` parses with one
+    /// or many ids, and none is a parse error too.
     #[test]
     fn drain_hold_and_done_flags_parse_as_spelled() {
         let ok = |args: &[&str]| {
@@ -222,5 +242,75 @@ mod tests {
             !ok(&["drain", "--seat", "a", "--done"]),
             "--done with no id is a parse error"
         );
+        assert!(ok(&["done", "ab12cd34"]));
+        assert!(ok(&["done", "ab12cd34", "ef567890"]));
+        assert!(
+            !ok(&["done"]),
+            "done with no id is a parse error"
+        );
+    }
+
+    /// `drain --seat X --done` is `seat done`: the seat is checked
+    /// (an unknown seat keeps its named error), then the id is found
+    /// board-wide — an ack under the wrong seat archives the right
+    /// file.
+    #[test]
+    fn drain_done_acks_board_wide_after_checking_the_seat() {
+        use crate::msg;
+        use crate::seat;
+        use crate::testutil::temp_root;
+        use crate::verbs;
+        let root = temp_root("main-drain-done");
+        crate::board::init(&root).unwrap();
+        verbs::cmd_register(&root, "alpha", "sb", None, None, Vec::new(), None, None).unwrap();
+        verbs::cmd_register(&root, "beta", "sb", None, None, Vec::new(), None, None).unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "wrong seat ack", None).unwrap();
+        let mut out = Vec::new();
+        drain::hold(&root, "beta", &mut out).unwrap();
+        let staged = msg::list_msg_dir(&seat::seat_dir(&root, "beta").join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let name = staged[0].file_name().unwrap().to_str().unwrap().to_string();
+        let id = name
+            .strip_suffix(".msg")
+            .unwrap()
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .to_string();
+
+        dispatch(
+            &root,
+            Command::Drain {
+                seat: "alpha".into(),
+                hold: false,
+                done: vec![id],
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            msg::list_msg_dir(&seat::seat_dir(&root, "beta").join("draining"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            msg::list_msg_dir(&seat::seat_dir(&root, "beta").join("archive"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // An unknown --seat keeps its named error.
+        let err = dispatch(
+            &root,
+            Command::Drain {
+                seat: "ghost".into(),
+                hold: false,
+                done: vec!["ab12cd34".into()],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
     }
 }
