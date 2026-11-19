@@ -169,9 +169,12 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 
 /// The `done` verb (`seat done <ID>...`, and `drain --seat X --done
 /// ID...`): find each id anywhere on the board and settle it on its
-/// own — every id that can be archived is archived, and a refused id
-/// (malformed, ambiguous, unread, quarantined, unknown) never blocks
-/// the others. Each id is checked (8 lowercase hex) and its owner
+/// own — every id that can be archived is archived, and a refused or
+/// erroring id (malformed, ambiguous, unread, quarantined, unknown, or
+/// an error settling it: a busy seat, failed io) never blocks the
+/// others: the error is recorded as that id's refusal and the loop
+/// settles the ids that follow. Each id is checked (8 lowercase hex)
+/// and its owner
 /// seat found by a board-wide scan; the decision and the rename then
 /// happen under the owner's lock alone (never two seats' locks at
 /// once), where the id's current folder is re-resolved: a drain or
@@ -191,7 +194,9 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 /// when the caller's `--seat` is a different seat, one line to `err`
 /// names both. Refused ids come back as one error for `main` to
 /// print — each reason exactly once — so the command exits nonzero
-/// when any id was refused. Prints nothing on stdout.
+/// when any id was refused. A `last_drained` stamp that fails after
+/// the rename never hides the archive: the trace line stands and the
+/// stamp's failure is that id's refusal. Prints nothing on stdout.
 pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
 
@@ -230,10 +235,28 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
         // scans and refusing as unknown. Which folder it is in — and
         // whether it may be archived — is decided under the owner's
         // lock.
-        let inbox = find(id, "inbox")?;
-        let staged = find(id, "draining")?;
-        let archived = !find(id, "archive")?.is_empty();
-        let quarantined = find(id, "quarantine")?;
+        // The four listings; an io error in one is that id's
+        // refusal, never the end of the whole command.
+        let listings = |id: &str| -> Result<(
+            Vec<(String, String)>,
+            Vec<(String, String)>,
+            bool,
+            Vec<(String, String)>,
+        )> {
+            Ok((
+                find(id, "inbox")?,
+                find(id, "draining")?,
+                !find(id, "archive")?.is_empty(),
+                find(id, "quarantine")?,
+            ))
+        };
+        let (inbox, staged, archived, quarantined) = match listings(id) {
+            Ok(found) => found,
+            Err(e) => {
+                refusals.push(format!("id {id}: {e}"));
+                continue;
+            }
+        };
         let owner = if staged.len() > 1 {
             let both = staged
                 .iter()
@@ -257,8 +280,8 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
             refusals.push(format!("id {id} is not on this board"));
             continue;
         };
-        match settle(root, &owner, id)? {
-            Settled::Archived => {
+        match settle(root, &owner, id) {
+            Ok(Settled::Archived(stamp)) => {
                 dstate::log_line(
                     root,
                     "done",
@@ -272,9 +295,17 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
                         "done: id {id} archived from seat {owner}, acked by seat {by}"
                     )?;
                 }
+                if let Some(failure) = stamp {
+                    refusals.push(format!(
+                        "id {id} was archived, but stamping last_drained failed: {failure}"
+                    ));
+                }
             }
-            Settled::AlreadyDone => {}
-            Settled::Refused(reason) => refusals.push(reason),
+            Ok(Settled::AlreadyDone) => {}
+            Ok(Settled::Refused(reason)) => refusals.push(reason),
+            // A settle error (a busy seat, failed io) is that id's
+            // refusal too: the ids that follow still settle.
+            Err(e) => refusals.push(format!("id {id}: {e}")),
         }
     }
     if refusals.is_empty() {
@@ -286,8 +317,11 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
 
 /// How one id settled under its owner seat's lock.
 enum Settled {
-    /// The file was renamed to `archive/` by this command.
-    Archived,
+    /// The file was renamed to `archive/` by this command. The string,
+    /// when present, is the `last_drained` stamp failing after the
+    /// rename: the archive stands and is traced, and the failure is
+    /// reported as that id's refusal.
+    Archived(Option<String>),
     /// Nothing moved: already in `archive/`, or a racing done took it.
     AlreadyDone,
     /// Refused, with the reason.
@@ -298,7 +332,9 @@ enum Settled {
 /// folder there (a drain or hold may have moved the file between the
 /// board scan and this lock — an id that reached `draining/` by then
 /// is archived from there), archive what can be archived, and stamp
-/// `last_drained` on a rename. The caller holds no other seat's lock.
+/// `last_drained` on a rename — a stamp that fails after the rename
+/// never fails the settle: the archive stands and the failure rides
+/// `Archived`. The caller holds no other seat's lock.
 fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
     let dir = seat::seat_dir(root, owner);
     let _lock = seat::Flock::seat(&dir, owner)?;
@@ -333,12 +369,7 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
         // already-archived id (commit_invoked tolerates the same
         // race).
         return match std::fs::rename(dir.join("draining").join(&file), &to) {
-            Ok(()) => {
-                seat::update_meta(&dir, |meta| {
-                    meta.last_drained = Some(seat::now_ts());
-                })?;
-                Ok(Settled::Archived)
-            }
+            Ok(()) => Ok(Settled::Archived(stamp_last_drained(&dir))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settled::AlreadyDone),
             Err(e) => Err(e.into()),
         };
@@ -360,10 +391,7 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
         }
         let to = dir.join("archive").join(&file);
         std::fs::rename(dir.join("inbox").join(&file), &to)?;
-        seat::update_meta(&dir, |meta| {
-            meta.last_drained = Some(seat::now_ts());
-        })?;
-        return Ok(Settled::Archived);
+        return Ok(Settled::Archived(stamp_last_drained(&dir)));
     }
     if !here("quarantine")?.is_empty() {
         return Ok(Settled::Refused(format!(
@@ -372,6 +400,17 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
     }
     // Nowhere under the lock: a racing done took it. Success.
     Ok(Settled::AlreadyDone)
+}
+
+/// Stamp `last_drained`, reporting a failure instead of returning it:
+/// the rename already happened, so the archive stands and is traced —
+/// the failure rides `Settled::Archived` as that id's reported reason.
+fn stamp_last_drained(dir: &Path) -> Option<String> {
+    seat::update_meta(dir, |meta| {
+        meta.last_drained = Some(seat::now_ts());
+    })
+    .err()
+    .map(|e| e.to_string())
 }
 
 /// Stage and verify everything the seat owes one delivery pass. The
@@ -1497,6 +1536,97 @@ mod tests {
             "refusals keep command order: {text}"
         );
         assert_eq!(notice, "", "refusals ride the error alone");
+    }
+
+    /// A `last_drained` stamp that fails after a successful rename
+    /// never hides the archive: the id is archived WITH its trace
+    /// line, the stamp's failure is that id's refusal — reported
+    /// exactly once — and the ids after it still settle.
+    #[test]
+    fn a_stamp_failure_after_the_rename_still_traces_and_settles_the_rest() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "stamp fails", None).unwrap();
+        verbs::cmd_send(&root, Some("beta"), "alpha", "settles after", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let (r, _) = hold_str(&root, "alpha");
+        r.unwrap();
+        let beta_id = id_of(&msg::list_msg_dir(&beta_dir.join("draining")).unwrap()[0]);
+        let alpha_id = id_of(&msg::list_msg_dir(&alpha_dir.join("draining")).unwrap()[0]);
+
+        // The rename will succeed, the stamp cannot: corrupt meta.
+        std::fs::write(beta_dir.join("meta.json"), "{ nope").unwrap();
+
+        let (r, _) = done_run(&root, None, &[beta_id.clone(), alpha_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        // Both ids archived — the failure never ended the loop.
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("archive")).unwrap().len(), 1);
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("archive")).unwrap().len(),
+            1
+        );
+        // The archived id still has its trace line, failure or not.
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        assert!(
+            log.contains(&format!("done seat=beta id={beta_id} by=unknown")),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("done seat=alpha id={alpha_id} by=unknown")),
+            "{log}"
+        );
+        // The stamp's failure is that id's refusal, exactly once.
+        assert_eq!(text.matches(&beta_id).count(), 1, "{text}");
+        assert!(text.contains("corrupt seat meta"), "{text}");
+    }
+
+    /// An error settling one id — here the rename lands on a
+    /// directory, so it fails with an io error — is that id's refusal
+    /// alone: the file stays where it is, the reason is reported
+    /// exactly once, and the ids after it still settle. (A busy owner
+    /// seat reaches the same branch after its 30s wait.)
+    #[test]
+    fn an_error_settling_one_id_never_blocks_the_later_ones() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "cannot archive", None).unwrap();
+        verbs::cmd_send(&root, Some("beta"), "alpha", "archives fine", None).unwrap();
+        let beta_dir = seat::seat_dir(&root, "beta");
+        let alpha_dir = seat::seat_dir(&root, "alpha");
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let (r, _) = hold_str(&root, "alpha");
+        r.unwrap();
+        let staged = msg::list_msg_dir(&beta_dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        let beta_id = id_of(&staged[0]);
+        let alpha_id = id_of(&msg::list_msg_dir(&alpha_dir.join("draining")).unwrap()[0]);
+
+        // The rename's destination already exists as a directory: the
+        // rename fails with an io error, not NotFound.
+        let name = staged[0].file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::create_dir_all(beta_dir.join("archive").join(&name)).unwrap();
+
+        let (r, _) = done_run(&root, None, &[beta_id.clone(), alpha_id.clone()]);
+        let text = r.unwrap_err().to_string();
+        // The blocked id's file stayed in draining/, refused exactly
+        // once.
+        assert_eq!(msg::list_msg_dir(&beta_dir.join("draining")).unwrap().len(), 1);
+        assert_eq!(text.matches(&beta_id).count(), 1, "{text}");
+        assert!(text.contains("io error"), "{text}");
+        // The later id settled: archived with its trace line, and the
+        // blocked id never got one.
+        assert_eq!(
+            msg::list_msg_dir(&alpha_dir.join("archive")).unwrap().len(),
+            1
+        );
+        let log = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+        assert!(
+            log.contains(&format!("done seat=alpha id={alpha_id} by=unknown")),
+            "{log}"
+        );
+        assert!(!log.contains(&format!("id={beta_id}")), "{log}");
     }
 
     /// A redelivery is exactly the redelivery line plus the direct
