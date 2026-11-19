@@ -11,20 +11,29 @@ Notable changes to this crate. Versions follow semantic versioning.
   `draining/`, so a mistyped id or the right id under the wrong
   `--seat` exited 0 and the held mail came back 30 minutes later — a
   wrong ack succeeded and moved nothing. The new verb (one or more
-  ids, each 8 lowercase hex, else the whole command is refused before
-  anything is archived) searches every seat's `draining/`,
-  `archive/`, `inbox/` and `quarantine/` per id and decides in this
-  order: two or more `*-<id>.msg` matches in `draining/` (across
-  seats) is refused naming both as `<seat>/draining/<file>`; exactly
-  one is archived, leased or not; a match already in `archive/` is
-  success (nothing moves); a match in `inbox/` is refused
-  (`drain it first`); a match in `quarantine/` is refused (never
-  delivered); an id nowhere is refused (`not on this board`). Every
-  id is decided before the first rename — any refusal archives
-  nothing — then the renames run per seat in sorted order, each under
-  that seat's lock alone, stamping `last_drained` on each seat a file
-  was archived for; a NotFound on a rename is success (a racing done
-  took it). Errors are the new `SeatError::Done`, printed `done: ...`.
+  ids, each 8 lowercase hex) searches every seat's `inbox/`,
+  `draining/`, `archive/` and `quarantine/` per id — the four
+  listings taken in lifecycle order, so a file moving between
+  folders mid-scan is still found — and decides in this order: two
+  or more `*-<id>.msg` matches in `draining/` (across seats) is
+  refused naming both as `<seat>/draining/<file>`; exactly one is
+  archived, leased or not, under that seat's lock alone, where the
+  id's folder is re-resolved (an id that reached `draining/` by lock
+  time is archived from there; a NotFound on a rename is success);
+  a match already in `archive/` is success (nothing moves); a match
+  in `inbox/` is refused (`drain it first`) unless the seat carries
+  the `webhook.payload` marker and `webhook-delivered.json` records
+  the id as delivered in the webhook body — then it is retired by
+  one rename under the lock; a match in `quarantine/` is refused
+  (never delivered); an id nowhere is refused (`not on this board`).
+  Each id settles on its own: the archivable ids archive even when
+  others refuse, each refusal is reported exactly once in one
+  `SeatError::Done` that `main` prints (`done: ...`), and any
+  refusal exits nonzero. Every rename stamps `last_drained` on the
+  seat it archived for, and each archived id appends one trace line
+  to `dispatch.log` — `done seat=<owner> id=<id> by=<--seat or
+  unknown>` — with one stderr line naming both seats when the
+  caller's `--seat` differs from the owner.
 
 ### Changed
 

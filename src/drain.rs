@@ -223,9 +223,17 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
         }
         // The owner: the seat whose `draining/` (a hold to retire) or
         // `inbox/` (payload mode's delivered mail) holds the id right
-        // now, before any lock. Which folder it is in — and whether
-        // it may be archived — is decided under the owner's lock.
+        // now, before any lock. The listings run in lifecycle order
+        // (a file only moves forward: inbox, draining, archive), so
+        // one that moves between two listings is still caught by one
+        // of them instead of slipping past the draining and inbox
+        // scans and refusing as unknown. Which folder it is in — and
+        // whether it may be archived — is decided under the owner's
+        // lock.
+        let inbox = find(id, "inbox")?;
         let staged = find(id, "draining")?;
+        let archived = !find(id, "archive")?.is_empty();
+        let quarantined = find(id, "quarantine")?;
         let owner = if staged.len() > 1 {
             let both = staged
                 .iter()
@@ -236,11 +244,11 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
             continue;
         } else if let Some((seat_name, _)) = staged.into_iter().next() {
             seat_name
-        } else if !find(id, "archive")?.is_empty() {
+        } else if archived {
             continue; // already done: success, nothing moves
-        } else if let Some((seat_name, _)) = find(id, "inbox")?.into_iter().next() {
+        } else if let Some((seat_name, _)) = inbox.into_iter().next() {
             seat_name
-        } else if let Some((seat_name, _)) = find(id, "quarantine")?.into_iter().next() {
+        } else if let Some((seat_name, _)) = quarantined.into_iter().next() {
             refusals.push(format!(
                 "id {id} is in {seat_name}/quarantine; it was never delivered"
             ));
