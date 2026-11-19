@@ -202,17 +202,12 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
 
     let seats = crate::verbs::sorted_seat_names(root)?;
     // Every seat's `*-<id>.msg` in one directory, as (seat, file)
-    // pairs — a missing directory is an empty list.
+    // pairs.
     let find = |id: &str, sub: &str| -> Result<Vec<(String, String)>> {
-        let suffix = format!("-{id}.msg");
         let mut found = Vec::new();
         for seat_name in &seats {
-            for p in msg::list_msg_dir(&seat::seat_dir(root, seat_name).join(sub))? {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(&suffix) {
-                        found.push((seat_name.clone(), name.to_string()));
-                    }
-                }
+            for name in matching(&seat::seat_dir(root, seat_name), id, sub)? {
+                found.push((seat_name.clone(), name));
             }
         }
         Ok(found)
@@ -237,12 +232,7 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
         // lock.
         // The four listings; an io error in one is that id's
         // refusal, never the end of the whole command.
-        let listings = |id: &str| -> Result<(
-            Vec<(String, String)>,
-            Vec<(String, String)>,
-            bool,
-            Vec<(String, String)>,
-        )> {
+        let listings = |id: &str| -> Result<_> {
             Ok((
                 find(id, "inbox")?,
                 find(id, "draining")?,
@@ -288,8 +278,7 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
                     &owner,
                     &format!("id={id} by={}", caller.unwrap_or("unknown")),
                 );
-                if caller.is_some_and(|c| c != owner) {
-                    let by = caller.unwrap();
+                if let Some(by) = caller.filter(|c| *c != owner) {
                     writeln!(
                         err,
                         "done: id {id} archived from seat {owner}, acked by seat {by}"
@@ -315,6 +304,21 @@ pub fn done(root: &Path, caller: Option<&str>, ids: &[String], err: &mut dyn Wri
     }
 }
 
+/// The `*-<id>.msg` file names in one seat's `sub` folder — a
+/// missing directory is an empty list.
+fn matching(dir: &Path, id: &str, sub: &str) -> Result<Vec<String>> {
+    let suffix = format!("-{id}.msg");
+    let mut found = Vec::new();
+    for p in msg::list_msg_dir(&dir.join(sub))? {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(&suffix) {
+                found.push(name.to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// How one id settled under its owner seat's lock.
 enum Settled {
     /// The file was renamed to `archive/` by this command. The string,
@@ -338,20 +342,7 @@ enum Settled {
 fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
     let dir = seat::seat_dir(root, owner);
     let _lock = seat::Flock::seat(&dir, owner)?;
-    // `*-<id>.msg` in one folder of this seat — the lock-time truth.
-    let here = |sub: &str| -> Result<Vec<String>> {
-        let suffix = format!("-{id}.msg");
-        let mut found = Vec::new();
-        for p in msg::list_msg_dir(&dir.join(sub))? {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(&suffix) {
-                    found.push(name.to_string());
-                }
-            }
-        }
-        Ok(found)
-    };
-    let staged = here("draining")?;
+    let staged = matching(&dir, id, "draining")?;
     if staged.len() > 1 {
         let both = staged
             .iter()
@@ -374,10 +365,10 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
             Err(e) => Err(e.into()),
         };
     }
-    if !here("archive")?.is_empty() {
+    if !matching(&dir, id, "archive")?.is_empty() {
         return Ok(Settled::AlreadyDone); // already done: success, nothing moves
     }
-    if let Some(file) = here("inbox")?.into_iter().next() {
+    if let Some(file) = matching(&dir, id, "inbox")?.into_iter().next() {
         // Payload retirement, and only that: a seat with the
         // `webhook.payload` marker may retire an id its webhook
         // recorded as delivered in the body (`webhook-delivered.json`
@@ -393,7 +384,7 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
         std::fs::rename(dir.join("inbox").join(&file), &to)?;
         return Ok(Settled::Archived(stamp_last_drained(&dir)));
     }
-    if !here("quarantine")?.is_empty() {
+    if !matching(&dir, id, "quarantine")?.is_empty() {
         return Ok(Settled::Refused(format!(
             "id {id} is in {owner}/quarantine; it was never delivered"
         )));
