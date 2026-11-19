@@ -101,17 +101,28 @@ reader that only holds still reads.
 `seat done <ID>...` (and `drain --seat X --done <ID>...`, the same
 command — the seat is still checked) archives each id's mail found
 anywhere on the board, so an ack under the wrong `--seat` or a
-mistyped id can never succeed silently. Each id is 8 lowercase hex,
-else the whole command is refused before anything is archived. Per
-id, every seat is searched for `*-<id>.msg` in `draining/`,
-`archive/`, `inbox/` and `quarantine/`: two or more matches in
-`draining/` is refused naming both; exactly one is archived, leased
-or not, under that seat's lock, and `last_drained` is stamped on each
-seat a file was archived for; a match already in `archive/` is
-success (nothing moves); a match in `inbox/` is refused (`drain it
-first`); a match in `quarantine/` is refused (never delivered); an id
-the board cannot account for anywhere is refused (`not on this
-board`). Done prints nothing.
+mistyped id can never succeed silently. Each id settles on its own: a
+refused id never blocks the others, every id that can be archived is
+archived, and the command exits nonzero when any id was refused — each
+refusal reported exactly once, in one error line. Each id is 8
+lowercase hex, else that id is refused. Per id, every seat is searched
+for `*-<id>.msg` in `draining/`, `archive/`, `inbox/` and
+`quarantine/`: two or more matches in `draining/` is refused naming
+both; exactly one is the pick, leased or not; a match already in
+`archive/` is success (nothing moves); a match in `inbox/` is archived
+only for a `webhook.payload` seat whose `<seat>/webhook-delivered.json`
+records the id (payload mode's delivered mail) — any other inbox match
+is refused (`drain it first`); a match in `quarantine/` is refused
+(never delivered); an id the board cannot account for anywhere is
+refused (`not on this board`). The pick and the rename happen under
+the owning seat's lock, where the id's folder is re-resolved — an id a
+drain or hold moved to `draining/` by then is archived from there, so
+a settle never exits 0 with the mail still leased — and `last_drained`
+is stamped on each seat a file was archived for. Each archived id
+appends one line to `<root>/dispatch.log`: `done seat=<seat> id=<id>
+by=<--seat if given, else "unknown">`; when the caller's `--seat` is a
+different seat, one stderr line names both. Done prints nothing on
+stdout.
 
 Held mail is leased: a plain `drain`, a second `--hold` and the hapi
 pass all leave it alone until its deadline passes, and no ring, no
@@ -128,14 +139,20 @@ the redelivery line first:
 `drain` and `drain --hold` print that line (with the real id) before
 any message that was already in `draining/` when they ran — an
 expired hold, a crashed drain, or mail the dispatcher staged and
-pushed — so mail shown twice never looks like new mail. A duplicate
-after a clock jump is possible and a loss is not. The lease clock is
-the file's mtime; the alarm's is the header `ts`.
+pushed — so mail a drain or hold showed twice never looks like new
+mail. The exception is mail a payload-mode seat was already shown in
+the webhook body: its file was never in `draining/` before, so a later
+hold stages and prints it fresh, without the redelivery line — retire
+such mail with `seat done <id>` rather than holding it twice. A
+duplicate after a clock jump is possible and a loss is not. The lease
+clock is the file's mtime; the alarm's is the header `ts`.
 
 `status` counts `inbox/` only, so held mail in `draining/` is not
-counted. A payload-mode seat that holds marks hq mail done by id
-after acting on the payload — the payload carries each message's id,
-and `seat done <that id>` retires it.
+counted. A payload-mode seat marks hq mail done by id after acting on
+the payload — the payload carries each message's id, and
+`seat done <that id>` retires it: the file is still in `inbox/`, and
+the id's record in `<seat>/webhook-delivered.json` is what the ack
+archives it by (an id with no record is unread and stays refused).
 
 ## Deliver to a hub session
 
@@ -418,7 +435,9 @@ empty.
 <root>/alarm-seat             the seat alarms are mailed to (one line;
                               absent or empty: the log line only)
 <root>/dispatch.lock          one dispatcher per board (non-blocking)
-<root>/dispatch.log           one line per delivery, failure, alarm, rung
+<root>/dispatch.log           one line per delivery, failure, alarm, rung,
+                              done (the ack trace: done seat=<seat>
+                              id=<id> by=<--seat or unknown>)
 <root>/dispatch-alarms.json   the latched alarm causes
 <root>/hapi-sessions.json     seat → hapi session bindings (seat-role)
 <root>/dispatch-heartbeat     one timestamp per dispatcher pass (watchdog fact)

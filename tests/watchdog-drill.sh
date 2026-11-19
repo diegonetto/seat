@@ -254,8 +254,9 @@ new_board ack-refused
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 "$S" --root "$R" send --from A B 'still unread' >/dev/null 2>&1
 out="$("$S" --root "$R" done 0000000f 2>&1)"; rc=$?
-[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -qF 'not on this board'
-                                                 note $? "an unknown id exits 1 saying not on this board"
+[ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -qF 'not on this board' \
+    && [ -n "$(ls "$R/seats/B/inbox")" ]
+                                                 note $? "an unknown id exits 1 saying not on this board; nothing moves"
 f="$(ls "$R/seats/B/inbox" | head -1)"
 id="${f#*-}"; id="${id%.msg}"
 out="$("$S" --root "$R" done "$id" 2>&1)"; rc=$?

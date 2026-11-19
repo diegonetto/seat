@@ -73,9 +73,9 @@ enum Command {
         done: Vec<String>,
     },
     /// Archive held messages by id, found anywhere on the board: each
-    /// id 8 lowercase hex, and an id the board cannot account for
-    /// (unread, quarantined, ambiguous, unknown) refuses the whole
-    /// command and archives nothing
+    /// id 8 lowercase hex, and each id settles on its own — a refused
+    /// id (unread, quarantined, ambiguous, unknown) never blocks the
+    /// others, and any refusal exits nonzero
     Done {
         /// Message ids to archive (each 8 lowercase hex characters)
         #[arg(value_name = "ID", num_args = 1.., required = true)]
@@ -167,16 +167,20 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
             } else if !done.is_empty() {
                 // `--done` is `seat done`: the `--seat` is still
                 // checked (an unknown or corrupt seat keeps its named
-                // error).
+                // error), and its name rides the ack's trace line.
                 board::ensure_board(root)?;
                 seat::read_meta(&seat::seat_dir(root, &seat))?;
-                drain::done(root, &done)
+                let mut err = std::io::stderr();
+                drain::done(root, Some(&seat), &done, &mut err)
             } else {
                 let mut out = std::io::stdout().lock();
                 drain::drain(root, &seat, &mut out)
             }
         }
-        Command::Done { ids } => drain::done(root, &ids),
+        Command::Done { ids } => {
+            let mut err = std::io::stderr();
+            drain::done(root, None, &ids, &mut err)
+        }
         Command::Dispatch { once } => dispatch::cmd_dispatch(root, once),
         Command::Up { names } => session::cmd_up(root, &names),
         Command::Down { names } => session::cmd_down(root, &names),

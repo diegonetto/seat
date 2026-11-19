@@ -442,9 +442,13 @@ fn posted_text_is_exactly_the_drain_lines() {
         "[redelivery] check whether you already did this; if so, only run: seat done {}\n",
         header.id
     ));
+    // The POSTed text must exist AND match: asserting Some(...) so a
+    // missing POST can never pass as None == None.
+    let posted = hub.ctl.lock().unwrap().texts.get(&key).cloned();
+    let posted = posted.as_deref().expect("the POST was recorded");
     assert_eq!(
         rest,
-        hub.ctl.lock().unwrap().texts.get(&key).map(String::as_str),
+        Some(posted),
         "after the redelivery line, the POST must be byte for byte what drain prints"
     );
 }
