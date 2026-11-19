@@ -721,6 +721,31 @@ class RoleWakeTest(unittest.TestCase):
         role.kind = 'grok'
         self.assertFalse(role.is_wrapped([str(self.runtime / 'hapi-glm')]))
 
+    def test_hapi_chrome_wrapper_wakes_linked_never_the_down_branch(self):
+        # Flight (claude) launches through the hapi-chrome wrapper (Claude for Chrome, then `hapi claude`); a wake
+        # must treat it as wrapped: find and record the live session over the up pane, never cut over or restart.
+        self.fixture('adjudicator')
+        harness = json.loads(self.harness.read_text())
+        harness['argv'] = [str(self.runtime / 'hapi-chrome'), 'claude', '--model', 'claude-fable-5-1']
+        self.harness.write_text(json.dumps(harness))
+        self.assertEqual(self.no_mutation('awake'), {'status': 'awake', 'url': EXPECTED_URL})
+        saved = json.loads((self.home / '.local/share/seat/hapi-sessions.json').read_text())
+        self.assertEqual(saved['seats'][self.seat]['url'], EXPECTED_URL)
+
+    def test_hapi_chrome_wrapper_counts_as_wrapped_only_for_claude(self):
+        # Same shape as the hapi-glm rule: exact basename, one kind, and the wrapped `claude` word must follow it.
+        self.fixture('builder', wrapped=False)
+        role = ROLE.Wake.__new__(ROLE.Wake)
+        role.hapi = str(self.home / '.local/bin/hapi')
+        role.kind = 'claude'
+        self.assertTrue(role.is_wrapped([str(self.runtime / 'hapi-chrome'), 'claude', '--model', 'claude-opus-5-5']))
+        self.assertTrue(role.is_wrapped([role.hapi, 'claude', '--x']))
+        self.assertFalse(role.is_wrapped([str(self.runtime / 'hapi-chrome')]))
+        role.kind = 'codex'
+        self.assertFalse(role.is_wrapped([str(self.runtime / 'hapi-chrome'), 'claude', '--model', 'gpt-6.1-sol']))
+        role.kind = 'glm'
+        self.assertFalse(role.is_wrapped([str(self.runtime / 'hapi-chrome'), 'claude']))
+
     def test_live_plain_glm_answers_up_and_is_left_as_is(self):
         # glm runs in its terminal with no phone session: the seat is up, so the answer says up, and nothing changes.
         self.fixture('builder', wrapped=False)
