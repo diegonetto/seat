@@ -217,7 +217,7 @@ pub fn write_msg(
     }
     let content = format!("{}\n\n{}", serde_json::to_string(&header)?, body);
     // Atomic publish: write a dot-prefixed `.tmp` scratch name in the
-    // SAME directory (not ending in `.msg`, so a concurrent drain —
+    // SAME directory (not ending in `.msg`, so a concurrent read —
     // which only lists `*.msg` — never sees a half-written message),
     // fsync, then rename into place.
     let tmp = dir.join(format!(".{}.tmp", filename_for(&header.ts, &header.id)));
@@ -349,7 +349,7 @@ mod tests {
         let (path, _) = write_msg(&root, "beta", "alpha", &token, "atomic body", None).unwrap();
         assert!(verify_msg(&path, &token).unwrap());
         // The scratch name is gone: only the final .msg (plus the token)
-        // remains, and no non-.msg name lingers for a drain to trip on.
+        // remains, and no non-.msg name lingers for a read to trip on.
         let leftovers: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())

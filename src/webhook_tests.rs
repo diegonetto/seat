@@ -2,7 +2,7 @@
 //! committed fixture (fixed ts, nonce and key), the payload doorbell
 //! ported from `test_grok_doorbell.py` (verification, carry-once,
 //! failed-post-no-retry, suppression), the re-ring that stops once
-//! the bot drained, and the worker that steps aside when its seat
+//! the bot read, and the worker that steps aside when its seat
 //! becomes hapi-bound. Nothing here touches the live board or panel:
 //! every root is a throwaway and every POST targets the local
 //! receiver.
@@ -345,7 +345,7 @@ fn payload_doorbell_ports_the_python_cases() {
         "a delivered id never rides twice"
     );
     assert_eq!(hook.hits().len(), 1);
-    // The bot's own drain took the carried mail out of inbox/.
+    // The bot's own read took the carried mail out of inbox/.
     std::fs::remove_file(&carried).unwrap();
 
     // verification: a tampered MAC never leaks; other mail gets the signal.
@@ -376,7 +376,7 @@ fn payload_doorbell_ports_the_python_cases() {
     );
 
     // suppression: no second routine for the attempted id, and other
-    // mail must not make the bot drain an attempted message twice.
+    // mail must not make the bot read an attempted message twice.
     hook.ctl.lock().unwrap().status = 0;
     hook.ctl.lock().unwrap().hits.clear();
     assert_eq!(
@@ -455,7 +455,7 @@ fn backoff_characterization_production_ring_waits() {
 
 /// An already delivered payload suppresses POSTs while its burst
 /// keeps backing off. Pin every state byte, the initial cap, doubling,
-/// the repeated cap, and the reset when the bot drains the burst.
+/// the repeated cap, and the reset when the bot reads the burst.
 #[test]
 fn backoff_characterization_ring_state() {
     for (first, max, expected) in [(3, 10, [3000, 6000, 10000, 10000]), (20, 7, [7000; 4])] {
@@ -524,7 +524,7 @@ fn backoff_characterization_ring_state() {
 }
 
 /// Re-ring backs off while the rung mail waits, and stops once the
-/// bot's own drain took every rung message (the burst closes).
+/// bot's own read took every rung message (the burst closes).
 #[test]
 fn re_ring_stops_once_the_bot_drained() {
     let hook = FakeWebhook::start();
@@ -541,7 +541,7 @@ fn re_ring_stops_once_the_bot_drained() {
         "nothing new and the next ring is not due yet"
     );
     assert_eq!(hook.hits().len(), 1);
-    // The bot drained: the file left inbox/ and draining/.
+    // The bot read: the file left inbox/ and draining/.
     std::fs::remove_file(
         kotek_dir(&root)
             .join("inbox")
@@ -556,7 +556,7 @@ fn re_ring_stops_once_the_bot_drained() {
         webhook::ring_pass(&root, "kotek-grokbot", &cfg, hour_waits(), &no_sleep).unwrap(),
         RingOutcome::Idle
     );
-    assert_eq!(hook.hits().len(), 1, "no ring after the drain");
+    assert_eq!(hook.hits().len(), 1, "no ring after the read");
     assert!(load_state(&kotek_dir(&root)).ring.is_none(), "burst closed");
 }
 
@@ -741,7 +741,7 @@ fn new_mail_wakes_the_re_ring_wait() {
     );
 }
 
-/// The re-ring wait's empty-inbox arm: when the bot's drain takes every
+/// The re-ring wait's empty-inbox arm: when the bot's read takes every
 /// file while the worker sleeps, nothing is present and the wait ends
 /// at once — the next pass prunes the burst closed and the worker
 /// returns Idle instead of sleeping the backoff out. The first pass's
@@ -1748,7 +1748,7 @@ fn a_successful_signal_ring_logs_one_rung_line() {
 /// `alarm::undelivered` does not fire even for mail whose header `ts`
 /// is a month old. Once the file's mtime moves into the past the same
 /// file is present again, a `ring_pass` rings it though no new mail
-/// arrived, and the next `--hold` prints it again. On main a hold did
+/// arrived, and the next `--lease` prints it again. On main a lease did
 /// not exist and the month-old mail paged and rang at once.
 #[test]
 fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
@@ -1802,7 +1802,7 @@ fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
         ],
     );
 
-    // And the next --hold prints it again — under the redelivery
+    // And the next --lease prints it again — under the redelivery
     // line first, since it was shown before.
     let mut printed2 = Vec::new();
     crate::drain::hold(&root, "kotek-grokbot", &mut printed2).unwrap();
@@ -1814,7 +1814,7 @@ fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
         ),
         "the reprint starts with the redelivery line: {reprint}"
     );
-    assert!(crate::drain::leased(&staged), "re-leased by the new hold");
+    assert!(crate::drain::leased(&staged), "re-leased by the new lease");
 }
 
 /// Payload mode keeps its `delivered` line and adds no `rung` line: a

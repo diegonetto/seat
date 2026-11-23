@@ -355,16 +355,16 @@ fn a_changed_binding_reposts_in_flight_items() {
     assert!(posts("s1") && posts("s2"), "{journal:?}");
 }
 
-/// A manual drain that took the file first counts as done: the next
+/// A manual read that took the file first counts as done: the next
 /// pass prunes the key quietly — no new POST, no failure line.
 #[test]
 fn manual_drain_took_the_file_counts_as_done() {
     let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
-    send(&root, "opus", "taken by a manual drain");
+    send(&root, "opus", "taken by a manual read");
     mark(&hub, &only_key(&root, "opus"), "queued");
     dispatch::pass_seat(&root, "opus", &mut client).unwrap(); // POST, waiting
     let mut out = Vec::new();
-    drain::drain(&root, "opus", &mut out).unwrap(); // the manual drain
+    drain::drain(&root, "opus", &mut out).unwrap(); // the manual read
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
         Pass::Idle
@@ -414,17 +414,17 @@ fn one_seats_hung_hub_does_not_delay_another() {
     );
 }
 
-/// The POSTed text is exactly the lines `seat drain` prints for the
-/// item — compared against drain's own stdout, not a rebuilt copy of
-/// the helper. The pass staged the file before the manual drain, so
-/// the drain prints the redelivery line first and then exactly the
+/// The POSTed text is exactly the lines `seat read` prints for the
+/// item — compared against read's own stdout, not a rebuilt copy of
+/// the helper. The pass staged the file before the manual read, so
+/// the read prints the redelivery line first and then exactly the
 /// POSTed text. (2b deletes this test.)
 #[test]
 fn posted_text_is_exactly_the_drain_lines() {
     let (root, hub, mut client) = kit(&[("opus", "s1")], &["s1"]);
     verbs::cmd_send(&root, Some("opus"), "opus", "line one\nline two", None).unwrap();
     let key = only_key(&root, "opus");
-    mark(&hub, &key, "queued"); // stays staged, so drain prints it
+    mark(&hub, &key, "queued"); // stays staged, so read prints it
     assert_eq!(
         dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
         Pass::Waiting
@@ -449,7 +449,7 @@ fn posted_text_is_exactly_the_drain_lines() {
     assert_eq!(
         rest,
         Some(posted),
-        "after the redelivery line, the POST must be byte for byte what drain prints"
+        "after the redelivery line, the POST must be byte for byte what read prints"
     );
 }
 

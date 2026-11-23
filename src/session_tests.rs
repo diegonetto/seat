@@ -198,7 +198,7 @@ fn session_verbs_drive_the_fake_multiplexer() {
         ]
     );
 
-    // The pane set matches what gallery prints, and down drained
+    // The pane set matches what gallery prints, and down read
     // nothing: beta's mail is still in the inbox.
     let running_names: Vec<String> = rows
         .iter()
@@ -211,7 +211,7 @@ fn session_verbs_drive_the_fake_multiplexer() {
             .unwrap()
             .len(),
         1,
-        "down kept beta's mail for a later drain"
+        "down kept beta's mail for a later read"
     );
 
     // SEAT_TMUX is set: gallery must not have attached.

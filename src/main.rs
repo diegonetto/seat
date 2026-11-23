@@ -56,23 +56,23 @@ enum Command {
         to: String,
         body: String,
     },
-    /// Print a seat's unread inbox. Plain drain prints and archives;
-    /// `--hold` prints but leases the mail in `draining/` for 30
+    /// Print a seat's unread inbox. Plain read prints and archives;
+    /// `--lease` prints and leases the mail in `draining/` for 30
     /// minutes instead of archiving, and `--done <ID>...` is
     /// `seat done`: the ids are found board-wide.
-    Drain {
+    Read {
         #[arg(long)]
         seat: String,
-        /// Print the mail but hold it (leased in `draining/` for 30
+        /// Print the mail but lease it (in `draining/` for 30
         /// minutes) instead of archiving it
         #[arg(long)]
-        hold: bool,
+        lease: bool,
         /// `seat done <ID>...`: archive these message ids, found
         /// anywhere on the board (each id 8 lowercase hex characters)
-        #[arg(long, value_name = "ID", num_args = 1.., conflicts_with = "hold")]
+        #[arg(long, value_name = "ID", num_args = 1.., conflicts_with = "lease")]
         done: Vec<String>,
     },
-    /// Archive held messages by id, found anywhere on the board: each
+    /// Archive leased messages by id, found anywhere on the board: each
     /// id 8 lowercase hex, and each id settles on its own — a refused
     /// id (unread, quarantined, ambiguous, unknown) never blocks the
     /// others, and any refusal exits nonzero
@@ -94,7 +94,7 @@ enum Command {
         /// Registered seats to bring up (default: every registered seat)
         names: Vec<String>,
     },
-    /// Stop seats by killing their panes; prints nothing, drains nothing
+    /// Stop seats by killing their panes; prints nothing, reads nothing
     Down {
         /// Registered seats to stop (default: every registered seat)
         names: Vec<String>,
@@ -160,8 +160,8 @@ fn dispatch(root: &Path, cmd: Command, session: Option<&str>) -> error::Result<(
         Command::Send { from, to, body } => {
             verbs::cmd_send(root, from.as_deref(), &to, &body, session)
         }
-        Command::Drain { seat, hold, done } => {
-            if hold {
+        Command::Read { seat, lease, done } => {
+            if lease {
                 let mut out = std::io::stdout().lock();
                 drain::hold(root, &seat, &mut out)
             } else if !done.is_empty() {
@@ -219,43 +219,56 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The drain flags parse exactly as the verb is spelled: `--hold`
-    /// alone, `--done` with one or many ids; `--hold` and `--done`
+    /// The read flags parse exactly as the verb is spelled: `--lease`
+    /// alone, `--done` with one or many ids; `--lease` and `--done`
     /// together are refused by the parser, and `--done` with no id is
     /// a parse error, not an empty done. `seat done` parses with one
-    /// or many ids, and none is a parse error too.
+    /// or many ids, and none is a parse error too. `drain` and
+    /// `--hold` are not aliases: clap's ordinary error rejects them.
     #[test]
-    fn drain_hold_and_done_flags_parse_as_spelled() {
-        let ok = |args: &[&str]| {
-            Cli::try_parse_from(std::iter::once("seat").chain(args.iter().copied())).is_ok()
+    fn read_lease_and_done_flags_parse_as_spelled() {
+        let parsed = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("seat").chain(args.iter().copied()))
         };
-        assert!(ok(&["drain", "--seat", "a", "--hold"]));
-        assert!(ok(&["drain", "--seat", "a", "--done", "ab12cd34"]));
+        let ok = |args: &[&str]| parsed(args).is_ok();
+        assert!(ok(&["read", "--seat", "a", "--lease"]));
+        assert!(ok(&["read", "--seat", "a", "--done", "ab12cd34"]));
         assert!(ok(&[
-            "drain", "--seat", "a", "--done", "ab12cd34", "ef567890"
+            "read", "--seat", "a", "--done", "ab12cd34", "ef567890"
         ]));
         assert!(
-            !ok(&["drain", "--seat", "a", "--hold", "--done", "ab12cd34"]),
-            "--hold and --done together must be refused by the parser"
+            !ok(&["read", "--seat", "a", "--lease", "--done", "ab12cd34"]),
+            "--lease and --done together must be refused by the parser"
         );
         assert!(
-            !ok(&["drain", "--seat", "a", "--done"]),
+            !ok(&["read", "--seat", "a", "--done"]),
             "--done with no id is a parse error"
         );
         assert!(ok(&["done", "ab12cd34"]));
         assert!(ok(&["done", "ab12cd34", "ef567890"]));
+        assert!(!ok(&["done"]), "done with no id is a parse error");
+
+        let drained = match parsed(&["drain", "--seat", "a"]) {
+            Ok(_) => panic!("seat drain parsed"),
+            Err(e) => e.to_string(),
+        };
         assert!(
-            !ok(&["done"]),
-            "done with no id is a parse error"
+            drained.contains("unrecognized subcommand 'drain'"),
+            "{drained}"
         );
+        let held = match parsed(&["read", "--seat", "a", "--hold"]) {
+            Ok(_) => panic!("seat read --hold parsed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(held.contains("unexpected argument '--hold'"), "{held}");
     }
 
-    /// `drain --seat X --done` is `seat done`: the seat is checked
+    /// `read --seat X --done` is `seat done`: the seat is checked
     /// (an unknown seat keeps its named error), then the id is found
     /// board-wide — an ack under the wrong seat archives the right
     /// file.
     #[test]
-    fn drain_done_acks_board_wide_after_checking_the_seat() {
+    fn read_done_acks_board_wide_after_checking_the_seat() {
         use crate::msg;
         use crate::seat;
         use crate::testutil::temp_root;
@@ -280,9 +293,9 @@ mod tests {
 
         dispatch(
             &root,
-            Command::Drain {
+            Command::Read {
                 seat: "alpha".into(),
-                hold: false,
+                lease: false,
                 done: vec![id],
             },
             None,
@@ -303,9 +316,9 @@ mod tests {
         // An unknown --seat keeps its named error.
         let err = dispatch(
             &root,
-            Command::Drain {
+            Command::Read {
                 seat: "ghost".into(),
-                hold: false,
+                lease: false,
                 done: vec!["ab12cd34".into()],
             },
             None,

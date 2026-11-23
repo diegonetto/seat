@@ -2,7 +2,7 @@
 # Smoke suite for the seat operator binary.
 #
 # Execs "$SEAT" as a program against throwaway --root directories.
-# Never the operator's live board. Covers fresh drain, bad mark,
+# Never the operator's live board. Covers fresh read, bad mark,
 # session verbs, status, foreign root.
 #
 #   SEAT=$PWD/target/debug/seat tests/smoke.sh
@@ -52,7 +52,7 @@ note() {
 S="$SEAT"
 R="$ROOT"
 
-## quickstart step 1: fresh drain ----------------------------------------
+## quickstart step 1: fresh read ----------------------------------------
 "$S" --root "$R" init >/dev/null 2>&1;               note $? "init"
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
                                                       note $? "register A"
@@ -61,36 +61,36 @@ R="$ROOT"
 "$S" --root "$R" send --from A B "hello seat" >/dev/null 2>&1
                                                       note $? "send A -> B"
 
-out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
+out="$("$S" --root "$R" read --seat B 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "hello seat"
-                                                      note $? "drain B returns the body"
+                                                      note $? "read B returns the body"
 printf '%s\n' "$out" | grep -qF "hello seat" && [ "$(printf '%s\n' "$out" | grep -cF 'hello seat')" -eq 1 ]
                                                       note $? "the body appears exactly once"
 
-# The reply drains A the same way (A was never `up`).
+# The reply reads A the same way (A was never `up`).
 "$S" --root "$R" send --from B A "reply seat" >/dev/null 2>&1
                                                       note $? "send B -> A"
-out="$("$S" --root "$R" drain --seat A 2>&1)"; rc=$?
+out="$("$S" --root "$R" read --seat A 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "reply seat"
-                                                      note $? "drain A returns the reply"
+                                                      note $? "read A returns the reply"
 
 ## quickstart step 4: bad mark -------------------------------------------
 "$S" --root "$R" send --from A B "tamper target" >/dev/null 2>&1
                                                      note $? "send a message to tamper with"
 f="$(ls "$R/seats/B/inbox" | sort | tail -1)"
 sed -i 's/tamper target/tampered body/' "$R/seats/B/inbox/$f"
-out="$("$S" --root "$R" drain --seat B 2>"$R/drain-bad.err")"; rc=$?
+out="$("$S" --root "$R" read --seat B 2>"$R/drain-bad.err")"; rc=$?
 [ "$rc" -ne 0 ];                                     note $? "bad mark exits nonzero"
 printf '%s\n' "$out" | grep -qF "tampered body" && rc=1 || rc=0
                                                      note $rc "bad mark prints no body"
-grep -qF "from 'A'" "$R/drain-bad.err";              note $? "drain names the claimed from"
-out="$("$S" --root "$R" drain --seat B 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && [ -z "$out" ];                    note $? "board not wedged: next drain is clean"
+grep -qF "from 'A'" "$R/drain-bad.err";              note $? "read names the claimed from"
+out="$("$S" --root "$R" read --seat B 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ];                    note $? "board not wedged: next read is clean"
 "$S" --root "$R" send --from A B "byte flip" >/dev/null 2>&1
                                                      note $? "send a message to flip a body byte"
 f="$(ls "$R/seats/B/inbox" | sort | tail -1)"
 python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); b=bytearray(p.read_bytes()); i=b.rindex(b"byte flip"); b[i]=0xff; p.write_bytes(b)' "$R/seats/B/inbox/$f"
-out="$("$S" --root "$R" drain --seat B 2>"$R/drain-utf8.err")"; rc=$?
+out="$("$S" --root "$R" read --seat B 2>"$R/drain-utf8.err")"; rc=$?
 [ "$rc" -ne 0 ];                                     note $? "non-utf8 body exits nonzero"
 printf '%s\n' "$out" | grep -qF "byte" && rc=1 || rc=0
                                                      note $rc "non-utf8 body is not printed"
@@ -101,7 +101,7 @@ grep -qF "from 'A'" "$R/drain-utf8.err";             note $? "non-utf8 body name
 
 ## quickstart step 5: session ---------------------------------------------
 # A fresh root, the fake multiplexer behind SEAT_TMUX, and no mail
-# anywhere: this step never sends and never drains (mail-free).
+# anywhere: this step never sends and never reads (mail-free).
 SMOKE_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAKE="$SMOKE_DIR/fake-tmux.sh"
 if [ ! -x "$FAKE" ]; then
@@ -193,7 +193,7 @@ r1="$(tm5 status | awk '$2 == "pane" { print $1 }')"
 r2="$(tm5 gallery)"
 [ "$r1" = "$r2" ];                                 note $? "the pane set matches gallery"
 [ "$(ls "$R5/seats/parked/inbox" | wc -l)" -eq 1 ]
-                                                   note $? "down drained nothing: parked keeps its mail"
+                                                   note $? "down read nothing: parked keeps its mail"
 
 # Presence: a pane is pane; every other seat is unattended, mail or
 # not (no bindings on this board, so nothing is awake).
@@ -288,7 +288,7 @@ out="$(tm6 up bad run 2>&1)"; rc=$?
 
 ## seat-launch quickstart step 4: mail survives a new command ---------
 # box starts mail-only, receives `kept`, then records a launch. The
-# token is byte-for-byte the same and the inbox still drains.
+# token is byte-for-byte the same and the inbox still reads.
 tm6 register --seat box --harness h >/dev/null 2>&1
                                                     note $? "launch step 4: register box (mail-only)"
 tm6 send --from run box kept >/dev/null 2>&1;       note $? "launch step 4: send kept from run to box"
@@ -296,13 +296,13 @@ cp "$R6/seats/box/token" "$R6/box.token"
 tm6 register --seat box --harness h --cwd "$R6" -- /bin/sleep 5 >/dev/null 2>&1
                                                     note $? "launch step 4: box records a launch"
 cmp -s "$R6/box.token" "$R6/seats/box/token";       note $? "launch step 4: token byte-for-byte the same"
-out="$(tm6 drain --seat box 2>&1)"; rc=$?
+out="$(tm6 read --seat box 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF "kept"
-                                                    note $? "launch step 4: drain still prints kept"
+                                                    note $? "launch step 4: read still prints kept"
 
 ## seat-launch quickstart step 5: the running command stays -----------
 # A running seat keeps the command it was started with until down and
-# up. down prints nothing and drains nothing.
+# up. down prints nothing and reads nothing.
 box_cmd6() { record6 | awk -F'\t' '$3 == "box" { print $6 }'; }
 tm6 up box >/dev/null 2>&1;                         note $? "launch step 5: up box starts the stored command"
 [ "$(box_cmd6)" = '["/bin/sleep","5"]' ];           note $? "launch step 5: the record shows /bin/sleep 5"
@@ -314,8 +314,8 @@ out="$(tm6 down box 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && [ -z "$out" ];                   note $? "launch step 5: down prints nothing"
 tm6 up box >/dev/null 2>&1;                         note $? "launch step 5: up box after down"
 [ "$(box_cmd6)" = '["/bin/sleep","9"]' ];           note $? "launch step 5: the record shows the new command"
-out="$(tm6 drain --seat box 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && [ -z "$out" ];                   note $? "launch step 5: drain of box is empty"
+out="$(tm6 read --seat box 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ];                   note $? "launch step 5: read of box is empty"
 
 ## seat-launch quickstart step 6: fail mid-up ---------------------------
 R7="$(mktemp -d)"; EXTRA_ROOTS="$EXTRA_ROOTS $R7"
@@ -357,9 +357,9 @@ out="$("$S" --root "$R2" init 2>&1)"; rc=$?
 out="$("$S" --root "$R2" register --seat X --harness sb 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$R2"
                                                      note $? "register refuses the foreign root"
-out="$("$S" --root "$R2" drain --seat X 2>&1)"; rc=$?
+out="$("$S" --root "$R2" read --seat X 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$R2"
-                                                     note $? "drain refuses the foreign root"
+                                                     note $? "read refuses the foreign root"
 "$S" --root "$R2" reset >/dev/null 2>&1;             note $? "reset works on the foreign root"
 [ ! -e "$R2/seats" ];                                note $? "reset removed the foreign seats/"
 "$S" --root "$R2" init >/dev/null 2>&1;              note $? "reset then init succeeds"

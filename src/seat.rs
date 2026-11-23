@@ -499,7 +499,7 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         assert_eq!(
             err.to_string(),
-            "seat 'alpha' is busy: another drain holds its lock (gave up after 30s)",
+            "seat 'alpha' is busy: another read holds its lock (gave up after 30s)",
             "{err}"
         );
         assert!(matches!(err, SeatError::SeatBusy(_)));

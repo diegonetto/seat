@@ -129,7 +129,7 @@ sys.exit(0 if p["seat"]=="B" and p["kind"]=="overdue" and "route webhook" in p["
     "$R/watchdog-status.json"
                                                  note $? "inbox: the problem names seat, route and limit"
 
-# (3) the same in draining/, not leased: overdue. The hold's lease
+# (3) the same in draining/, not leased: overdue. The lease
 # deadline is a future mtime; an expired lease is a past one, so the
 # mtime goes back to now and the age rides the name's ts.
 new_board overdue-draining
@@ -137,14 +137,14 @@ new_board overdue-draining
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 printf 'https://127.0.0.1:9/hook\n' >"$R/seats/B/webhook.url"
 "$S" --root "$R" send --from A B 'drill mail' >/dev/null 2>&1
-"$S" --root "$R" drain --seat B --hold >/dev/null 2>&1
+"$S" --root "$R" read --seat B --lease >/dev/null 2>&1
 age_name "$R/seats/B/draining" '20 minutes ago'
 touch "$R/seats/B/draining/"*.msg
 out="$(dog)"; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys)" = "overdue:B" ]
                                                  note $? "draining: 20m unleased mail is overdue"
 
-# (4) leased: nothing (a hold's deadline is still in the future).
+# (4) leased: nothing (a lease's deadline is still in the future).
 # The mail is aged past the limit by name first, so only the lease
 # can be what keeps it unreported.
 new_board leased
@@ -152,12 +152,12 @@ new_board leased
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 printf 'https://127.0.0.1:9/hook\n' >"$R/seats/B/webhook.url"
 "$S" --root "$R" send --from A B 'drill mail' >/dev/null 2>&1
-"$S" --root "$R" drain --seat B --hold >/dev/null 2>&1
+"$S" --root "$R" read --seat B --lease >/dev/null 2>&1
 age_name "$R/seats/B/draining" '20 minutes ago'
 touch -d '+20 min' "$R/seats/B/draining/"*.msg
 out="$(dog)"; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys)" = "" ] && ok_is true
-                                                 note $? "leased: held mail reports nothing"
+                                                 note $? "leased: mail under a lease reports nothing"
 
 # (5) a quarantine file: quarantine.
 new_board quarantine
@@ -221,21 +221,21 @@ out="$(PATH="$STUBBIN:$PATH" python3 -I "$WATCHDOG" --root "$R" 2>&1)"; rc=$?
     && [ ! -e "$R/watchdog-status.json" ] && printf '%s' "$out" | grep -q '^Error:'
                                                  note $? "no marker: one Error line, exit 1"
 
-# (11) a reader holds and dies: the mail prints again under the
+# (11) a reader leases and dies: the mail prints again under the
 # redelivery line naming its id, and `seat done` archives it by id,
 # board-wide; a repeat succeeds.
 new_board ack-hold-die
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 "$S" --root "$R" send --from A B 'drill held mail' >/dev/null 2>&1
-out="$("$S" --root "$R" drain --seat B --hold 2>&1)"; rc=$?
+out="$("$S" --root "$R" read --seat B --lease 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qF 'drill held mail' \
     && [ -z "$(ls "$R/seats/B/archive")" ]
-                                                 note $? "hold prints the mail and archives nothing"
+                                                 note $? "lease prints the mail and archives nothing"
 f="$(ls "$R/seats/B/draining" | head -1)"
 id="${f#*-}"; id="${id%.msg}"
 touch -d '1 min ago' "$R/seats/B/draining/$f"
-out="$("$S" --root "$R" drain --seat B --hold 2>&1)"; rc=$?
+out="$("$S" --root "$R" read --seat B --lease 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] \
     && printf '%s\n' "$out" | grep -qF "[redelivery] check whether you already did this; if so, only run: seat done $id"
                                                  note $? "redelivery: the line names the id"
@@ -244,7 +244,7 @@ printf '%s\n' "$out" | grep -qF 'drill held mail'
 "$S" --root "$R" done "$id" >/dev/null 2>&1
                                                  note $? "seat done exits 0"
 [ -n "$(ls "$R/seats/B/archive")" ] && [ -z "$(ls "$R/seats/B/draining")" ]
-                                                 note $? "done archives the held file"
+                                                 note $? "done archives the leased file"
 "$S" --root "$R" done "$id" >/dev/null 2>&1
                                                  note $? "a repeat done exits 0"
 
@@ -269,10 +269,10 @@ new_board ack-wrong-seat
 "$S" --root "$R" register --seat A --harness sb >/dev/null 2>&1
 "$S" --root "$R" register --seat B --harness sb >/dev/null 2>&1
 "$S" --root "$R" send --from A B 'wrong seat mail' >/dev/null 2>&1
-"$S" --root "$R" drain --seat B --hold >/dev/null 2>&1
+"$S" --root "$R" read --seat B --lease >/dev/null 2>&1
 f="$(ls "$R/seats/B/draining" | head -1)"
 id="${f#*-}"; id="${id%.msg}"
-"$S" --root "$R" drain --seat A --done "$id" >/dev/null 2>&1
+"$S" --root "$R" read --seat A --done "$id" >/dev/null 2>&1
                                                  note $? "an ack under the wrong seat exits 0"
 [ -n "$(ls "$R/seats/B/archive")" ] && [ -z "$(ls "$R/seats/B/draining")" ]
                                                  note $? "it archives B's file"
