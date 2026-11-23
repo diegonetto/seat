@@ -143,8 +143,8 @@ def run_text(argv: list[str]) -> str:
 
 
 def seat_names() -> list[str]:
-    sb = os.environ.get("PANE_DOOR_SB", "sb")
-    text = run_text([sb, "seats", "--names"])
+    dkt = os.environ.get("PANE_DOOR_DKT", "dkt")
+    text = run_text([dkt, "seats", "--names"])
     names = []
     for line in text.splitlines():
         name = line.strip()

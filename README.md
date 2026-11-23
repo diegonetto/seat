@@ -185,7 +185,7 @@ idle that long: its inbox empty and nothing in flight, its idle clock
 a delivery to its currently bound session) past the threshold, the
 bound session's `thinking` flag explicitly false (a missing, mistyped,
 or unreadable answer — and a session that is gone — never counts as
-quiet), a role for the seat in the kernel seat map (`sb seats
+quiet), a role for the seat in the docket seat map (`dkt seats
 --json`), because the wake needs one, and the dispatcher's board being
 the very board the wake script writes
 (`<SEAT_ROLE_HOME|$HOME>/.local/share/seat`; seat-role fixes its

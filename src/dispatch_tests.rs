@@ -1694,7 +1694,7 @@ fn lock_env_discards_later_mutations_of_a_guarded_variable() {
     std::env::remove_var("SEAT_GUARD_PROBE_MUT");
 }
 
-/// `dir` first on PATH (the rest kept: the stubs shadow `sb` and
+/// `dir` first on PATH (the rest kept: the stubs shadow `dkt` and
 /// `seat-role`, everything else still resolves).
 fn path_with(dir: &Path) -> OsString {
     let prev = std::env::var_os("PATH").unwrap_or_default();
@@ -1709,11 +1709,11 @@ fn stub(dir: &Path, name: &str, body: &str) {
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A stub directory for the sleep/wake cases: an `sb` answering
-/// `sb seats --json` (`Some(json)` prints it, `None` fails the map
+/// A stub directory for the sleep/wake cases: a `dkt` answering
+/// `dkt seats --json` (`Some(json)` prints it, `None` fails the map
 /// read) and, when wanted, a `seat-role` whose wake is the given
 /// body. The wake-success bodies are built by `wake_success`.
-fn stub_kit(tag: &str, sb_map: Option<&str>, seat_role_body: Option<&str>) -> PathBuf {
+fn stub_kit(tag: &str, map_json: Option<&str>, seat_role_body: Option<&str>) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "seat-test-kit-{tag}-{}-{}",
         std::process::id(),
@@ -1723,9 +1723,9 @@ fn stub_kit(tag: &str, sb_map: Option<&str>, seat_role_body: Option<&str>) -> Pa
             .subsec_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    match sb_map {
-        Some(json) => stub(&dir, "sb", &format!("printf '%s' '{json}'")),
-        None => stub(&dir, "sb", "exit 1"),
+    match map_json {
+        Some(json) => stub(&dir, "dkt", &format!("printf '%s' '{json}'")),
+        None => stub(&dir, "dkt", "exit 1"),
     }
     if let Some(body) = seat_role_body {
         stub(&dir, "seat-role", body);
@@ -2138,8 +2138,8 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
     assert!(!log_text(&root).contains("sleep seat="));
 }
 
-/// `idle_after` without a role in the kernel seat map never sleeps —
-/// the wake takes a role — and neither does a map the kernel refuses
+/// `idle_after` without a role in the docket seat map never sleeps —
+/// the wake takes a role — and neither does a map docket refuses
 /// to answer.
 #[test]
 fn idle_after_without_a_role_never_sleeps() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start panes first, then link their HAPI sessions through the normal wake path.
 set -euo pipefail
-names="$(sb seats --names)"
+names="$(dkt seats --names)"
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 failed=0
 for name in $names; do
@@ -9,7 +9,7 @@ for name in $names; do
     failed=1
   fi
 done
-roles="$(sb seats --json | python3 -c 'import json,sys; print(*[s["role"] for s in json.load(sys.stdin)["seats"].values() if "role" in s], sep="\n")')"
+roles="$(dkt seats --json | python3 -c 'import json,sys; print(*[s["role"] for s in json.load(sys.stdin)["seats"].values() if "role" in s], sep="\n")')"
 # Wake is serial: the cross-role lock answers busy rather than queuing.
 for role in $roles; do
   if result="$("$script_dir/seat-role" wake "$role")"; then

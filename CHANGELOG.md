@@ -32,6 +32,14 @@ Notable changes to this crate. Versions follow semantic versioning.
   `--lease` still prints and leases the mail until `seat done`. The
   on-disk stage directory stays `seats/<name>/draining/`, and
   `meta.json` still stamps `last_drained`.
+- Hard switch onto docket: `sb` is `dkt`, `sb-quota` is `dkt quota`.
+  The seat map is `dkt seats` (`--json` and `--names`). The quota
+  check is `dkt quota status --all --json`; a blocking verdict is
+  `BLOCK` (was `HOLD`). Docket reads `$DOCKET_HOME` (was
+  `$SWITCHBOARD_HOME`; state at `~/.local/share/docket`). `pane-door`
+  takes its binary from `PANE_DOOR_DKT` (was `PANE_DOOR_SB`), default
+  `dkt`. No alias. Callers: `seat-role`, `seat-gallery-up`,
+  `pane-door`, and the dispatcher's sleep path.
 
 ## [0.11.0] - 2026-11-18
 

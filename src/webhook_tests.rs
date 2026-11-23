@@ -1299,7 +1299,7 @@ fn a_webhook_auth_written_mid_burst_is_sent_by_the_next_ring() {
         "one failed ring alarms nothing"
     );
     let ring = load_state(&dir).ring.unwrap();
-    assert_eq!(ring.failures, 0, "the successful ring reset the ladder");
+    assert_eq!(ring.failures, 0, "the successful ring reset the backoff");
 }
 
 /// Every failed ring writes its `failure` line with its detail: four
@@ -1365,7 +1365,7 @@ fn four_failed_rings_log_four_failure_lines_and_fire_the_alarm_once() {
     assert_eq!(ring.failures, 4);
     assert_eq!(
         ring.backoff_ms, 3_600_000,
-        "the ladder kept doubling to the cap"
+        "the backoff kept doubling to the cap"
     );
     assert_eq!(ring.rung, [name]);
 }
