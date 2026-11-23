@@ -197,6 +197,53 @@ class WatchdogTest(unittest.TestCase):
         self.assertEqual(self.keys(status), ["overdue:hook"])
         self.assertIn("limit 15m", status["problems"][0]["detail"])
 
+    def _pin(self, when):
+        os.utime(self.board.root / "dispatch-heartbeat", (when.timestamp(), when.timestamp()))
+
+    def test_overdue_problem_names_the_sender_and_the_ask(self):
+        stamp = dt.datetime(2026, 11, 21, 14, 12, 26, 837008, tzinfo=dt.timezone.utc)
+        when = stamp + dt.timedelta(hours=33, minutes=40)
+        self._pin(when)
+        oldest = stamp.strftime("%Y%m%dT%H%M%S.%f") + "-d5972158.msg"
+        newer_at = when - dt.timedelta(minutes=20)
+        newer = newer_at.strftime("%Y%m%dT%H%M%S.%f") + "-aaaa1111.msg"
+        directory = self.board.seat("hook", webhook=True)
+        raw = "  please\treview   the board " + ("x" * 200)
+        write_msg(directory / "inbox", oldest, body=json.dumps({
+            "from": "ada", "id": "d5972158", "ts": stamp.strftime("%Y%m%dT%H%M%S.%f"),
+        }) + "\n\n" + raw + "\nnot this line\n")
+        write_msg(directory / "inbox", newer, body=json.dumps({
+            "from": "bob", "id": "aaaa1111", "ts": newer_at.strftime("%Y%m%dT%H%M%S.%f"),
+        }) + "\n\nnewer ask\n")
+        with patch.object(DOG, "now", return_value=when):
+            _, status = self.run_dog()
+        self.assertEqual(status["problems"], [{
+            "key": "overdue:hook", "seat": "hook", "kind": "overdue",
+            "since": "2026-11-21T14:27:26Z",
+            "detail": "2 of 2 owed past limit 15m on route webhook; "
+                      f"oldest {oldest} age 33h40m",
+            "from": "ada", "id": "d5972158", "sent": "2026-11-21T14:12:26Z",
+            "ask": "please review the board " + "x" * 136,
+        }])
+
+    def test_unreadable_header_omits_sender_and_keeps_detail(self):
+        stamp = dt.datetime(2026, 11, 21, 14, 12, 26, 837008, tzinfo=dt.timezone.utc)
+        when = stamp + dt.timedelta(hours=33, minutes=40)
+        self._pin(when)
+        name = stamp.strftime("%Y%m%dT%H%M%S.%f") + "-d5972158.msg"
+        directory = self.board.seat("hook", webhook=True)
+        write_msg(directory / "inbox", name, body="{not json\nplease look\n")
+        with patch.object(DOG, "now", return_value=when), \
+                patch.object(DOG.json, "loads", wraps=DOG.json.loads) as loads:
+            _, status = self.run_dog()
+        self.assertEqual(status["problems"], [{
+            "key": "overdue:hook", "seat": "hook", "kind": "overdue",
+            "since": "2026-11-21T14:27:26Z",
+            "detail": "1 of 1 owed past limit 15m on route webhook; "
+                      f"oldest {name} age 33h40m",
+        }])
+        self.assertIn("{not json", [call.args[0] for call in loads.call_args_list])
+
     # -- bindings -----------------------------------------------------------
 
     def test_bindings_cases(self):

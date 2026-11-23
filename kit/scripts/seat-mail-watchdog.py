@@ -2,10 +2,10 @@
 once per stale-heartbeat incident, writes one status file, prints one
 line.
 
-Stdlib only; run as `python3 -I`. It never opens a `.msg` file (names
-and mtimes only), takes no lock, never runs `seat`, calls no hub, sends
-no mail. The one thing it runs is `systemctl --user restart
-seat-dispatch.service`, once per incident, output kept private.
+Stdlib only; run as `python3 -I`. It opens only the oldest overdue
+`.msg` (header and first body line), takes no lock, never runs `seat`,
+calls no hub, sends no mail. The one thing it runs is `systemctl --user
+restart seat-dispatch.service`, once per incident, output kept private.
 """
 import argparse
 import datetime as dt
@@ -102,6 +102,27 @@ def owed_files(seat_dir, at):
             found.append((entry.name, max(0.0, age)))
     found.sort(key=lambda row: row[0])
     return found
+
+
+def mail_fact(seat_dir, name):
+    """`from`, `id`, `sent`, `ask` from an overdue `.msg`, or None when
+    it cannot be read or parsed. `sent` is the header `ts` as ISO UTC;
+    `ask` is the first body line, whitespace collapsed, 160 chars."""
+    path = next((seat_dir / stage / name for stage in ("inbox", "draining")
+                 if (seat_dir / stage / name).is_file()), None)
+    if path is None:
+        return None
+    try:
+        lines = path.read_text().splitlines()
+        header = json.loads(lines[0])
+        stamp = file_ts(header["ts"])
+        sender, ident = header["from"], header["id"]
+        ask = " ".join(next(ln for ln in lines[1:] if ln.strip()).split())[:160]
+    except Exception:
+        return None
+    if stamp is None or not isinstance(sender, str) or not isinstance(ident, str):
+        return None
+    return {"from": sender, "id": ident, "sent": iso(stamp), "ask": ask}
 
 
 def route_of(seat_dir, bound):
@@ -304,6 +325,7 @@ def check_board(root):
                     "since": iso(overdue_at),
                     "detail": f"{len(past)} of {len(owed)} owed past limit {limit_raw}"
                     f" on route {route}; oldest {oldest_name} age {age_words(oldest_age)}",
+                    **(mail_fact(seat_dir, oldest_name) or {}),
                 })
         try:
             quarantined = sorted(p for p in (seat_dir / "quarantine").iterdir() if p.is_file())
