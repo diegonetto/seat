@@ -30,13 +30,13 @@ pub enum SeatError {
     #[error("message body at {path} is not valid UTF-8")]
     BadBody { path: PathBuf },
 
-    #[error("drain: message from '{0}' failed mark verification; not delivered")]
+    #[error("read: message from '{0}' failed mark verification; not delivered")]
     BadMark(String),
 
-    #[error("drain: unreadable message was not delivered")]
+    #[error("read: unreadable message was not delivered")]
     Unreadable,
 
-    #[error("drain: {0}")]
+    #[error("read: {0}")]
     Drain(String),
 
     #[error("done: {0}")]
@@ -54,7 +54,7 @@ pub enum SeatError {
     #[error("token for seat {0} is not valid hex")]
     BadToken(String),
 
-    #[error("seat '{0}' is busy: another drain holds its lock (gave up after 30s)")]
+    #[error("seat '{0}' is busy: another read holds its lock (gave up after 30s)")]
     SeatBusy(String),
 
     #[error("another dispatcher holds the lock {0} (one dispatcher per board)")]

@@ -1,6 +1,6 @@
 //! The dispatcher's per-seat state: `dispatch.json` (each in-flight
 //! key, its target session and phase, the last delivery for status's
-//! `awake`), the stable delivery keys, the exact text `drain` prints
+//! `awake`), the stable delivery keys, the exact text `seat read` prints
 //! for an item, and the one-line log.
 use crate::drain::ReceivedDirect;
 use crate::error::Result;
@@ -74,7 +74,7 @@ pub struct WakeHold {
 }
 
 /// The webhook adapter's ring state (inside `dispatch.json`): the
-/// burst still open — files rung, waiting for the bot's own drain —
+/// burst still open — files rung, waiting for the bot's own read —
 /// the doubling re-ring backoff (0 = no burst) and the failed-ring
 /// count behind the `webhook-failing` alarm.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -206,7 +206,7 @@ pub(crate) fn next_delivery_key(key: &str) -> String {
     format!("{base}#{next}")
 }
 
-/// Exactly the lines `seat drain` prints for the item: header line,
+/// Exactly the lines `seat read` prints for the item: header line,
 /// body, blank line.
 pub(crate) fn direct_text(d: &ReceivedDirect) -> String {
     format!(

@@ -1,7 +1,7 @@
-//! The `webhook` adapter: the Grok bots drain the board themselves,
+//! The `webhook` adapter: the Grok bots read the board themselves,
 //! so it never runs `receive` and never archives — it rings, and
 //! re-rings (1 min doubling to 1 h) until every rung message in
-//! `inbox/` or `draining/` has been taken by the bot's drain. Two
+//! `inbox/` or `draining/` has been taken by the bot's read. Two
 //! modes: **signal** POSTs `{"schema_version":1,"seat":..,"ts":..,
 //! "nonce":..}` HMAC'd with `bridge.key`, never a message body;
 //! **payload mode** (enabled by `<seat>/webhook.payload`) carries
@@ -42,7 +42,7 @@ pub(crate) const PROD_RING_WAITS: RingWaits = RingWaits {
 pub(crate) enum RingOutcome {
     Rang,    // a POST went out; the burst is open
     Waiting, // burst open, next ring not due yet
-    Idle,    // nothing to ring: the bot's drain took everything
+    Idle,    // nothing to ring: the bot's read took everything
 }
 
 #[derive(Clone)]
@@ -246,11 +246,11 @@ pub(crate) fn hq_receipt(
     }
 }
 
-/// File names in `inbox/` and `draining/`: work the bot's own drain
-/// owes (it removes both). Held mail — a file in `draining/` inside
-/// its `--hold` lease, a future mtime — is left out: every caller
+/// File names in `inbox/` and `draining/`: work the bot's own read
+/// owes (it removes both). Leased mail — a file in `draining/` inside
+/// its `--lease` deadline, a future mtime — is left out: every caller
 /// (the 2 s scan, `ring_pass`, the worker's waits,
-/// `alarm::undelivered`, the sleep checks) then sees held mail as
+/// `alarm::undelivered`, the sleep checks) then sees leased mail as
 /// not owed until its deadline passes, and as owed again after it.
 pub(crate) fn present_files(dir: &Path) -> BTreeSet<String> {
     let mut present = BTreeSet::new();
@@ -279,7 +279,7 @@ fn file_id(name: &str) -> &str {
 /// the hapi half: a seat in `hapi-sessions.json` is hapi (even with
 /// `webhook.url` staged), a seat whose `webhook.url` is gone is pull —
 /// either way this worker must step aside, so the scan can hand the
-/// seat to the hapi worker or leave it to drain when it chooses.
+/// seat to the hapi worker or leave it to read when it chooses.
 pub(crate) fn still_webhook(root: &Path, seat_name: &str) -> bool {
     !Bindings::load(root).contains(seat_name)
         && seat::seat_dir(root, seat_name)
@@ -402,7 +402,7 @@ pub(crate) fn ring_once(
     }
     if pending.is_empty() {
         // While an attempted hq message is still unread, a signal
-        // would make the bot drain and answer it twice.
+        // would make the bot read and answer it twice.
         if other_mail && !attempted_hq_still_unread {
             return ring_signal(cfg, seat, sleeper);
         }
@@ -517,7 +517,7 @@ fn wake_condition(rung: &BTreeSet<&String>, present: &BTreeSet<String>, deadline
 
 /// One pass for one webhook seat: ring on a burst of new mail, re-ring
 /// with the doubling backoff until every rung message — a file in
-/// `inbox/`/`draining/` — has been taken by the bot's drain. Three
+/// `inbox/`/`draining/` — has been taken by the bot's read. Three
 /// failed rings in a row are the `webhook-failing` alarm; owed mail
 /// older than 15 minutes by its header `ts` is `undelivered` (both
 /// once per cause).
@@ -545,7 +545,7 @@ pub(crate) fn ring_pass(
     // successful ring's `rung` line names what this ring newly
     // covers, so the covered-before set must survive the prune.
     let prev_rung: BTreeSet<String> = ring.rung.iter().cloned().collect();
-    // Prune what the bot's drain took; an empty rung set closes the
+    // Prune what the bot's read took; an empty rung set closes the
     // burst and resets the backoff.
     ring.rung.retain(|f| present.contains(f));
     if ring.rung.is_empty() {
@@ -683,7 +683,7 @@ pub(crate) fn worker_loop(
             Ok(cfg) => cfg,
             Err(e) => {
                 if present_files(&dir).is_empty() {
-                    return; // the bot drained the burst: nothing owes a ring
+                    return; // the bot read the burst: nothing owes a ring
                 }
                 log_line(&root, "failure", &seat, &e.to_string());
                 first = false; // a skipped pass counts: stop may end the loop

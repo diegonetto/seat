@@ -1,7 +1,7 @@
 # seat
 
 One command for a local board of named seats. Each seat has an inbox of
-HMAC-signed messages. `drain` prints the inbox and empties it. `up`
+HMAC-signed messages. `read` prints the inbox and empties it. `up`
 starts the command stored on a seat inside one tmux session named
 `swarm`.
 
@@ -20,10 +20,10 @@ seat --root "$ROOT" init
 seat --root "$ROOT" register --seat alice --harness local
 seat --root "$ROOT" register --seat bob --harness local
 seat --root "$ROOT" send --from alice bob hello
-seat --root "$ROOT" drain --seat bob
+seat --root "$ROOT" read --seat bob
 ```
 
-`drain` prints `hello`. A second `drain` prints nothing.
+`read` prints `hello`. A second `read` prints nothing.
 
 ## Start a command
 
@@ -44,7 +44,7 @@ the inbox.
 
 ## Verbs
 
-`init`, `register`, `send`, `drain`, `done`, `dispatch`, `up`, `down`,
+`init`, `register`, `send`, `read`, `done`, `dispatch`, `up`, `down`,
 `gallery`, `status`, `reset`. An unknown verb exits 2 with
 `error: unrecognized subcommand '<verb>'` and a usage line.
 
@@ -52,7 +52,7 @@ the inbox.
 seat init
 seat register --seat <name> --harness <h> [--model M] [--cwd ABS] [--idle-after DUR] [--mail-limit DUR] [-- CMD...]
 seat send [--from <from>] <to> <body>
-seat drain --seat <name> [--hold | --done <ID>...]
+seat read --seat <name> [--lease | --done <ID>...]
 seat done <ID>...
 seat dispatch [--once]
 seat up [name...]
@@ -78,27 +78,27 @@ tile's border shows that pane's `@seat` name. Mouse is on. A zoomed pane
 stays full screen across a resize. It does not list a seat that is not
 running, and it does not move any other pane.
 
-`drain` takes a per-seat lock (`<seat>/lock`) for its whole run: a
-second drain of the same seat waits, and gives up after 30 seconds with
-an error naming the seat. Drains of other seats never wait. `--hold`
+`read` takes a per-seat lock (`<seat>/lock`) for its whole run: a
+second read of the same seat waits, and gives up after 30 seconds with
+an error naming the seat. Reads of other seats never wait. `--lease`
 and `--done` take the same lock the same way.
 
-### Hold, then done
+### Lease, then done
 
 A bot that acts on its mail before it can safely say it used it — a
-Grok bot run that dies after reading its drain — holds instead of
-draining. The bot's loop: `drain --hold`, act, `seat done` the ids it
+Grok bot run that dies after reading its mail — leases instead of
+archiving. The bot's loop: `read --lease`, act, `seat done` the ids it
 finished.
 
-`drain --hold` receives exactly as `drain` does, sets each staged
+`read --lease` receives exactly as `read` does, sets each staged
 file's mtime to the lease deadline (`now + 30 minutes`), prints the
-mail exactly as `drain` prints it, and archives nothing. Order per
+mail exactly as `read` prints it, and archives nothing. Order per
 file: staged, deadline set, printed; a file whose deadline cannot be
-set is not printed and the command fails naming it. A hold stamps
+set is not printed and the command fails naming it. A lease stamps
 `last_drained` on every call — including one that printed nothing: a
-reader that only holds still reads.
+reader that only leases still reads.
 
-`seat done <ID>...` (and `drain --seat X --done <ID>...`, the same
+`seat done <ID>...` (and `read --seat X --done <ID>...`, the same
 command — the seat is still checked) archives each id's mail found
 anywhere on the board, so an ack under the wrong `--seat` or a
 mistyped id can never succeed silently. Each id settles on its own: a
@@ -112,11 +112,11 @@ both; exactly one is the pick, leased or not; a match already in
 `archive/` is success (nothing moves); a match in `inbox/` is archived
 only for a `webhook.payload` seat whose `<seat>/webhook-delivered.json`
 records the id (payload mode's delivered mail) — any other inbox match
-is refused (`drain it first`); a match in `quarantine/` is refused
+is refused (`read it first`); a match in `quarantine/` is refused
 (never delivered); an id the board cannot account for anywhere is
 refused (`not on this board`). The pick and the rename happen under
 the owning seat's lock, where the id's folder is re-resolved — an id a
-drain or hold moved to `draining/` by then is archived from there, so
+read or lease moved to `draining/` by then is archived from there, so
 a settle never exits 0 with the mail still leased — and `last_drained`
 is stamped on each seat a file was archived for. Each archived id
 appends one line to `<root>/dispatch.log`: `done seat=<seat> id=<id>
@@ -124,11 +124,11 @@ by=<--seat if given, else "unknown">`; when the caller's `--seat` is a
 different seat, one stderr line names both. Done prints nothing on
 stdout.
 
-Held mail is leased: a plain `drain`, a second `--hold` and the hapi
+Leased mail stays leased: a plain `read`, a second `--lease` and the hapi
 pass all leave it alone until its deadline passes, and no ring, no
 scan worker and no `undelivered` alarm count it as owed — the 2 s
 scan starts a worker and the ring fires the moment the deadline
-passes, with no new mail. A bot run that dies after its hold loses no
+passes, with no new mail. A bot run that dies after its lease loses no
 mail: the mail is rung and printed again after the 30 minutes, under
 the redelivery line first:
 
@@ -136,18 +136,18 @@ the redelivery line first:
 [redelivery] check whether you already did this; if so, only run: seat done <id>
 ```
 
-`drain` and `drain --hold` print that line (with the real id) before
+`read` and `read --lease` print that line (with the real id) before
 any message that was already in `draining/` when they ran — an
-expired hold, a crashed drain, or mail the dispatcher staged and
-pushed — so mail a drain or hold showed twice never looks like new
+expired lease, a crashed read, or mail the dispatcher staged and
+pushed — so mail a read or lease showed twice never looks like new
 mail. The exception is mail a payload-mode seat was already shown in
 the webhook body: its file was never in `draining/` before, so a later
-hold stages and prints it fresh, without the redelivery line — retire
-such mail with `seat done <id>` rather than holding it twice. A
+lease stages and prints it fresh, without the redelivery line — retire
+such mail with `seat done <id>` rather than leasing it twice. A
 duplicate after a clock jump is possible and a loss is not. The lease
 clock is the file's mtime; the alarm's is the header `ts`.
 
-`status` counts `inbox/` only, so held mail in `draining/` is not
+`status` counts `inbox/` only, so leased mail in `draining/` is not
 counted. A payload-mode seat marks hq mail done by id after acting on
 the payload — the payload carries each message's id, and
 `seat done <that id>` retires it: the file is still in `inbox/`, and
@@ -164,7 +164,7 @@ nonzero at once with one line naming the lock. Every 2 s it scans the
 seats and routes each one by configuration alone: a seat bound in
 `<root>/hapi-sessions.json` is `hapi` (even if it also holds webhook
 files), else a seat directory holding `webhook.url` is `webhook`, else
-pull — no push and no receive, that seat drains when it chooses. A
+pull — no push and no receive, that seat reads when it chooses. A
 slow hub delays only its own seat, every HTTP request is bounded at
 10 s, and SIGTERM exits cleanly. Each hapi item is tracked by a stable
 key recorded in `<seat>/dispatch.json` atomically before anything is
@@ -185,7 +185,7 @@ idle that long: its inbox empty and nothing in flight, its idle clock
 a delivery to its currently bound session) past the threshold, the
 bound session's `thinking` flag explicitly false (a missing, mistyped,
 or unreadable answer — and a session that is gone — never counts as
-quiet), a role for the seat in the kernel seat map (`sb seats
+quiet), a role for the seat in the docket seat map (`dkt seats
 --json`), because the wake needs one, and the dispatcher's board being
 the very board the wake script writes
 (`<SEAT_ROLE_HOME|$HOME>/.local/share/seat`; seat-role fixes its
@@ -242,7 +242,7 @@ attempted again until that pane is verifiably gone.
 
 ### The webhook adapter
 
-The Grok bots drain the board themselves, so the webhook adapter never
+The Grok bots read the board themselves, so the webhook adapter never
 runs `receive` and never archives — it rings, and re-rings until every
 rung message has left `inbox/` and `draining/` (backoff from 1 min
 doubling to 1 h). A webhook worker rechecks its route before each pass
@@ -283,7 +283,7 @@ byte for byte against the scripts they replace:
 
 ### Staging a Grok bot seat
 
-A Grok bot seat is a webhook seat: the bot drains the board itself, so
+A Grok bot seat is a webhook seat: the bot reads the board itself, so
 delivery rings its webhook instead of posting to a hub session. Stage
 the files, register the seat, and leave the dispatcher running:
 
@@ -419,7 +419,7 @@ no mark, with a delivery the dispatcher recorded for this seat's bound
 session within the last 10 minutes (read from
 `<seat>/dispatch.json`; status never asks the hub). `unattended` is
 everything else. `mail=<N>` is the number of files in that seat's
-inbox — held mail sitting in `draining/` under a `--hold` lease is
+inbox — leased mail sitting in `draining/` under a `--lease` deadline is
 not counted. It is printed on every row. Mail does not change
 presence.
 

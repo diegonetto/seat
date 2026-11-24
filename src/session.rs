@@ -293,8 +293,8 @@ pub fn cmd_up(root: &Path, names: &[String]) -> Result<()> {
 }
 
 /// `seat down [NAME...]` — kill those seats' panes. No names
-/// stops every registered seat. Prints no message body and drains
-/// nothing: unread mail waits for a later `drain`. A
+/// stops every registered seat. Prints no message body and reads
+/// nothing: unread mail waits for a later `read`. A
 /// registered seat that is already stopped is success.
 pub fn cmd_down(root: &Path, names: &[String]) -> Result<()> {
     board::ensure_board(root)?;

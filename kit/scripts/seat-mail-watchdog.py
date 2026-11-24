@@ -96,7 +96,7 @@ def owed_files(seat_dir, at):
             except OSError:
                 continue
             if stage == "draining" and mtime > at:
-                continue  # leased: a `--hold` deadline still in the future
+                continue  # leased: a `--lease` deadline still in the future
             stamp = file_ts(entry.name)
             age = (at - stamp).total_seconds() if stamp is not None else (at - mtime).total_seconds()
             found.append((entry.name, max(0.0, age)))

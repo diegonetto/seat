@@ -33,7 +33,7 @@ HUB = "http://127.0.0.1:3006/api"
 RESUME = {"resume", "--resume", "--continue", "-c", "-r", "--session-id", "--fork-session"}
 # Child commands named in plain words; their output is never echoed.
 TOOLS = {"tmux": "the swarm's tmux", "seat": "the seat command", "curl": "the phone hub (HAPI)",
-         "sb-quota": "the quota check", "ps": "the process list"}
+         "ps": "the process list"}
 # tmux's own words for a server that is not running (stale or missing socket).
 NO_SERVER = re.compile(r"no server running on |error connecting to .*\((?:No such file or directory|Connection refused)\)")
 
@@ -101,6 +101,14 @@ def read_json(path):
         fail("the file " + path.name + " is missing or unreadable")
 
 
+def helper_words(argv):
+    """Plain words for a child. `dkt quota` is the quota check; the seat map is not this helper."""
+    name = Path(argv[0]).name
+    if name == "dkt" and len(argv) > 1 and argv[1] == "quota":
+        return "the quota check"
+    return TOOLS.get(name, "a helper command")
+
+
 def command(argv, *, data=None, timeout=5, cwd=None, deadline=None):
     if deadline is not None:
         timeout = min(timeout, deadline - time.monotonic())
@@ -110,9 +118,9 @@ def command(argv, *, data=None, timeout=5, cwd=None, deadline=None):
         done = subprocess.run(argv, input=data, text=True, capture_output=True,
                               timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired):
-        fail(TOOLS.get(Path(argv[0]).name, "a helper command") + " timed out or could not be run")
+        fail(helper_words(argv) + " timed out or could not be run")
     if done.returncode:
-        fail(TOOLS.get(Path(argv[0]).name, "a helper command") + " returned an error")
+        fail(helper_words(argv) + " returned an error")
     return done.stdout
 
 
@@ -131,14 +139,14 @@ def atomic_write(path, value):
 
 
 def seat_map():
-    """The kernel's seat map: `sb seats --json` (the kernel reads $SWITCHBOARD_HOME).
+    """The docket seat map: `dkt seats --json` (docket reads $DOCKET_HOME).
 
-    The kernel's own stderr words refuse an absent or malformed map.
+    Docket's own stderr refuses an absent or malformed map.
     """
     try:
-        done = subprocess.run(["sb", "seats", "--json"], text=True, capture_output=True, timeout=15)
+        done = subprocess.run(["dkt", "seats", "--json"], text=True, capture_output=True, timeout=15)
     except FileNotFoundError:
-        fail("the seat command is not on PATH")
+        fail("docket is not on PATH")
     except (OSError, subprocess.TimeoutExpired):
         fail("the seat map could not be read")
     if done.returncode:
@@ -171,7 +179,7 @@ class Wake:
         # HOME is never changed by this program or its tests.
         self.home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
         self.projects = self.home / "Projects"
-        # One seat list: the kernel's map names the seat, kind, label and account (the tables and roles.json are gone).
+        # One seat list: the docket map names the seat, kind, label and account (the tables and roles.json are gone).
         self.seat, record = role_row(role)
         kind, account, label = record.get("harness"), record.get("account"), record.get("name")
         if (not isinstance(kind, str) or not kind
@@ -207,8 +215,8 @@ class Wake:
             raise Result("refused", f"Windows has {free} MB free; a wake needs 3000 MB")
 
     def quota_guard(self, deadline=None):
-        # A cold sb-quota after a reboot took over 13 s (2026-10-14 00:05 CT); allow 30.
-        raw = command(["sb-quota", "status", "--all", "--json"], timeout=30, deadline=deadline)
+        # A cold `dkt quota` after a reboot took over 13 s (2026-10-14 00:05 CT); allow 30.
+        raw = command(["dkt", "quota", "status", "--all", "--json"], timeout=30, deadline=deadline)
         try:
             rows = json.loads(raw)["rows"]
             if not isinstance(rows, list):
@@ -217,9 +225,9 @@ class Wake:
             verdicts = [row.get("verdict") for row in selected]
         except (ValueError, KeyError, TypeError):
             fail("the quota check gave an answer that could not be read")
-        if "HOLD" in verdicts:
+        if "BLOCK" in verdicts:
             # Do not echo provider text: it may include credentials or pane output.
-            raise Result("refused", f"account {self.account} is on quota HOLD")
+            raise Result("refused", f"account {self.account} is on quota BLOCK")
         if not verdicts or any(v != "OK" for v in verdicts):
             fail(f"the quota for account {self.account} is unknown, so nothing was started")
 
@@ -522,7 +530,7 @@ class Wake:
             down = self.down(target) if wrapped else None
             if wrapped and not down:
                 # Identifying an existing session sends nothing to the pane. A busy
-                # CLI, low memory, or a quota HOLD must not hide its live URL.
+                # CLI, low memory, or a quota BLOCK must not hide its live URL.
                 reason = "the seat is running under the phone link, but no phone session for it is active"
                 url = None
                 try:

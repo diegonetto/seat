@@ -18,15 +18,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long `sb seats --json` may take (the kit's own bound is 15 s).
+/// How long `dkt seats --json` may take (the kit's own bound is 15 s).
 const MAP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The seat's role in the kernel seat map (`sb seats --json` — the
+/// The seat's role in the docket seat map (`dkt seats --json` — the
 /// same map `seat-role` reads). `None` when the map cannot be read or
 /// the seat has no role there: such a seat is never slept — the wake
 /// takes a role — and a map failure is never permission to sleep.
 pub(crate) fn seat_role(seat: &str) -> Option<String> {
-    let mut cmd = Command::new("sb");
+    let mut cmd = Command::new("dkt");
     cmd.args(["seats", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -116,7 +116,7 @@ pub(crate) enum WakeOutcome {
 pub(crate) fn wake_seat(root: &Path, seat: &str) -> WakeOutcome {
     let Some(role) = seat_role(seat) else {
         return WakeOutcome::Failed(format!(
-            "no role for seat {seat} in the kernel seat map, and seat-role wake takes a role"
+            "no role for seat {seat} in the docket seat map, and seat-role wake takes a role"
         ));
     };
     let prog = seat_role_program();
@@ -331,7 +331,7 @@ fn wake_writes_root(root: &Path) -> bool {
 /// later of it and a delivery to the currently bound session) at least
 /// that old; nothing in flight; nothing owed in `inbox/` or
 /// `draining/`, looked for again just before the record; the bound
-/// session's `thinking` explicitly `false`; a role in the kernel seat
+/// session's `thinking` explicitly `false`; a role in the docket seat
 /// map, because the wake takes one; and the dispatcher's board being
 /// the board the wake script writes. The kill names the pane the clock
 /// timed, and a different live pane under the same seat name cancels

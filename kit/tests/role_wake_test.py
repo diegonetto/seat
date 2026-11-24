@@ -29,7 +29,7 @@ SPEC.loader.exec_module(ROLE)
 SESSION = "11111111-2222-4333-8444-555555555555"
 OTHER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 EXPECTED_URL = "https://hapi.bll.dev/sessions/" + SESSION
-# The kernel's seat map (one seat list), as `sb seats --json` prints it.
+# The docket seat map (one seat list), as `dkt seats --json` prints it.
 MAP = {"schema_version": 1, "seats": {
     "glm-main": {"tenant": "internal", "account": "zai-personal", "model": "glm-5.3", "role": "builder",
                  "name": "GLM", "harness": "glm", "effort": None, "cwd": "/home/slix/Projects"},
@@ -70,26 +70,27 @@ def sock():
 def swarm_sock():
     # The swarm's default socket, only ever under the test's private TMUX_TMPDIR.
     return str(root / 'tmux-tmp' / ('tmux-' + str(os.getuid())) / 'default')
-if name == 'sb':
-    assert args in (['seats', '--json'], ['seats', '--names'])
-    if state.get('sb_error'):
-        print(state['sb_error'], file=sys.stderr)
-        sys.exit(1)
-    if args[1] == '--names':
-        print('\n'.join(state['map']['seats']))
-        sys.exit(0)
-    out(state['map'])
+if name == 'dkt':
+    if args[:1] == ['quota']:
+        assert args == ['quota', 'status', '--all', '--json']
+        if state.get('quota_error'):
+            print(state['access'], file=sys.stderr)
+            sys.exit(1)
+        out({'rows': state['quota']})
+    else:
+        assert args in (['seats', '--json'], ['seats', '--names'])
+        if state.get('map_error'):
+            print(state['map_error'], file=sys.stderr)
+            sys.exit(1)
+        if args[1] == '--names':
+            print('\n'.join(state['map']['seats']))
+            sys.exit(0)
+        out(state['map'])
 elif name == 'seat-role':
     assert len(args) == 2 and args[0] == 'wake'
     value = state.get('wake_results', {}).get(args[1], {'status': 'awake', 'url': 'https://hapi.bll.dev/sessions/11111111-2222-4333-8444-555555555555'})
     out(value)
     sys.exit(1 if value['status'] == 'failed' else 0)
-elif name == 'sb-quota':
-    assert args == ['status', '--all', '--json']
-    if state.get('quota_error'):
-        print(state['access'], file=sys.stderr)
-        sys.exit(1)
-    out({'rows': state['quota']})
 elif name == 'ps':
     assert args == ['-eo', 'pid=,ppid=']
     if state.get('real'):
@@ -276,14 +277,14 @@ class RoleWakeTest(unittest.TestCase):
         self.home = self.root / 'home'
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        for name in ('tmux', 'seat', 'curl', 'sb-quota', 'ps', 'sb'):
+        for name in ('tmux', 'seat', 'curl', 'ps', 'dkt'):
             executable = self.bin / name
             executable.write_text('#!' + sys.executable + '\n' + STUB)
             executable.chmod(0o755)
         (self.bin / 'python3').symlink_to(sys.executable)
         (self.bin / 'dirname').symlink_to('/usr/bin/dirname')
-        self.sb = self.root / 'switchboard'
-        self.sb.mkdir()
+        self.docket_home = self.root / 'docket'
+        self.docket_home.mkdir()
         self.memory = self.root / 'memory.csv'
         self.memory.write_text('timestamp,free_mb\n2026-10-14T02:30:00Z,3000\n')
         (self.home / '.hapi').mkdir(parents=True)
@@ -293,7 +294,7 @@ class RoleWakeTest(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             'HOME': str(self.home), 'TMUX_TMPDIR': str(self.tmux_tmp), 'TMUX': SENTINEL_TMUX + ',1,0',
             'PATH': str(self.bin), 'SEAT_ROLE_HOME': str(self.home),
-            'SEAT_ROLE_MEMORY_LOG': str(self.memory), 'SWITCHBOARD_HOME': str(self.sb),
+            'SEAT_ROLE_MEMORY_LOG': str(self.memory), 'DOCKET_HOME': str(self.docket_home),
             'SEAT_RUNTIMES': str(self.home / 'Projects/.seat-runtimes'), 'STUB_ROOT': str(self.root),
         })
         self.env.start()
@@ -341,7 +342,7 @@ class RoleWakeTest(unittest.TestCase):
 
     def invoke(self, args=None, stderr=''):
         out, err = io.StringIO(), io.StringIO()
-        before = {p.name: p.read_bytes() for p in self.sb.iterdir()}
+        before = {p.name: p.read_bytes() for p in self.docket_home.iterdir()}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = ROLE.main(args if args is not None else ['wake', self.role])
         self.assertEqual(err.getvalue(), stderr)
@@ -363,7 +364,7 @@ class RoleWakeTest(unittest.TestCase):
             for arg in call:
                 for bad in forbidden:
                     self.assertNotIn(bad, arg)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.sb.iterdir()})
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.docket_home.iterdir()})
         return value
 
     def swarm_sock(self):
@@ -388,13 +389,13 @@ class RoleWakeTest(unittest.TestCase):
         self.assertIn('moved_at', saved['seats'][self.seat])
         self.assertTrue(any('/sessions/' + SESSION in c[-1] for c in self.calls() if c[0] == 'curl'))
 
-    def test_wrapped_session_returns_url_during_low_memory_hold_and_busy_work(self):
+    def test_wrapped_session_returns_url_during_low_memory_block_and_busy_work(self):
         self.memory.write_text('at,2999\n')
-        self.state['quota'][0]['verdict'] = 'HOLD'
+        self.state['quota'][0]['verdict'] = 'BLOCK'
         self.state['pane'] = 'Working\n1 shell\nDo you want to continue? (y/n)'
         self.save()
         self.assertEqual(self.no_mutation('awake'), {'status': 'awake', 'url': EXPECTED_URL})
-        self.assertFalse(any(c[0] == 'sb-quota' for c in self.calls()))
+        self.assertFalse(any(c[:2] == ['dkt', 'quota'] for c in self.calls()))
 
     def test_awake_patch_names_the_session_once(self):
         self.assertEqual(self.invoke(), {'status': 'awake', 'url': EXPECTED_URL})
@@ -565,7 +566,7 @@ class RoleWakeTest(unittest.TestCase):
         self.fixture('fixer', wrapped=False)
         self.memory.write_text('at,2999\n')
         self.assertIn('2999', self.no_mutation('refused')['reason'])
-        self.assertEqual(self.calls(), [['sb', 'seats', '--json']])
+        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
     def test_memory_unavailable(self):
         self.fixture('fixer', wrapped=False)
@@ -582,7 +583,7 @@ class RoleWakeTest(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(self.invoke(args)['status'], 'failed')
         # Each refusal reads the map twice: once to look the role up, once to list the roles it offers.
-        self.assertEqual(self.calls(), [['sb', 'seats', '--json']] * 4)
+        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']] * 4)
 
     def test_six_seat_map_resolves_every_role(self):
         for seat, row in MAP['seats'].items():
@@ -592,19 +593,19 @@ class RoleWakeTest(unittest.TestCase):
 
     def test_wake_loop_order_is_the_maps_file_order(self):
         self.assertEqual(ROLE.map_roles(), ['builder', 'reviewer', 'lander', 'fixer', 'critic', 'adjudicator'])
-        self.assertEqual(len([c for c in self.calls() if c[0] == 'sb']), 1)
+        self.assertEqual(len([c for c in self.calls() if c[0] == 'dkt']), 1)
 
     def test_role_missing_from_the_map_fails_with_its_words(self):
         value = self.invoke(['wake', 'admin'])
         self.assertEqual(value['reason'],
                          'role admin is not in the seat map; use builder, reviewer, lander, fixer, critic, adjudicator')
 
-    def test_refusing_map_fails_with_the_kernel_words(self):
-        self.state['sb_error'] = 'seats.json: unknown key tenantx in seat glm-main'
+    def test_refusing_map_fails_with_dockets_words(self):
+        self.state['map_error'] = 'seats.json: unknown key tenantx in seat glm-main'
         self.save()
         value = self.invoke()
         self.assertEqual(value['reason'], 'the seat map: seats.json: unknown key tenantx in seat glm-main')
-        self.assertEqual(self.calls(), [['sb', 'seats', '--json']])
+        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
     def test_invalid_map_record_for_a_role(self):
         self.state['map']['seats']['opus-main']['account'] = 'not valid!'
@@ -612,8 +613,8 @@ class RoleWakeTest(unittest.TestCase):
         value = self.invoke()
         self.assertEqual(value['reason'], 'the seat map record for role reviewer is invalid')
 
-    def test_gallery_script_refusal_prints_the_kernel_words(self):
-        self.state['sb_error'] = 'seats.json: seat glm-main has no account'
+    def test_gallery_script_refusal_prints_dockets_words(self):
+        self.state['map_error'] = 'seats.json: seat glm-main has no account'
         self.save()
         script = subprocess.run(['/bin/bash', str(ROOT / 'scripts/seat-gallery-up')],
                                 capture_output=True, text=True, timeout=15)
@@ -667,7 +668,7 @@ class RoleWakeTest(unittest.TestCase):
         self.state['wake_results'] = {
             'builder': {'status': 'up', 'reason': 'plain terminal'},
             'reviewer': {'status': 'busy'},
-            'lander': {'status': 'refused', 'reason': 'quota HOLD'},
+            'lander': {'status': 'refused', 'reason': 'quota BLOCK'},
         }
         result = self.gallery()
         self.assertEqual(result.returncode, 0)
@@ -675,14 +676,14 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual([json.loads(line.split(' ', 1)[1])['status']
                           for line in result.stdout.splitlines()[:3]], ['up', 'busy', 'refused'])
 
-    def test_hold_is_scoped_to_role_account(self):
-        self.state['quota'].append({'account': 'unrelated', 'verdict': 'HOLD'})
+    def test_block_is_scoped_to_role_account(self):
+        self.state['quota'].append({'account': 'unrelated', 'verdict': 'BLOCK'})
         self.save()
         self.no_mutation('awake')
         self.fixture('fixer', wrapped=False)
-        self.state['quota'][0]['verdict'] = 'HOLD'
+        self.state['quota'][0]['verdict'] = 'BLOCK'
         self.save()
-        self.assertIn('HOLD', self.no_mutation('refused')['reason'])
+        self.assertIn('BLOCK', self.no_mutation('refused')['reason'])
 
     def test_unknown_quota_fails_closed(self):
         self.fixture('fixer', wrapped=False)
@@ -823,7 +824,7 @@ class RoleWakeTest(unittest.TestCase):
 
         def run(argv, *args, **kwargs):
             # The seat map reads normally; every child command after it times out.
-            if argv[0] == 'sb':
+            if argv[0] == 'dkt' and argv[1:2] == ['seats']:
                 return real_run(argv, *args, **kwargs)
             raise subprocess.TimeoutExpired('stub', 1)
 
@@ -909,7 +910,7 @@ class RoleWakeTest(unittest.TestCase):
         with (state_dir / 'role-wake.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.no_mutation('busy')
-        self.assertEqual(self.calls(), [['sb', 'seats', '--json']])
+        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
     def down_fixture(self, role='reviewer', wrapped=True, down='server'):
         self.fixture(role, wrapped)
@@ -1039,9 +1040,9 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(self.no_mutation('refused')['status'], 'refused')
         self.assertIn(self.seat, self.saved_map()['seats'])
 
-    def test_down_with_quota_hold_is_refused_before_start(self):
+    def test_down_with_quota_block_is_refused_before_start(self):
         self.down_fixture('fixer', wrapped=False)
-        self.state['quota'][0]['verdict'] = 'HOLD'
+        self.state['quota'][0]['verdict'] = 'BLOCK'
         self.save()
         self.no_mutation('refused')
 
@@ -1200,7 +1201,7 @@ class PinsTest(unittest.TestCase):
         # claude states no effort flag; its settings file carries it.
         (root / "home/.claude").mkdir(parents=True)
         (root / "home/.claude/settings.json").write_text(json.dumps({"effort": "xhigh"}))
-        stub = root / "sb"
+        stub = root / "dkt"
         stub.write_text("#!" + sys.executable + "\n" + STUB)
         stub.chmod(0o755)
         (root / "stub.json").write_text(json.dumps({"map": {"schema_version": 1, "seats": seats}}))

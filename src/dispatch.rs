@@ -2,7 +2,7 @@
 //! Routing is by configuration alone, at the seam in `run`: a seat in
 //! `hapi-sessions.json` is `hapi` (its pass body below, client in
 //! `hub`), else a seat directory holding `webhook.url` is `webhook`
-//! (`webhook` — no hub needed), else pull — no push, the seat drains
+//! (`webhook` — no hub needed), else pull — no push, the seat reads
 //! when it chooses. The alarm hooks live in the hapi pass
 //! where it is.
 use crate::alarm;
@@ -65,7 +65,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     if let Some(pass) = sleep::asleep_preamble(root, seat, &mut state, hub)? {
         return Ok(pass);
     }
-    // Pull seats drain themselves: never `receive` for them. The
+    // Pull seats read themselves: never `receive` for them. The
     // binding is re-read here, after any wake rewrote it.
     let Some(session) = bound_session(root, seat) else {
         log_line(
@@ -111,7 +111,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
         }
         _ => {}
     }
-    // The lock covers receive only; a manual drain can run between
+    // The lock covers receive only; a manual read can run between
     // receive and commit.
     let received = {
         let _lock = Flock::seat(&dir, seat)?;
@@ -129,7 +129,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
     for d in &received.directs {
         texts.insert(direct_key(seat, &d.file_name), direct_text(d));
     }
-    // A key whose file is gone (a manual drain took it) is pruned; a
+    // A key whose file is gone (a manual read took it) is pruned; a
     // rotated key (a generation suffix) is its file's key too, so
     // exactly one key per present file stays in flight. Item identity
     // is the file; the delivery key is the hub `localId` and may be
@@ -146,7 +146,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
             store_state(&dir, &state)?; // persist the prune / the pane fact
         }
         // Sleep, decided here: a seat past its threshold with no mail,
-        // a quiet session, and a role in the kernel seat map.
+        // a quiet session, and a role in the docket seat map.
         sleep::try_sleep(root, seat, &session, &mut state, hub)?;
         return Ok(Pass::Idle);
     }
@@ -330,7 +330,7 @@ fn poll_round(
 }
 
 /// Commit exactly the invoked items under the seat lock: archive the
-/// invoked directs (a file already taken by a manual drain counts as
+/// invoked directs (a file already taken by a manual read counts as
 /// done). A rotated key (a generation suffix) is its file's key.
 pub(crate) fn commit_invoked(
     root: &Path,

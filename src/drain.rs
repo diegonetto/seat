@@ -8,13 +8,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// The `--hold` lease: how long held mail stays leased before it is
+/// The `--lease` lease: how long leased mail stays leased before it is
 /// owed again. One constant, 30 minutes — the Matter bot's longest
 /// run waits up to 20 minutes on an approval, so the lease outlives
 /// the run instead of being renewed.
 pub const LEASE: Duration = Duration::from_secs(30 * 60);
 
-/// A staged file is leased while its mtime — the deadline a `--hold`
+/// A staged file is leased while its mtime — the deadline a `--lease`
 /// wrote — is later than now. Nothing else ever sets a future mtime
 /// (`rename` keeps the send-time mtime), so a crashed drain's
 /// leftovers and the hapi dispatcher's staged items are never leased.
@@ -68,11 +68,11 @@ pub struct Received {
     pub unreadable: bool,
 }
 
-/// The drain verb. Lock, receive, print, commit, unlock. Output, exit
+/// The `seat read` verb. Lock, receive, print, commit, unlock. Output, exit
 /// codes, quarantine behaviour and stderr wording are unchanged: good
 /// mail is archived and `last_drained` is stamped exactly as before
 /// even when `receive` recorded failures — then the command exits
-/// nonzero, so a bad message never wedges the next drain.
+/// nonzero, so a bad message never wedges the next read.
 pub fn drain(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -115,7 +115,7 @@ fn report_failures(received: &Received) -> Result<()> {
         // The error names the first sender. Name any further ones here so
         // the process prints each claimed from once.
         for from in &received.bad_marks[1..] {
-            eprintln!("drain: message from '{from}' failed mark verification; not delivered");
+            eprintln!("read: message from '{from}' failed mark verification; not delivered");
         }
         return Err(SeatError::BadMark(received.bad_marks[0].clone()));
     }
@@ -125,17 +125,17 @@ fn report_failures(received: &Received) -> Result<()> {
     Ok(())
 }
 
-/// The `drain --hold` verb: the same lock and the same receive as
-/// `drain`, then for each good message set the staged file's mtime to
-/// the lease deadline (`now + LEASE`), print it exactly as `drain`
+/// The `read --lease` verb: the same lock and the same receive as
+/// `read`, then for each good message set the staged file's mtime to
+/// the lease deadline (`now + LEASE`), print it exactly as `read`
 /// prints it (redelivery line included), and commit nothing — the
-/// mail stays in `draining/` until the bot that held it names its ids
+/// mail stays in `draining/` until the bot that leased it names its ids
 /// done (`done`) or the deadline passes. Order per file: staged,
 /// deadline set, printed; a file whose deadline cannot be set is not
 /// printed and the command fails naming it. Mail leased by an earlier
-/// hold is left alone by `receive` and printed by nobody. A hold
+/// lease is left alone by `receive` and printed by nobody. A lease
 /// stamps `last_drained` on every call — after printing, including a
-/// call that printed nothing: a reader that only holds still reads.
+/// call that printed nothing: a reader that only leases still reads.
 pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     board::ensure_board(root)?;
     let dir = seat::seat_dir(root, seat_name);
@@ -167,7 +167,7 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
     report_failures(&received)
 }
 
-/// The `done` verb (`seat done <ID>...`, and `drain --seat X --done
+/// The `done` verb (`seat done <ID>...`, and `read --seat X --done
 /// ID...`): find each id anywhere on the board and settle it on its
 /// own — every id that can be archived is archived, and a refused or
 /// erroring id (malformed, ambiguous, unread, quarantined, unknown, or
@@ -177,8 +177,8 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 /// and its owner
 /// seat found by a board-wide scan; the decision and the rename then
 /// happen under the owner's lock alone (never two seats' locks at
-/// once), where the id's current folder is re-resolved: a drain or
-/// hold that moved the file between the scan and the lock is
+/// once), where the id's current folder is re-resolved: a read or
+/// lease that moved the file between the scan and the lock is
 /// accounted for, and an id that reached `draining/` by then is
 /// archived from there. Decision order per id: two or more
 /// `*-<id>.msg` files in any seat's `draining/` is refused, naming
@@ -187,7 +187,7 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
 /// done, nothing moves); else a file in `inbox/` names the owner —
 /// archived only for a `webhook.payload` seat whose
 /// `webhook-delivered.json` records the id (payload mode's delivered
-/// mail), else refused (`drain it first`); else one in `quarantine/`
+/// mail), else refused (`read it first`); else one in `quarantine/`
 /// is refused (never delivered); else the id is not on this board.
 /// Each archived id appends one line to `dispatch.log` (`done
 /// seat=<owner> id=<id> by=<--seat if given, else "unknown">`), and
@@ -333,7 +333,7 @@ enum Settled {
 }
 
 /// Settle one id under its owner seat's lock: re-resolve the id's
-/// folder there (a drain or hold may have moved the file between the
+/// folder there (a read or lease may have moved the file between the
 /// board scan and this lock — an id that reached `draining/` by then
 /// is archived from there), archive what can be archived, and stamp
 /// `last_drained` on a rename — a stamp that fails after the rename
@@ -377,7 +377,7 @@ fn settle(root: &Path, owner: &str, id: &str) -> Result<Settled> {
         let delivered = crate::webhook::id_list(&dir.join("webhook-delivered.json"));
         if !dir.join("webhook.payload").exists() || !delivered.iter().any(|d| d == id) {
             return Ok(Settled::Refused(format!(
-                "id {id} is unread in {owner}/inbox; drain it first"
+                "id {id} is unread in {owner}/inbox; read it first"
             )));
         }
         let to = dir.join("archive").join(&file);
@@ -410,7 +410,7 @@ fn stamp_last_drained(dir: &Path) -> Option<String> {
 /// crashed drain ride along), then each staged message is checked
 /// exactly as `drain` always has: the sender name, the sender's token,
 /// the HMAC, the destination. What fails is quarantined — never
-/// delivered. A leased file (`--hold` still inside its lease) is
+/// delivered. A leased file (`read --lease` still inside its lease) is
 /// skipped whole: not printed, not quarantined, not committed.
 pub fn receive(root: &Path, seat_name: &str) -> Result<Received> {
     board::ensure_board(root)?;
@@ -933,11 +933,11 @@ mod tests {
         );
     }
 
-    /// `--hold` prints the mail exactly as `drain` prints it, sets
+    /// `--lease` prints the mail exactly as `read` prints it, sets
     /// each staged file's mtime to the lease deadline (a future
     /// mtime), archives nothing, and stamps `last_drained` (the
-    /// reader is alive). Inside the lease a second `--hold` and a
-    /// plain `drain` print nothing and move nothing.
+    /// reader is alive). Inside the lease a second `--lease` and a
+    /// plain `read` print nothing and move nothing.
     #[test]
     fn hold_prints_leases_and_moves_nothing() {
         let root = setup();
@@ -960,11 +960,11 @@ mod tests {
         // Inside the lease nobody takes it: not a second hold...
         let (r2, text2) = hold_str(&root, "beta");
         r2.unwrap();
-        assert_eq!(text2, "", "a second --hold inside the lease prints nothing");
-        // ...and not a plain drain.
+        assert_eq!(text2, "", "a second --lease inside the lease prints nothing");
+        // ...and not a plain read.
         let (r3, text3) = drain_str(&root, "beta");
         r3.unwrap();
-        assert_eq!(text3, "", "a plain drain inside the lease prints nothing");
+        assert_eq!(text3, "", "a plain read inside the lease prints nothing");
         assert_eq!(msg::list_msg_dir(&dir.join("draining")).unwrap().len(), 1);
         assert!(msg::list_msg_dir(&dir.join("archive")).unwrap().is_empty());
     }
@@ -989,12 +989,12 @@ mod tests {
         assert!(text.contains("old mail"));
         let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
         assert_eq!(staged.len(), 1);
-        assert!(leased(&staged[0]), "the deadline was set at the hold");
+        assert!(leased(&staged[0]), "the deadline was set at the lease");
     }
 
-    /// A leftover from a receive without commit (no hold) is not
+    /// A leftover from a receive without commit (no lease) is not
     /// leased — nothing ever set its mtime — so the next plain
-    /// `drain` prints and archives it exactly as before the hold
+    /// `read` prints and archives it exactly as before the lease
     /// existed, under the redelivery line first: it may have been
     /// shown before.
     #[test]
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert!(
             !leased(&staged[0]),
-            "a crashed drain's leftover is not held"
+            "a crashed read's leftover is not leased"
         );
 
         let (r, text) = drain_str(&root, "beta");
@@ -1029,7 +1029,7 @@ mod tests {
     /// `done` archives exactly the named ids (leased or not), never
     /// touches `inbox/`, stamps `last_drained`, and prints nothing on
     /// stdout. A repeat exits 0 and moves nothing; an id found only in
-    /// `inbox/` is refused (`drain it first`) and nothing moves; a
+    /// `inbox/` is refused (`read it first`) and nothing moves; a
     /// malformed id is refused on its own while the well-formed id
     /// beside it still archives.
     #[test]
@@ -1069,7 +1069,7 @@ mod tests {
         let (r, notice) = done_run(&root, None, &[id_of(&inbox[0])]);
         let msg = r.unwrap_err().to_string();
         assert!(msg.contains("unread in beta/inbox"), "{msg}");
-        assert!(msg.contains("drain it first"), "{msg}");
+        assert!(msg.contains("read it first"), "{msg}");
         assert_eq!(notice, "", "a refusal rides the error alone");
         assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
         assert_eq!(msg::list_msg_dir(&dir.join("archive")).unwrap().len(), 2);
@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     /// `--done` takes a leased file as happily as an expired one: the
-    /// lease holds a `drain` off held mail, never the bot's own done.
+    /// lease holds a `read` off leased mail, never the bot's own done.
     #[test]
     fn done_archives_a_leased_file() {
         let root = setup();
@@ -1195,11 +1195,11 @@ mod tests {
             "{err}"
         );
 
-        // Unread: drain it first.
+        // Unread: read it first.
         let (r, _) = done_run(&root, None, &[id_of(&inbox[0])]);
         let text = r.unwrap_err().to_string();
         assert!(text.contains("unread in beta/inbox"), "{text}");
-        assert!(text.contains("drain it first"), "{text}");
+        assert!(text.contains("read it first"), "{text}");
         assert_eq!(msg::list_msg_dir(&dir.join("inbox")).unwrap().len(), 1);
 
         // Quarantined: it was never delivered.
@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(staged.len(), 1);
         let id = id_of(&staged[0]);
 
-        // `drain --seat alpha --done`: the file is beta's, so the
+        // `read --seat alpha --done`: the file is beta's, so the
         // trace names beta and the ack names alpha — plus one stderr
         // line naming both.
         let (r, notice) = done_run(&root, Some("alpha"), &[id.clone()]);
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     /// The id moves from `inbox/` to `draining/` between the caller's
-    /// request and the archive (a drain or hold staged it while done
+    /// request and the archive (a read or lease staged it while done
     /// waited on the seat lock): done re-resolves the folder under the
     /// lock, archives it from `draining/` with its trace line, and
     /// never exits 0 with the mail still leased.
@@ -1396,7 +1396,7 @@ mod tests {
 
         // Hold the seat lock so done's board scan finishes and it
         // blocks before the settle; then a receive stages the file,
-        // exactly as a drain or hold would.
+        // exactly as a read or lease would.
         let held = seat::Flock::seat(&dir, "beta").unwrap();
         let name = inbox[0].file_name().unwrap().to_str().unwrap().to_string();
         let (tx, rx) = std::sync::mpsc::channel::<(Result<()>, String)>();
@@ -1465,7 +1465,7 @@ mod tests {
         let text = r.unwrap_err().to_string();
         assert!(
             text.contains(&format!(
-                "id {undelivered_id} is unread in beta/inbox; drain it first"
+                "id {undelivered_id} is unread in beta/inbox; read it first"
             )),
             "{text}"
         );
@@ -1483,7 +1483,7 @@ mod tests {
         let text = r.unwrap_err().to_string();
         assert!(
             text.contains(&format!(
-                "id {no_marker_id} is unread in alpha/inbox; drain it first"
+                "id {no_marker_id} is unread in alpha/inbox; read it first"
             )),
             "{text}"
         );
@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(text.matches("0000000f is not on this board").count(), 1, "{text}");
         assert_eq!(
             text.matches(&format!(
-                "id {unread} is unread in beta/inbox; drain it first"
+                "id {unread} is unread in beta/inbox; read it first"
             ))
             .count(),
             1,

@@ -48,7 +48,7 @@ class PaneDoorTest(unittest.TestCase):
                 handle.write(json.dumps(sys.argv) + chr(10))
             time.sleep(60)
         """)
-        write_exec(self.bin / "sb", """\
+        write_exec(self.bin / "dkt", """\
             #!/bin/sh
             if [ "$1" = "seats" ] && [ "$2" = "--names" ]; then
               printf '%s\\n' glm-main grok-main
@@ -66,7 +66,7 @@ class PaneDoorTest(unittest.TestCase):
         self.env.update({
             "PANE_DOOR_STATE": str(self.state),
             "PANE_DOOR_RUNTIMES": str(self.runtimes),
-            "PANE_DOOR_SB": str(self.bin / "sb"),
+            "PANE_DOOR_DKT": str(self.bin / "dkt"),
             "PANE_DOOR_TMUX": str(self.bin / "tmux"),
             "PANE_DOOR_TTYD": str(self.bin / "ttyd"),
             "STUB_LOG": str(self.argv_log),
@@ -278,7 +278,7 @@ class PaneDoorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-400:])
 
     def test_ingress_prints_and_applies_nothing(self):
-        write_exec(self.bin / "sb", """\
+        write_exec(self.bin / "dkt", """\
             #!/bin/sh
             if [ "$1" = "seats" ] && [ "$2" = "--names" ]; then
               printf '%s\\n' glm-main a.b grok-main
