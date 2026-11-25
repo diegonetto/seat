@@ -38,9 +38,7 @@ pub(crate) fn in_seat_map(seat: &str) -> bool {
         return false;
     }
     serde_json::from_slice::<serde_json::Value>(&output.stdout)
-        .ok()
-        .and_then(|value| value.get("seats")?.get(seat).map(|row| row.is_object()))
-        .unwrap_or(false)
+        .is_ok_and(|value| value["seats"][seat].is_object())
 }
 
 /// Run `cmd` to completion bounded by `limit`: a helper that hangs is
