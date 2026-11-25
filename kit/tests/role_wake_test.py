@@ -29,7 +29,8 @@ SPEC.loader.exec_module(ROLE)
 SESSION = "11111111-2222-4333-8444-555555555555"
 OTHER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 EXPECTED_URL = "https://hapi.bll.dev/sessions/" + SESSION
-# The docket seat map (one seat list), as `dkt seats --json` prints it.
+# The docket seat map (one seat list), as `dkt seats --json` prints it. Its records still carry the retired
+# `role` key, which nothing reads: a role word names no seat.
 MAP = {"schema_version": 1, "seats": {
     "glm-main": {"tenant": "internal", "account": "zai-personal", "model": "glm-5.3", "role": "builder",
                  "name": "GLM", "harness": "glm", "effort": None, "cwd": "/home/slix/Projects"},
@@ -590,22 +591,18 @@ class RoleWakeTest(unittest.TestCase):
             self.assertEqual((wake.seat, wake.kind, wake.label, wake.account),
                              (seat, row['harness'], row['name'], row['account']))
 
-    def test_role_word_fallback_until_slice_3(self):
-        # Transitional ("seats have no roles", slice 1): hq's poller still sends role words until slice 2 moves it
-        # to seat names. Delete this test with the fallback in slice 3.
-        for seat, row in MAP['seats'].items():
-            self.assertEqual(ROLE.Wake(row['role']).seat, seat)
-        self.assertEqual(self.invoke(['wake', 'reviewer']), {'status': 'awake', 'url': EXPECTED_URL})
-        saved = json.loads((self.home / '.local/share/seat/hapi-sessions.json').read_text())
-        self.assertEqual(saved['seats']['opus-main']['url'], EXPECTED_URL)
-        # A seat name beats a role word equal to it, and a role two records share names neither.
-        self.state['map']['seats']['grok-main']['role'] = 'opus-main'
-        self.state['map']['seats']['codex-main']['role'] = 'reviewer'
-        self.save()
-        self.assertEqual(ROLE.Wake('opus-main').seat, 'opus-main')
-        self.assertEqual(self.invoke(['wake', 'reviewer'])['reason'],
-                         'seat reviewer is not in the seat map; use glm-main, opus-main, codex-main, grok-main, '
-                         'gemini-main, fable-main')
+    def test_a_role_word_is_refused(self):
+        # Seats have no roles: only a seat name names a seat. Every fixture record still carries a role word, and
+        # waking by it is refused with the seat names after the one map read, touching nothing else.
+        for row in MAP['seats'].values():
+            with self.subTest(role=row['role']):
+                (self.root / 'calls.jsonl').unlink(missing_ok=True)
+                self.assertEqual(self.invoke(['wake', row['role']]), {
+                    'status': 'failed',
+                    'reason': 'seat ' + row['role'] + ' is not in the seat map; use glm-main, opus-main, codex-main, '
+                              'grok-main, gemini-main, fable-main'})
+                self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
+        self.assertFalse((self.home / '.local/share/seat/hapi-sessions.json').exists())
 
     def test_a_seat_with_no_role_wakes_by_name(self):
         del self.state['map']['seats']['opus-main']['role']
@@ -625,7 +622,7 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(ROLE.Wake('opus-main').label, 'opus-main')
 
     def test_wake_loop_order_is_the_maps_file_order(self):
-        self.assertEqual(ROLE.map_roles(),
+        self.assertEqual(ROLE.seat_names(),
                          ['glm-main', 'opus-main', 'codex-main', 'grok-main', 'gemini-main', 'fable-main'])
         self.assertEqual(len([c for c in self.calls() if c[0] == 'dkt']), 1)
 

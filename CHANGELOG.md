@@ -26,6 +26,18 @@ Notable changes to this crate. Versions follow semantic versioning.
 
 ### Changed
 
+- `seat-role wake` takes seat names only (slice 3 of 3 of "seats have
+  no roles"). The transitional role-word fallback in `seat_row`
+  (`kit/scripts/seat-role.py`) is gone: a word that is not a seat name
+  fails with `seat X is not in the seat map; use <seat names>`, even
+  when a map record still carries a matching `role`. Nothing live
+  changes: hq's poller, the dispatcher and the boot already pass seat
+  names, and the live map carries no `role`. `map_roles` is now
+  `seat_names`. `seat-role`, `role-wake.lock` and `role_wake_test.py`
+  keep their names. `kit/tests/role_wake_test.py` drops the fallback
+  test for one that refuses every role word, and the
+  `src/dispatch_tests.rs` map fixtures drop their `role` keys (except
+  the case showing a role never stands in for a seat).
 - Seats are woken and slept by seat name, not role (slice 1 of 3 of
   "seats have no roles"). `seat-role wake <seat>`
   looks the seat up in the docket seat map by its name; its unknown-name

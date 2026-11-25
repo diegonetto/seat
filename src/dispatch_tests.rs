@@ -1806,11 +1806,7 @@ const QUIET: &str = r#"{"session":{"active":true,"thinking":false,"thinkingAt":0
 /// path, dispatch.json records why — once and only once.
 #[test]
 fn idle_seat_sleeps_once_and_only_once() {
-    let kit_dir = stub_kit(
-        "sleep-once",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-once", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -1868,11 +1864,7 @@ fn idle_seat_sleeps_once_and_only_once() {
 /// bound to never counted.
 #[test]
 fn the_idle_clock_is_the_pane_plus_the_bound_delivery() {
-    let kit_dir = stub_kit(
-        "sleep-clock",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-clock", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -1925,11 +1917,7 @@ fn the_idle_clock_is_the_pane_plus_the_bound_delivery() {
 /// it never sleeps.
 #[test]
 fn a_thinking_session_never_sleeps() {
-    let kit_dir = stub_kit(
-        "sleep-thinking",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-thinking", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -1963,11 +1951,7 @@ fn a_thinking_session_never_sleeps() {
 /// sleep.
 #[test]
 fn a_bad_thinking_answer_never_sleeps() {
-    let kit_dir = stub_kit(
-        "sleep-bad-answer",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-bad-answer", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2013,11 +1997,7 @@ fn a_bad_thinking_answer_never_sleeps() {
 /// quiet session: the mail is delivered first.
 #[test]
 fn an_in_flight_item_never_sleeps() {
-    let kit_dir = stub_kit(
-        "sleep-inflight",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-inflight", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2051,7 +2031,7 @@ fn an_in_flight_item_never_sleeps() {
 fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
     let kit_dir = stub_kit(
         "sleep-unarmed",
-        Some(r#"{"seats":{"opus":{"role":"opus"},"drowsy":{"role":"drowsy"}}}"#),
+        Some(r#"{"seats":{"opus":{},"drowsy":{}}}"#),
         None,
     );
     let mut env = lock_env(&[
@@ -2246,7 +2226,7 @@ fn mail_to_an_asleep_seat_wakes_and_delivers_in_the_same_pass() {
     let root = board_with(&[("opus", "s1")]); // s1: the binding sleep left behind
     let kit_dir = stub_kit(
         "wake-deliver",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&wake_success(&root, "opus", "s2")),
     );
     let hub = FakeHub::start();
@@ -2325,7 +2305,7 @@ fn a_failed_wake_leaves_the_seat_asleep() {
         verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
         let kit_dir = stub_kit(
             "wake-fail",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             Some(case.body),
         );
         let hub = FakeHub::start();
@@ -2398,7 +2378,7 @@ fn the_scan_wakes_an_asleep_seat_the_binding_no_longer_names() {
     verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
     let kit_dir = stub_kit(
         "scan-wake",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&wake_success(&root, "opus", "s9")),
     );
     let hub = FakeHub::start();
@@ -2469,7 +2449,7 @@ fn the_scan_wakes_an_asleep_seat_that_also_holds_a_webhook_url() {
     .unwrap();
     let kit_dir = stub_kit(
         "scan-wake-hook",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&wake_success(&root, "opus", "s9")),
     );
     let hub = FakeHub::start();
@@ -2538,11 +2518,7 @@ fn the_scan_wakes_an_asleep_seat_that_also_holds_a_webhook_url() {
 /// sleep: the mark clears and that pane starts a fresh clock.
 #[test]
 fn a_pass_finishes_a_sleep_whose_kill_never_landed() {
-    let kit_dir = stub_kit(
-        "sleep-finish",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-finish", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2625,7 +2601,7 @@ fn mail_to_an_unfinished_sleep_cancels_the_kill_and_delivers() {
     let root = board_with(&[("opus", "s1")]); // s1: the binding sleep left behind
     let kit_dir = stub_kit(
         "wake-finish",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         // Installed to prove it is never called: a wake would move the
         // binding to s2 and the delivery with it.
         Some(&wake_success(&root, "opus", "s2")),
@@ -2720,11 +2696,7 @@ fn mail_to_an_unfinished_sleep_cancels_the_kill_and_delivers() {
 /// pane's old timestamp.
 #[test]
 fn a_new_pane_resets_the_idle_clock() {
-    let kit_dir = stub_kit(
-        "sleep-new-pane",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-new-pane", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2778,11 +2750,7 @@ fn a_new_pane_resets_the_idle_clock() {
 /// replacement keeps a fresh clock, and its pane stands.
 #[test]
 fn a_pending_sleep_never_kills_a_replacement_pane() {
-    let kit_dir = stub_kit(
-        "sleep-replaced",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-replaced", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2865,11 +2833,7 @@ fn a_pending_sleep_never_kills_a_replacement_pane() {
 /// one the mark named.
 #[test]
 fn a_replacement_between_recovery_pane_queries_cancels_the_sleep() {
-    let kit_dir = stub_kit(
-        "sleep-mid-swap",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-mid-swap", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -2970,11 +2934,7 @@ exit $status
 /// settlement names the case it saw.
 #[test]
 fn a_pending_sleep_whose_pane_already_died_completes() {
-    let kit_dir = stub_kit(
-        "sleep-already-gone",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-already-gone", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -3012,7 +2972,7 @@ fn a_pending_sleep_whose_pane_already_died_completes() {
 fn a_pending_sleep_survives_an_unanswerable_multiplexer() {
     let kit_dir = stub_kit(
         "sleep-unreadable-tmux",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         None,
     );
     let mut env = lock_env(&[
@@ -3065,11 +3025,7 @@ fn a_pending_sleep_survives_an_unanswerable_multiplexer() {
 /// work is never killed — the sleep is cancelled and the pane stands.
 #[test]
 fn a_pending_sleep_on_a_session_that_resumed_work_is_cancelled() {
-    let kit_dir = stub_kit(
-        "sleep-resumed",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-resumed", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -3125,11 +3081,7 @@ fn a_pending_sleep_on_a_session_that_resumed_work_is_cancelled() {
 /// still kills by seat name, dead-but-listed included.
 #[test]
 fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
-    let kit_dir = stub_kit(
-        "sleep-named-pane",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-named-pane", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -3227,7 +3179,7 @@ fn the_sleep_kills_the_pane_the_mark_names_not_the_first_listed() {
 fn a_sleep_is_cancelled_when_a_different_live_pane_remains() {
     let kit_dir = stub_kit(
         "sleep-other-live-pane",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         None,
     );
     let mut env = lock_env(&[
@@ -3279,7 +3231,7 @@ fn try_sleeps_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "sleep-tail-pin-landed",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3318,7 +3270,7 @@ fn try_sleeps_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "sleep-tail-pin-gone",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3361,7 +3313,7 @@ fn try_sleeps_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "sleep-tail-pin-replaced",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3406,7 +3358,7 @@ fn try_sleeps_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "sleep-tail-pin-pending",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3483,7 +3435,7 @@ fn settlements_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "settle-tail-pin-landed",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3533,7 +3485,7 @@ fn settlements_kill_then_verify_tail_full_outputs_are_pinned() {
     {
         let kit_dir = stub_kit(
             "settle-tail-pin-gone",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3598,7 +3550,7 @@ fi
     {
         let kit_dir = stub_kit(
             "settle-tail-pin-replaced",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3666,7 +3618,7 @@ exit $status
     {
         let kit_dir = stub_kit(
             "settle-tail-pin-pending",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+            Some(r#"{"seats":{"opus":{}}}"#),
             None,
         );
         let mut env = lock_env(&[
@@ -3731,11 +3683,7 @@ fi
 /// `draining/` stops the store — no mark, no kill, the pane stands.
 #[test]
 fn a_sleep_re_checks_owed_mail_before_storing_the_mark() {
-    let kit_dir = stub_kit(
-        "sleep-mail-recheck",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-mail-recheck", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -3788,11 +3736,7 @@ fn a_sleep_re_checks_owed_mail_before_storing_the_mark() {
 /// the case; the recovered pass then delivers the staged mail.
 #[test]
 fn a_pending_sleep_survives_a_get_error_and_cancels_on_mail() {
-    let kit_dir = stub_kit(
-        "sleep-get-error",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-get-error", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),
@@ -3901,11 +3845,7 @@ fn a_pending_sleep_survives_a_get_error_and_cancels_on_mail() {
 fn a_pending_sleep_on_a_missing_session_or_binding_cancels() {
     // A 404 on the session GET: `thinking` cannot read exactly false.
     {
-        let kit_dir = stub_kit(
-            "sleep-404",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-            None,
-        );
+        let kit_dir = stub_kit("sleep-404", Some(r#"{"seats":{"opus":{}}}"#), None);
         let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
@@ -3944,11 +3884,7 @@ fn a_pending_sleep_on_a_missing_session_or_binding_cancels() {
     }
     // No binding at all: there is nothing quiet to re-read.
     {
-        let kit_dir = stub_kit(
-            "sleep-no-binding",
-            Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-            None,
-        );
+        let kit_dir = stub_kit("sleep-no-binding", Some(r#"{"seats":{"opus":{}}}"#), None);
         let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
@@ -4014,7 +3950,7 @@ fi
     .replace("ROOT", &root.display().to_string());
     let kit_dir = stub_kit(
         "wake-up-hold",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&body),
     );
     let hub = FakeHub::start();
@@ -4144,7 +4080,7 @@ fn a_successful_wake_pass_full_outputs_are_pinned() {
     let root = board_with(&[("opus", "s1")]); // s1: the binding sleep left behind
     let kit_dir = stub_kit(
         "wake-pin",
-        Some(r#"{"seats":{"opus":{"role":"reviewer"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&wake_success(&root, "opus", "s2")),
     );
     let hub = FakeHub::start();
@@ -4257,7 +4193,7 @@ fi
 "#;
     let kit_dir = stub_kit(
         "wake-fail-pin",
-        Some(r#"{"seats":{"opus":{"role":"reviewer"},"bll":{"role":"lander"}}}"#),
+        Some(r#"{"seats":{"opus":{},"bll":{}}}"#),
         Some(body),
     );
     let hub = FakeHub::start();
@@ -4374,7 +4310,7 @@ fi
     .replace("ROOT", &root.display().to_string());
     let kit_dir = stub_kit(
         "wake-preamble-pin",
-        Some(r#"{"seats":{"opus":{"role":"reviewer"}}}"#),
+        Some(r#"{"seats":{"opus":{}}}"#),
         Some(&body),
     );
     let hub = FakeHub::start();
@@ -4600,11 +4536,7 @@ mail stays in the inbox while the pane stands";
 /// still does.
 #[test]
 fn a_board_the_wake_script_cannot_write_never_sleeps() {
-    let kit_dir = stub_kit(
-        "sleep-other-board",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        None,
-    );
+    let kit_dir = stub_kit("sleep-other-board", Some(r#"{"seats":{"opus":{}}}"#), None);
     let mut env = lock_env(&[
         ("PATH", path_with(&kit_dir)),
         ("SEAT_KIT", OsString::from("")),

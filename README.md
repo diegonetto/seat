@@ -456,10 +456,10 @@ and names the path.
 `kit/` is the home of the seat's host scripts, moved unchanged in
 behaviour from the agent-skills library. One line each:
 
-- `kit/scripts/seat-role` — wake one seat by name (`seat-role wake
-  <seat>`; a role word still names its seat until hq sends seat names)
-  and link its phone (HAPI) session, answering one JSON result, or
-  report why it cannot;
+- `kit/scripts/seat-role` — wake one seat by its seat name
+  (`seat-role wake <seat>`; any other word is refused) and link its
+  phone (HAPI) session, answering one JSON result, or report why it
+  cannot;
   `seat-role pins` reports each seat's model and effort drift.
 - `kit/scripts/seat-sit` — the stored pane command for a gallery seat:
   it records the pane target, then replaces itself with seat-supervise.
