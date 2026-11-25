@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # Start panes first, then link their HAPI sessions through the normal wake path.
+# `dkt seats --names` is the startup list, one seat per line: docket decides which seats it names, and this script
+# never re-filters it.
 set -euo pipefail
 names="$(dkt seats --names)"
+mapfile -t seats <<<"$names"
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 failed=0
-for name in $names; do
-  if ! seat up "$name"; then
+for seat in "${seats[@]}"; do
+  [ -n "$seat" ] || continue
+  if ! seat up "$seat"; then
     failed=1
   fi
 done
-roles="$(dkt seats --json | python3 -c 'import json,sys; print(*[s["role"] for s in json.load(sys.stdin)["seats"].values() if "role" in s], sep="\n")')"
-# Wake is serial: the cross-role lock answers busy rather than queuing.
-for role in $roles; do
-  if result="$("$script_dir/seat-role" wake "$role")"; then
+# Wake is serial, by seat name: the shared role-wake.lock answers busy rather than queuing.
+for seat in "${seats[@]}"; do
+  [ -n "$seat" ] || continue
+  if result="$("$script_dir/seat-role" wake "$seat")"; then
     :
   else
     failed=1
   fi
-  printf '%s %s\n' "$role" "$result"
+  printf '%s %s\n' "$seat" "$result"
 done
 exit "$failed"

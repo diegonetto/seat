@@ -1734,16 +1734,15 @@ fn stub_kit(tag: &str, map_json: Option<&str>, seat_role_body: Option<&str>) -> 
 }
 
 /// The seat-role stub body for a successful wake: it refuses any call
-/// but `wake <role>`, writes the binding for `seat` → `session` at
-/// `root` (the script is the only writer of that file), and answers
-/// the kit's awake JSON.
-fn wake_success(root: &Path, seat: &str, role: &str, session: &str) -> String {
+/// but `wake <seat>` — the seat's own name, never its role — writes
+/// the binding for `seat` → `session` at `root` (the script is the
+/// only writer of that file), and answers the kit's awake JSON.
+fn wake_success(root: &Path, seat: &str, session: &str) -> String {
     r#"
-[ "$1" = "wake" ] && [ "$2" = "ROLE" ] || { echo "stub: expected wake ROLE, got $*" >&2; exit 9; }
+[ "$1" = "wake" ] && [ "$2" = "SEAT" ] || { echo "stub: expected wake SEAT, got $*" >&2; exit 9; }
 printf '%s\n' '{"schema_version":1,"seats":{"SEAT":{"url":"https://hapi.bll.dev/sessions/SESSION","moved_at":"2026-10-23T12:00:00Z"}}}' > 'ROOT/hapi-sessions.json'
 printf '%s' '{"status":"awake","url":"https://hapi.bll.dev/sessions/SESSION"}'
 "#
-    .replace("ROLE", role)
     .replace("SEAT", seat)
     .replace("SESSION", session)
     .replace("ROOT", &root.display().to_string())
@@ -2138,14 +2137,25 @@ fn a_seat_without_a_threshold_or_seen_pane_never_sleeps() {
     assert!(!log_text(&root).contains("sleep seat="));
 }
 
-/// `idle_after` without a role in the docket seat map never sleeps —
-/// the wake takes a role — and neither does a map docket refuses
-/// to answer.
+/// `idle_after` on a seat missing from the docket seat map never
+/// sleeps — the wake looks the seat up there by name, and another
+/// record whose role is this seat's name does not stand in for it —
+/// and neither does a map docket refuses to answer or answers
+/// unreadably: a map that cannot be read is never permission to sleep.
 #[test]
-fn idle_after_without_a_role_never_sleeps() {
-    let no_role = stub_kit("sleep-norole", Some(r#"{"seats":{"other":{"role":"x"}}}"#), None);
+fn a_seat_missing_from_the_map_never_sleeps() {
+    let missing = stub_kit(
+        "sleep-noseat",
+        Some(r#"{"seats":{"other":{"role":"opus"}}}"#),
+        None,
+    );
     let map_fails = stub_kit("sleep-nomap", None, None);
-    for (name, kit_dir) in [("no role in the map", no_role), ("map read fails", map_fails)] {
+    let unreadable = stub_kit("sleep-badmap", Some("not a map"), None);
+    for (name, kit_dir) in [
+        ("seat missing from the map", missing),
+        ("map read fails", map_fails),
+        ("map unreadable", unreadable),
+    ] {
         let mut env = lock_env(&[
             ("PATH", path_with(&kit_dir)),
             ("SEAT_KIT", OsString::from("")),
@@ -2168,6 +2178,65 @@ fn idle_after_without_a_role_never_sleeps() {
     }
 }
 
+/// A seat whose map record carries no `role` sleeps and wakes like any
+/// other: the sleep asks only that the seat is a record in the map, and
+/// the wake runs `seat-role wake <seat>` by its name. Round trip: idle
+/// past the threshold puts it down, mail wakes it and delivers in the
+/// same pass.
+#[test]
+fn a_seat_with_no_role_sleeps_and_wakes() {
+    let kit_dir = stub_kit(
+        "sleep-wake-norole",
+        Some(r#"{"seats":{"opus":{"name":"Claude","harness":"claude"}}}"#),
+        None,
+    );
+    let mut env = lock_env(&[
+        ("PATH", path_with(&kit_dir)),
+        ("SEAT_KIT", OsString::from("")),
+        ("SEAT_TMUX", OsString::from(fake_tmux())),
+    ]);
+    let (root, hub, mut client) = up_and_seen(&mut env, "opus", "s1", 31, QUIET);
+    let dir = seat::seat_dir(&root, "opus");
+
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Idle
+    );
+    assert!(dstate::load_state(&dir).asleep.is_some(), "it slept");
+    assert!(
+        !crate::session::running_seats(&fake_tmux())
+            .unwrap()
+            .contains("opus"),
+        "the pane was killed"
+    );
+
+    // The wake script is the seat-name stub: any other argument exits 9.
+    stub(&kit_dir, "seat-role", &wake_success(&root, "opus", "s2"));
+    hub.ctl.lock().unwrap().sessions.insert("s2".into(), true);
+    send(&root, "opus", "wake up");
+    let key = only_key(&root, "opus");
+    mark(&hub, &key, "invoked");
+    assert_eq!(
+        dispatch::pass_seat(&root, "opus", &mut client).unwrap(),
+        Pass::Delivered,
+        "{}",
+        log_text(&root)
+    );
+    let state = dstate::load_state(&dir);
+    assert_eq!(state.asleep, None, "the mark is cleared");
+    assert_eq!(state.woken.map(|w| w.key), Some(key.clone()));
+    assert!(
+        hub.journal().contains(&format!("POST-MSG s2 {key}")),
+        "{:?}",
+        hub.journal()
+    );
+    let log = log_text(&root);
+    assert!(
+        log.contains("wake seat=opus") && !log.contains("wake failed"),
+        "{log}"
+    );
+}
+
 /// Mail to an asleep seat runs the wake — the worker's first act, a
 /// stubbed `seat-role` on PATH that writes the binding and prints the
 /// kit's awake JSON — and delivers in the same pass, clearing
@@ -2178,7 +2247,7 @@ fn mail_to_an_asleep_seat_wakes_and_delivers_in_the_same_pass() {
     let kit_dir = stub_kit(
         "wake-deliver",
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        Some(&wake_success(&root, "opus", "opus", "s2")),
+        Some(&wake_success(&root, "opus", "s2")),
     );
     let hub = FakeHub::start();
     hub.ctl.lock().unwrap().sessions.insert("s2".into(), true);
@@ -2330,7 +2399,7 @@ fn the_scan_wakes_an_asleep_seat_the_binding_no_longer_names() {
     let kit_dir = stub_kit(
         "scan-wake",
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        Some(&wake_success(&root, "opus", "opus", "s9")),
+        Some(&wake_success(&root, "opus", "s9")),
     );
     let hub = FakeHub::start();
     hub.ctl.lock().unwrap().sessions.insert("s9".into(), true);
@@ -2401,7 +2470,7 @@ fn the_scan_wakes_an_asleep_seat_that_also_holds_a_webhook_url() {
     let kit_dir = stub_kit(
         "scan-wake-hook",
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        Some(&wake_success(&root, "opus", "opus", "s9")),
+        Some(&wake_success(&root, "opus", "s9")),
     );
     let hub = FakeHub::start();
     hub.ctl.lock().unwrap().sessions.insert("s9".into(), true);
@@ -2559,7 +2628,7 @@ fn mail_to_an_unfinished_sleep_cancels_the_kill_and_delivers() {
         Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
         // Installed to prove it is never called: a wake would move the
         // binding to s2 and the delivery with it.
-        Some(&wake_success(&root, "opus", "opus", "s2")),
+        Some(&wake_success(&root, "opus", "s2")),
     );
     let hub = FakeHub::start();
     hub.ctl
@@ -4075,8 +4144,8 @@ fn a_successful_wake_pass_full_outputs_are_pinned() {
     let root = board_with(&[("opus", "s1")]); // s1: the binding sleep left behind
     let kit_dir = stub_kit(
         "wake-pin",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
-        Some(&wake_success(&root, "opus", "opus", "s2")),
+        Some(r#"{"seats":{"opus":{"role":"reviewer"}}}"#),
+        Some(&wake_success(&root, "opus", "s2")),
     );
     let hub = FakeHub::start();
     hub.ctl.lock().unwrap().sessions.insert("s2".into(), true);
@@ -4179,7 +4248,7 @@ fn failed_and_up_wake_passes_full_outputs_are_pinned() {
     verbs::cmd_register(&root, "opus", "sb", None, None, Vec::new(), None, None).unwrap();
     verbs::cmd_register(&root, "bll", "sb", None, None, Vec::new(), None, None).unwrap();
     let body = r#"
-[ "$1" = "wake" ] || { echo "stub: expected wake, got $*" >&2; exit 9; }
+{ [ "$1" = "wake" ] && { [ "$2" = "opus" ] || [ "$2" = "bll" ]; }; } || { echo "stub: expected wake opus|bll, got $*" >&2; exit 9; }
 if [ "$2" = "opus" ]; then
   printf '%s' '{"status":"busy"}'
 else
@@ -4188,7 +4257,7 @@ fi
 "#;
     let kit_dir = stub_kit(
         "wake-fail-pin",
-        Some(r#"{"seats":{"opus":{"role":"opus"},"bll":{"role":"bll"}}}"#),
+        Some(r#"{"seats":{"opus":{"role":"reviewer"},"bll":{"role":"lander"}}}"#),
         Some(body),
     );
     let hub = FakeHub::start();
@@ -4305,7 +4374,7 @@ fi
     .replace("ROOT", &root.display().to_string());
     let kit_dir = stub_kit(
         "wake-preamble-pin",
-        Some(r#"{"seats":{"opus":{"role":"opus"}}}"#),
+        Some(r#"{"seats":{"opus":{"role":"reviewer"}}}"#),
         Some(&body),
     );
     let hub = FakeHub::start();

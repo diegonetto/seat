@@ -1,7 +1,7 @@
 //! Sleep and wake: a hapi seat idle past its
 //! `--idle-after` threshold goes down through the same `down` path
 //! one pane already uses and `dispatch.json` records `asleep`; mail
-//! wakes it through `kit/scripts/seat-role wake <role>`. The script
+//! wakes it through `kit/scripts/seat-role wake <seat>`. The script
 //! is called, never reimplemented, and this crate never writes
 //! `hapi-sessions.json` — the script is its only writer.
 use crate::alarm;
@@ -21,26 +21,24 @@ use std::time::{Duration, Instant};
 /// How long `dkt seats --json` may take (the kit's own bound is 15 s).
 const MAP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The seat's role in the docket seat map (`dkt seats --json` — the
-/// same map `seat-role` reads). `None` when the map cannot be read or
-/// the seat has no role there: such a seat is never slept — the wake
-/// takes a role — and a map failure is never permission to sleep.
-pub(crate) fn seat_role(seat: &str) -> Option<String> {
+/// Is the seat a record in the docket seat map (`dkt seats --json` —
+/// the same map `seat-role` reads)? The wake looks the seat up there by
+/// name, so a seat missing from the map is never slept, and a map that
+/// cannot be read (no answer, an error, unreadable JSON) is never
+/// permission to sleep. The record's `role`, if any, plays no part.
+pub(crate) fn in_seat_map(seat: &str) -> bool {
     let mut cmd = Command::new("dkt");
     cmd.args(["seats", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = run_bounded(&mut cmd, MAP_TIMEOUT)?;
+    let Some(output) = run_bounded(&mut cmd, MAP_TIMEOUT) else {
+        return false;
+    };
     if !output.status.success() {
-        return None;
+        return false;
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    value
-        .get("seats")?
-        .get(seat)?
-        .get("role")?
-        .as_str()
-        .map(str::to_string)
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .is_ok_and(|value| value["seats"][seat].is_object())
 }
 
 /// Run `cmd` to completion bounded by `limit`: a helper that hangs is
@@ -114,13 +112,8 @@ pub(crate) enum WakeOutcome {
 /// short; the 2-second scan promise is only that the wake starts on
 /// the pass that sees the mail.
 pub(crate) fn wake_seat(root: &Path, seat: &str) -> WakeOutcome {
-    let Some(role) = seat_role(seat) else {
-        return WakeOutcome::Failed(format!(
-            "no role for seat {seat} in the docket seat map, and seat-role wake takes a role"
-        ));
-    };
     let prog = seat_role_program();
-    let output = match Command::new(&prog).arg("wake").arg(&role).output() {
+    let output = match Command::new(&prog).arg("wake").arg(seat).output() {
         Ok(o) => o,
         Err(e) => {
             return WakeOutcome::Failed(format!("cannot run {}: {e}", prog.display()));
@@ -130,15 +123,15 @@ pub(crate) fn wake_seat(root: &Path, seat: &str) -> WakeOutcome {
         Ok(v) => v,
         Err(_) => {
             return WakeOutcome::Failed(format!(
-                "seat-role wake {role} printed no readable answer (exit {})",
+                "seat-role wake {seat} printed no readable answer (exit {})",
                 output.status
             ));
         }
     };
     let status = answer.get("status").and_then(|s| s.as_str()).unwrap_or("");
     let reason = || match answer.get("reason").and_then(|r| r.as_str()) {
-        Some(r) if !r.is_empty() => format!("seat-role wake {role} answered {status}: {r}"),
-        _ => format!("seat-role wake {role} answered {status}"),
+        Some(r) if !r.is_empty() => format!("seat-role wake {seat} answered {status}: {r}"),
+        _ => format!("seat-role wake {seat} answered {status}"),
     };
     if status == "up" {
         // The pane is already running; it cannot grow a phone session
@@ -151,7 +144,7 @@ pub(crate) fn wake_seat(root: &Path, seat: &str) -> WakeOutcome {
     }
     if Bindings::load(root).session_id(seat).is_none() {
         return WakeOutcome::Failed(format!(
-            "seat-role wake {role} answered awake but hapi-sessions.json has no binding for {seat}"
+            "seat-role wake {seat} answered awake but hapi-sessions.json has no binding for {seat}"
         ));
     }
     WakeOutcome::Awake
@@ -331,9 +324,10 @@ fn wake_writes_root(root: &Path) -> bool {
 /// later of it and a delivery to the currently bound session) at least
 /// that old; nothing in flight; nothing owed in `inbox/` or
 /// `draining/`, looked for again just before the record; the bound
-/// session's `thinking` explicitly `false`; a role in the docket seat
-/// map, because the wake takes one; and the dispatcher's board being
-/// the board the wake script writes. The kill names the pane the clock
+/// session's `thinking` explicitly `false`; the seat a record in the
+/// docket seat map, because the wake looks it up there by name (a map
+/// that cannot be read counts as missing); and the dispatcher's board
+/// being the board the wake script writes. The kill names the pane the clock
 /// timed, and a different live pane under the same seat name cancels
 /// the sleep: nothing dies.
 pub(crate) fn try_sleep(
@@ -386,7 +380,7 @@ pub(crate) fn try_sleep(
         Ok(s) if s.thinking == Some(false) => {}
         _ => return Ok(false),
     }
-    if seat_role(seat).is_none() {
+    if !in_seat_map(seat) {
         return Ok(false);
     }
     // The last look before the record: mail that landed between the

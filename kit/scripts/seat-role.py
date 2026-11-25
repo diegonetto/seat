@@ -1,4 +1,4 @@
-"""Implementation of seat-role wake ROLE. Stdlib only; child output stays private.
+"""Implementation of seat-role wake SEAT. Stdlib only; child output stays private.
 
 Cutover/quit sequencing is adapted from ~/sb-reroute/hapi-seat-{cutover,move}.sh.
 The host scripts are deliberately not executed: their unscoped `seat up` and
@@ -160,35 +160,41 @@ def seat_map():
     return seats
 
 
-def map_roles():
-    """The map's roles in its file order; the map says which roles exist."""
-    return [str(row["role"]) for row in seat_map().values()
-            if isinstance(row, dict) and isinstance(row.get("role"), str)]
+def map_roles(seats=None):
+    """The map's seat names in its file order; the map says which seats exist (one read when `seats` is given)."""
+    return list(seat_map() if seats is None else seats)
 
 
-def role_row(role):
-    """(seat, record) for the map record whose role matches."""
-    for seat, row in seat_map().items():
-        if isinstance(row, dict) and row.get("role") == role:
-            return seat, row
-    fail("role " + role + " is not in the seat map; use " + ", ".join(map_roles()))
+def seat_row(name):
+    """(seat, record) for the map record named `name`: the seat name is the key."""
+    seats = seat_map()
+    if name in seats:
+        if not isinstance(seats[name], dict):
+            fail("the seat map record for seat " + name + " is invalid")
+        return name, seats[name]
+    # Transitional fallback, removed in slice 3 of "seats have no roles" with `role` itself: hq's poller still sends a
+    # role word until slice 2 moves it to seat names. A word that is no seat name but is exactly one record's role
+    # names that seat.
+    matches = [(seat, row) for seat, row in seats.items() if isinstance(row, dict) and row.get("role") == name]
+    if len(matches) == 1:
+        return matches[0]
+    fail("seat " + name + " is not in the seat map; use " + ", ".join(map_roles(seats)))
 
 
 class Wake:
-    def __init__(self, role):
+    def __init__(self, name):
         # HOME is never changed by this program or its tests.
         self.home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
         self.projects = self.home / "Projects"
         # One seat list: the docket map names the seat, kind, label and account (the tables and roles.json are gone).
-        self.seat, record = role_row(role)
+        self.seat, record = seat_row(name)
         kind, account, label = record.get("harness"), record.get("account"), record.get("name")
         if (not isinstance(kind, str) or not kind
                 or not isinstance(account, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", account)):
-            fail("the seat map record for role " + role + " is invalid")
-        self.role = role
+            fail("the seat map record for seat " + self.seat + " is invalid")
         self.kind = kind
-        self.label = label if isinstance(label, str) and label else role.capitalize()
+        self.label = label if isinstance(label, str) and label else self.seat
         self.account = account
         self.runtime = Path(os.environ.get("SEAT_RUNTIMES", str(self.projects / ".seat-runtimes"))) / self.seat
         self.harness_path = self.runtime / "harness.json"
@@ -373,7 +379,7 @@ class Wake:
         return "https://hapi.bll.dev/sessions/" + found[0] if found else None
 
     def rename(self, url, deadline):
-        """Name the session for its role and seat; the manual name beats any
+        """Name the session for its label and seat; the manual name beats any
         title the hub invents on its own.
 
         A hand-set name is never fought over. A failure warns without hiding
@@ -479,11 +485,11 @@ class Wake:
         except Result:
             if backup:
                 atomic_write(self.harness_path, backup.read_bytes())
-            fail(f"the swarm was not running and the seat command could not start {self.role}")
+            fail(f"the swarm was not running and the seat command could not start {self.seat}")
         if blocker:
             # The seat is up; it just has no phone session. Say so ("up"), never "failed": the board shows it awake
             # without Connect, and a failed answer would invite a retry that restarts a working seat.
-            raise Result("up", f"{self.role} is running in its terminal, but {blocker}")
+            raise Result("up", f"{self.seat} is running in its terminal, but {blocker}")
         self.await_session(None, "the swarm was not running; started it, but no session appeared within 60 seconds",
                            backup)
 
@@ -507,7 +513,7 @@ class Wake:
 
     def run(self):
         self.state.mkdir(parents=True, exist_ok=True)
-        # Serialize restarts and map writes across roles; do not queue another tap.
+        # Serialize restarts and map writes across seats; do not queue another tap.
         with (self.state / "role-wake.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -675,7 +681,7 @@ def main(args):
         if args == ["pins"]:
             pins()
         if len(args) != 2 or args[0] != "wake":
-            fail("usage: seat-role wake <role> | seat-role pins")
+            fail("usage: seat-role wake <seat> | seat-role pins")
         Wake(args[1]).run()
     except Result as result:
         value = result.value

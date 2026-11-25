@@ -185,8 +185,9 @@ idle that long: its inbox empty and nothing in flight, its idle clock
 a delivery to its currently bound session) past the threshold, the
 bound session's `thinking` flag explicitly false (a missing, mistyped,
 or unreadable answer — and a session that is gone — never counts as
-quiet), a role for the seat in the docket seat map (`dkt seats
---json`), because the wake needs one, and the dispatcher's board being
+quiet), the seat a record in the docket seat map (`dkt seats
+--json`; a map that cannot be read counts as missing), because the
+wake looks the seat up there by name, and the dispatcher's board being
 the very board the wake script writes
 (`<SEAT_ROLE_HOME|$HOME>/.local/share/seat`; seat-role fixes its
 binding file there and calls `seat up` with no `--root`, so a
@@ -227,17 +228,17 @@ no longer names the seat, and even when a leftover `webhook.url` would
 otherwise route it to the hook — and for an asleep seat whose mark
 sits beside a pane fact, a pending kill, whether or not a binding or
 mail waits: a restart's leftover mark is settled by the first scan
-that sees it. The mail worker's first act is the wake: it runs the kit's own `kit/scripts/seat-role wake <role>` (found at
+that sees it. The mail worker's first act is the wake: it runs the kit's own `kit/scripts/seat-role wake <seat>` (found at
 `$SEAT_KIT`, else the kit beside the binary, else PATH), waits for the
 script to run to its own deadlines, and only a JSON `awake` answer
 plus a binding on the re-read delivers in that pass, clearing the mark
 and recording `woken: {at, key}`. Any other answer (`busy` from the
-cross-role lock, `refused`, `failed`, or no binding after an `awake`)
+shared `role-wake.lock`, `refused`, `failed`, or no binding after an `awake`)
 leaves the seat asleep with the item in the inbox, one failure line
 naming the script's reason, and the next scan retries. The script's
 `up` answer is a hold, not a retry: a pane runs with no phone
 session — `up` means stop calling, and a resume-style pane holds the
-script's cross-role lock through its idle watch — so the wake is not
+script's shared `role-wake.lock` through its idle watch — so the wake is not
 attempted again until that pane is verifiably gone.
 
 ### The webhook adapter
@@ -455,8 +456,10 @@ and names the path.
 `kit/` is the home of the seat's host scripts, moved unchanged in
 behaviour from the agent-skills library. One line each:
 
-- `kit/scripts/seat-role` — wake one role's seat and link its phone
-  (HAPI) session, answering one JSON result, or report why it cannot;
+- `kit/scripts/seat-role` — wake one seat by name (`seat-role wake
+  <seat>`; a role word still names its seat until hq sends seat names)
+  and link its phone (HAPI) session, answering one JSON result, or
+  report why it cannot;
   `seat-role pins` reports each seat's model and effort drift.
 - `kit/scripts/seat-sit` — the stored pane command for a gallery seat:
   it records the pane target, then replaces itself with seat-supervise.
@@ -471,8 +474,9 @@ behaviour from the agent-skills library. One line each:
   fatal. One script called from both places: the gallery unit's
   `ExecStartPre` and seat-supervise, so a boot and a hand `seat up` behave
   alike.
-- `kit/scripts/seat-gallery-up` — boot: start every seat's pane, then
-  link each session through the normal wake path.
+- `kit/scripts/seat-gallery-up` — boot: start the pane of every seat
+  `dkt seats --names` prints, then link each session through the normal
+  wake path, `seat-role wake <seat>`, one seat at a time.
 - `kit/scripts/pane-door` — one localhost ttyd per seat pane plus the
   root grid on `127.0.0.1:7700`; its vendored xterm files are in
   `kit/assets/pane-door/`.
