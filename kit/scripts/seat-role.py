@@ -166,13 +166,13 @@ def seat_names(seats=None):
 
 
 def seat_row(name):
-    """(seat, record) for the map record named `name`: the seat name is the key, and only a seat name names a seat."""
+    """The map record for seat `name`: the seat name is the key."""
     seats = seat_map()
     if name not in seats:
         fail("seat " + name + " is not in the seat map; use " + ", ".join(seat_names(seats)))
     if not isinstance(seats[name], dict):
         fail("the seat map record for seat " + name + " is invalid")
-    return name, seats[name]
+    return seats[name]
 
 
 class Wake:
@@ -181,7 +181,7 @@ class Wake:
         self.home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
         self.projects = self.home / "Projects"
         # One seat list: the docket map names the seat, kind, label and account (the tables and roles.json are gone).
-        self.seat, record = seat_row(name)
+        self.seat, record = name, seat_row(name)
         kind, account, label = record.get("harness"), record.get("account"), record.get("name")
         if (not isinstance(kind, str) or not kind
                 or not isinstance(account, str)
