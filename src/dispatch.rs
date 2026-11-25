@@ -146,7 +146,7 @@ pub(crate) fn pass_seat(root: &Path, seat: &str, hub: &mut Hub) -> Result<Pass> 
             store_state(&dir, &state)?; // persist the prune / the pane fact
         }
         // Sleep, decided here: a seat past its threshold with no mail,
-        // a quiet session, and a role in the docket seat map.
+        // a quiet session, and a record in the docket seat map.
         sleep::try_sleep(root, seat, &session, &mut state, hub)?;
         return Ok(Pass::Idle);
     }

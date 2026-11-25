@@ -17,7 +17,7 @@ KillMode=process
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Projects
 # Wait for the hub's port, not its process (why: kit/scripts/seat-hub-wait). Keep this
-# ExecStartPre: seat-gallery-up wakes roles right after seating them, so removing it races
+# ExecStartPre: seat-gallery-up wakes seats right after seating them, so removing it races
 # the wake's pane check against a still-waiting seat.
 ExecStartPre=%h/Projects/seat/kit/scripts/seat-hub-wait
 # The map names the seats. The script starts each pane, links sessions serially,

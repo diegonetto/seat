@@ -83,7 +83,7 @@ if name == 'dkt':
             print(state['map_error'], file=sys.stderr)
             sys.exit(1)
         if args[1] == '--names':
-            print('\n'.join(state['map']['seats']))
+            print('\n'.join(state.get('names', state['map']['seats'])))
             sys.exit(0)
         out(state['map'])
 elif name == 'seat-role':
@@ -310,9 +310,8 @@ class RoleWakeTest(unittest.TestCase):
             'flavor': 'claude' if self.kind == 'glm' else self.kind, 'hostPid': pid, **metadata,
         }}
 
-    def fixture(self, role='reviewer', wrapped=True):
-        self.role = role
-        self.seat = next(s for s, row in MAP['seats'].items() if row['role'] == role)
+    def fixture(self, seat='opus-main', wrapped=True):
+        self.seat = seat
         row = MAP['seats'][self.seat]
         self.kind = row['harness']
         self.runtime = self.home / 'Projects/.seat-runtimes' / self.seat
@@ -344,7 +343,7 @@ class RoleWakeTest(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         before = {p.name: p.read_bytes() for p in self.docket_home.iterdir()}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = ROLE.main(args if args is not None else ['wake', self.role])
+            code = ROLE.main(args if args is not None else ['wake', self.seat])
         self.assertEqual(err.getvalue(), stderr)
         self.assertEqual(len(out.getvalue().splitlines()), 1)
         value = json.loads(out.getvalue())
@@ -508,7 +507,7 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(self.saved_map()['seats'][self.seat]['url'], EXPECTED_URL)
 
     def test_plain_idle_cutover_restart_and_fresh_session(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         original = self.harness.read_bytes()
         self.assertEqual(self.invoke(), {'status': 'awake', 'url': EXPECTED_URL})
         changed = json.loads(self.harness.read_text())
@@ -520,26 +519,26 @@ class RoleWakeTest(unittest.TestCase):
         self.assertGreaterEqual(self.clock.now, 10)
 
     def test_codex_keeps_real_binary_and_uses_quit(self):
-        self.fixture('lander', wrapped=False)
+        self.fixture('codex-main', wrapped=False)
         self.assertEqual(self.invoke()['status'], 'awake')
         self.assertEqual(json.loads(self.harness.read_text())['codex_bin'], '/stub/codex')
         self.assertTrue(any(c[-2:] == ['/quit', 'Enter'] for c in self.calls()))
 
     def test_plain_claude_cutover(self):
-        self.fixture('reviewer', wrapped=False)
+        self.fixture('opus-main', wrapped=False)
         self.assertEqual(self.invoke()['status'], 'awake')
         changed = json.loads(self.harness.read_text())
         self.assertEqual(changed['argv'][1], 'claude')
         self.assertTrue(any(c[-2:] == ['/exit', 'Enter'] for c in self.calls()))
 
     def test_busy_one_shell_never_sends(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['pane'] = 'Ready\n1 shell\n>'
         self.save()
         self.assertEqual(self.no_mutation('busy'), {'status': 'busy'})
 
     def test_busy_markers(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         for marker in ('esc to interrupt', 'Thinking', '2 shells', '1 agent', '3 agents', '⠙ Working',
                        'Do you want to continue?', '❯ 1. Yes', '(y/n)', 'Esc to cancel'):
             with self.subTest(marker=marker):
@@ -548,13 +547,13 @@ class RoleWakeTest(unittest.TestCase):
                 self.no_mutation('busy')
 
     def test_busy_during_idle_observation(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['late_busy'] = 3
         self.save()
         self.no_mutation('busy')
 
     def test_busy_after_cutover_rolls_back_without_sending(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         original = self.harness.read_bytes()
         self.state['late_busy'] = 8
         self.save()
@@ -563,42 +562,78 @@ class RoleWakeTest(unittest.TestCase):
         self.assertFalse(any('send-keys' in c or c[0] == 'seat' for c in self.calls()))
 
     def test_low_memory(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.memory.write_text('at,2999\n')
         self.assertIn('2999', self.no_mutation('refused')['reason'])
         self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
     def test_memory_unavailable(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.memory.write_text('at,unknown\n')
         self.no_mutation('failed')
 
-    def test_unknown_role_and_verb(self):
-        for args in (['sleep', 'reviewer'], []):
+    def test_unknown_seat_and_verb(self):
+        for args in (['sleep', 'opus-main'], []):
             with self.subTest(args=args):
                 self.assertEqual(self.invoke(args)['status'], 'failed')
                 self.assertEqual(self.calls(), [])
         (self.root / 'calls.jsonl').unlink(missing_ok=True)
-        for args in (['wake', 'admin'], ['wake', '../reviewer']):
+        for args in (['wake', 'admin'], ['wake', '../opus-main']):
             with self.subTest(args=args):
                 self.assertEqual(self.invoke(args)['status'], 'failed')
-        # Each refusal reads the map twice: once to look the role up, once to list the roles it offers.
-        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']] * 4)
+        # Each refusal reads the map once: the seat names it offers come from the same read.
+        self.assertEqual(self.calls(), [['dkt', 'seats', '--json']] * 2)
 
-    def test_six_seat_map_resolves_every_role(self):
+    def test_six_seat_map_resolves_every_seat_by_name(self):
         for seat, row in MAP['seats'].items():
-            wake = ROLE.Wake(row['role'])
+            wake = ROLE.Wake(seat)
             self.assertEqual((wake.seat, wake.kind, wake.label, wake.account),
                              (seat, row['harness'], row['name'], row['account']))
 
+    def test_role_word_fallback_until_slice_3(self):
+        # Transitional ("seats have no roles", slice 1): hq's poller still sends role words until slice 2 moves it
+        # to seat names. Delete this test with the fallback in slice 3.
+        for seat, row in MAP['seats'].items():
+            self.assertEqual(ROLE.Wake(row['role']).seat, seat)
+        self.assertEqual(self.invoke(['wake', 'reviewer']), {'status': 'awake', 'url': EXPECTED_URL})
+        saved = json.loads((self.home / '.local/share/seat/hapi-sessions.json').read_text())
+        self.assertEqual(saved['seats']['opus-main']['url'], EXPECTED_URL)
+        # A seat name beats a role word equal to it, and a role two records share names neither.
+        self.state['map']['seats']['grok-main']['role'] = 'opus-main'
+        self.state['map']['seats']['codex-main']['role'] = 'reviewer'
+        self.save()
+        self.assertEqual(ROLE.Wake('opus-main').seat, 'opus-main')
+        self.assertEqual(self.invoke(['wake', 'reviewer'])['reason'],
+                         'seat reviewer is not in the seat map; use glm-main, opus-main, codex-main, grok-main, '
+                         'gemini-main, fable-main')
+
+    def test_a_seat_with_no_role_wakes_by_name(self):
+        del self.state['map']['seats']['opus-main']['role']
+        self.save()
+        self.assertEqual(self.no_mutation('awake'), {'status': 'awake', 'url': EXPECTED_URL})
+
+    def test_a_down_seat_with_no_role_starts_by_name(self):
+        self.down_fixture('grok-main', wrapped=False)
+        for row in self.state['map']['seats'].values():
+            del row['role']
+        self.save()
+        self.assert_started_down(self.invoke())
+
+    def test_label_falls_back_to_the_seat_name(self):
+        del self.state['map']['seats']['opus-main']['name']
+        self.save()
+        self.assertEqual(ROLE.Wake('opus-main').label, 'opus-main')
+
     def test_wake_loop_order_is_the_maps_file_order(self):
-        self.assertEqual(ROLE.map_roles(), ['builder', 'reviewer', 'lander', 'fixer', 'critic', 'adjudicator'])
+        self.assertEqual(ROLE.map_roles(),
+                         ['glm-main', 'opus-main', 'codex-main', 'grok-main', 'gemini-main', 'fable-main'])
         self.assertEqual(len([c for c in self.calls() if c[0] == 'dkt']), 1)
 
-    def test_role_missing_from_the_map_fails_with_its_words(self):
+    def test_seat_missing_from_the_map_fails_with_its_words(self):
         value = self.invoke(['wake', 'admin'])
         self.assertEqual(value['reason'],
-                         'role admin is not in the seat map; use builder, reviewer, lander, fixer, critic, adjudicator')
+                         'seat admin is not in the seat map; use glm-main, opus-main, codex-main, grok-main, '
+                         'gemini-main, fable-main')
 
     def test_refusing_map_fails_with_dockets_words(self):
         self.state['map_error'] = 'seats.json: unknown key tenantx in seat glm-main'
@@ -607,11 +642,14 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(value['reason'], 'the seat map: seats.json: unknown key tenantx in seat glm-main')
         self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
-    def test_invalid_map_record_for_a_role(self):
-        self.state['map']['seats']['opus-main']['account'] = 'not valid!'
-        self.save()
-        value = self.invoke()
-        self.assertEqual(value['reason'], 'the seat map record for role reviewer is invalid')
+    def test_invalid_map_record_for_a_seat(self):
+        for case, broken in (('bad account', {**MAP['seats']['opus-main'], 'account': 'not valid!'}),
+                             ('not a record', 'not a record')):
+            with self.subTest(case):
+                self.fixture()
+                self.state['map']['seats']['opus-main'] = broken
+                self.save()
+                self.assertEqual(self.invoke()['reason'], 'the seat map record for seat opus-main is invalid')
 
     def test_gallery_script_refusal_prints_dockets_words(self):
         self.state['map_error'] = 'seats.json: seat glm-main has no account'
@@ -634,45 +672,56 @@ class RoleWakeTest(unittest.TestCase):
         return subprocess.run(['/bin/bash', str(scripts / 'seat-gallery-up')],
                               capture_output=True, text=True, timeout=15)
 
-    def assert_gallery_attempts_every_seat_and_role(self, result):
-        seats = MAP['seats']
-        roles = [row['role'] for row in seats.values()]
+    def assert_gallery_attempts_every_seat(self, result, names=None):
+        names = list(MAP['seats']) if names is None else names
         starts = [c for c in self.calls() if c[0] == 'seat']
         wakes = [c for c in self.calls() if c[0] == 'seat-role']
-        self.assertEqual(starts, [['seat', 'up', name] for name in seats])
-        self.assertEqual(wakes, [['seat-role', 'wake', role] for role in roles])
-        self.assertEqual([line.split(' ', 1)[0] for line in result.stdout.splitlines()], roles)
+        self.assertEqual(starts, [['seat', 'up', name] for name in names])
+        self.assertEqual(wakes, [['seat-role', 'wake', name] for name in names])
+        self.assertEqual([line.split(' ', 1)[0] for line in result.stdout.splitlines()], names)
         for line in result.stdout.splitlines():
             json.loads(line.split(' ', 1)[1])
+        # Docket's startup list is the whole input: one `--names` read, never the records to re-filter.
+        self.assertEqual([c for c in self.calls() if c[0] == 'dkt'], [['dkt', 'seats', '--names']])
         self.assertFalse(any(c[0] == 'sleep' for c in self.calls()))
         self.assertEqual(result.stderr, '')
 
-    def test_gallery_starts_panes_and_links_every_role(self):
+    def test_gallery_starts_panes_and_links_every_seat(self):
         result = self.gallery()
         self.assertEqual(result.returncode, 0)
-        self.assert_gallery_attempts_every_seat_and_role(result)
+        self.assert_gallery_attempts_every_seat(result)
+
+    def test_gallery_wakes_exactly_the_names_docket_prints(self):
+        # Docket leaves out a seat whose subscription is off; the records carry no role. The script wakes what
+        # `dkt seats --names` printed, in its order, and nothing else.
+        self.state['names'] = ['fable-main', 'grok-main']
+        for row in self.state['map']['seats'].values():
+            del row['role']
+        result = self.gallery()
+        self.assertEqual(result.returncode, 0)
+        self.assert_gallery_attempts_every_seat(result, ['fable-main', 'grok-main'])
 
     def test_gallery_continues_after_a_pane_start_fails(self):
         self.state['start_failures'] = ['codex-main']
         result = self.gallery()
         self.assertEqual(result.returncode, 1)
-        self.assert_gallery_attempts_every_seat_and_role(result)
+        self.assert_gallery_attempts_every_seat(result)
 
     def test_gallery_continues_after_a_wake_fails(self):
-        self.state['wake_results'] = {'reviewer': {'status': 'failed', 'reason': 'HAPI unavailable'}}
+        self.state['wake_results'] = {'opus-main': {'status': 'failed', 'reason': 'HAPI unavailable'}}
         result = self.gallery()
         self.assertEqual(result.returncode, 1)
-        self.assert_gallery_attempts_every_seat_and_role(result)
+        self.assert_gallery_attempts_every_seat(result)
 
     def test_gallery_logs_up_busy_and_refused_without_failing(self):
         self.state['wake_results'] = {
-            'builder': {'status': 'up', 'reason': 'plain terminal'},
-            'reviewer': {'status': 'busy'},
-            'lander': {'status': 'refused', 'reason': 'quota BLOCK'},
+            'glm-main': {'status': 'up', 'reason': 'plain terminal'},
+            'opus-main': {'status': 'busy'},
+            'codex-main': {'status': 'refused', 'reason': 'quota BLOCK'},
         }
         result = self.gallery()
         self.assertEqual(result.returncode, 0)
-        self.assert_gallery_attempts_every_seat_and_role(result)
+        self.assert_gallery_attempts_every_seat(result)
         self.assertEqual([json.loads(line.split(' ', 1)[1])['status']
                           for line in result.stdout.splitlines()[:3]], ['up', 'busy', 'refused'])
 
@@ -680,13 +729,13 @@ class RoleWakeTest(unittest.TestCase):
         self.state['quota'].append({'account': 'unrelated', 'verdict': 'BLOCK'})
         self.save()
         self.no_mutation('awake')
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['quota'][0]['verdict'] = 'BLOCK'
         self.save()
         self.assertIn('BLOCK', self.no_mutation('refused')['reason'])
 
     def test_unknown_quota_fails_closed(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['quota'][0]['verdict'] = 'unknown'
         self.save()
         self.no_mutation('failed')
@@ -694,7 +743,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_secret_in_child_error_is_not_printed(self):
         for key in ('quota_error', 'hub_error'):
             with self.subTest(key=key):
-                self.fixture('fixer', wrapped=False)
+                self.fixture('grok-main', wrapped=False)
                 self.state[key] = True
                 self.save()
                 self.no_mutation('failed')
@@ -712,7 +761,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_hapi_glm_wrapper_counts_as_wrapped(self):
         # glm under the phone link runs a wrapper (Z.ai endpoint and key, then `hapi claude`); seat-role treats it as
         # wrapped so it finds and records the session (Connect) instead of answering up.
-        self.fixture('builder', wrapped=False)
+        self.fixture('glm-main', wrapped=False)
         role = ROLE.Wake.__new__(ROLE.Wake)
         role.hapi = str(self.home / '.local/bin/hapi')
         role.kind = 'glm'
@@ -725,7 +774,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_hapi_chrome_wrapper_wakes_linked_never_the_down_branch(self):
         # Flight (claude) launches through the hapi-chrome wrapper (Claude for Chrome, then `hapi claude`); a wake
         # must treat it as wrapped: find and record the live session over the up pane, never cut over or restart.
-        self.fixture('adjudicator')
+        self.fixture('fable-main')
         harness = json.loads(self.harness.read_text())
         harness['argv'] = [str(self.runtime / 'hapi-chrome'), 'claude', '--model', 'claude-fable-5-1']
         self.harness.write_text(json.dumps(harness))
@@ -735,7 +784,7 @@ class RoleWakeTest(unittest.TestCase):
 
     def test_hapi_chrome_wrapper_counts_as_wrapped_only_for_claude(self):
         # Same shape as the hapi-glm rule: exact basename, one kind, and the wrapped `claude` word must follow it.
-        self.fixture('builder', wrapped=False)
+        self.fixture('glm-main', wrapped=False)
         role = ROLE.Wake.__new__(ROLE.Wake)
         role.hapi = str(self.home / '.local/bin/hapi')
         role.kind = 'claude'
@@ -749,7 +798,7 @@ class RoleWakeTest(unittest.TestCase):
 
     def test_live_plain_glm_answers_up_and_is_left_as_is(self):
         # glm runs in its terminal with no phone session: the seat is up, so the answer says up, and nothing changes.
-        self.fixture('builder', wrapped=False)
+        self.fixture('glm-main', wrapped=False)
         self.assertIn('no phone session', self.no_mutation('up')['reason'])
 
     def test_stale_saved_url_cannot_identify_a_session(self):
@@ -780,7 +829,7 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(value['reason'], 'more than one phone session claims this seat')
 
     def test_quit_timeout_does_not_force_stop_or_restart(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         original = self.harness.read_bytes()
         self.state['never_exits'] = True
         self.save()
@@ -792,7 +841,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_session_timeout_and_stale_target(self):
         for stale in (False, True):
             with self.subTest(stale=stale):
-                self.fixture('fixer', wrapped=False)
+                self.fixture('grok-main', wrapped=False)
                 self.state['stale_target'] = stale
                 self.state['sessions_after'] = []
                 self.save()
@@ -801,7 +850,7 @@ class RoleWakeTest(unittest.TestCase):
                 self.assertEqual(self.clock.now - start, 70)
 
     def test_startup_retries_missing_target_and_hub_failure(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['hub_after_failures'] = 1
         self.save()
         load = ROLE.Wake.load_target
@@ -832,7 +881,7 @@ class RoleWakeTest(unittest.TestCase):
             self.assertIn('timed out', self.no_mutation('failed')['reason'])
 
     def test_hub_discovery_uses_remaining_deadline(self):
-        wake = ROLE.Wake('reviewer')
+        wake = ROLE.Wake('opus-main')
         wake.token = self.state['jwt']
         with patch.object(ROLE.subprocess, 'run') as run:
             run.return_value = subprocess.CompletedProcess([], 0, '{"sessions": []}', '')
@@ -842,7 +891,7 @@ class RoleWakeTest(unittest.TestCase):
             wake.hub('/sessions', self.clock.monotonic())
 
     def test_restart_failure_has_no_retry_or_forced_stop(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['start_error'] = True
         self.save()
         original = self.harness.read_bytes()
@@ -861,9 +910,9 @@ class RoleWakeTest(unittest.TestCase):
         for down in (None, 'server'):
             with self.subTest(down=down):
                 if down:
-                    self.down_fixture('fixer', wrapped=False, down=down)
+                    self.down_fixture('grok-main', wrapped=False, down=down)
                 else:
-                    self.fixture('fixer', wrapped=False)
+                    self.fixture('grok-main', wrapped=False)
                 original = self.harness.read_bytes()
                 with patch.object(ROLE.subprocess, 'run', side_effect=seat_hangs) as run:
                     value = self.invoke()
@@ -879,9 +928,9 @@ class RoleWakeTest(unittest.TestCase):
         for down in (None, 'server'):
             with self.subTest(down=down), patch.dict(os.environ, {'SEAT_ROLE_TEST_SESSION_WAIT': '5'}):
                 if down:
-                    self.down_fixture('fixer', wrapped=False, down=down)
+                    self.down_fixture('grok-main', wrapped=False, down=down)
                 else:
-                    self.fixture('fixer', wrapped=False)
+                    self.fixture('grok-main', wrapped=False)
                 self.state['sessions_after'] = []
                 self.save()
                 original = self.harness.read_bytes()
@@ -898,7 +947,7 @@ class RoleWakeTest(unittest.TestCase):
                 (self.root / 'calls.jsonl').unlink()
 
     def test_resume_command_is_rejected(self):
-        self.fixture('lander', wrapped=False)
+        self.fixture('codex-main', wrapped=False)
         value = json.loads(self.harness.read_text())
         value['argv'] += ['resume', 'old-id']
         self.harness.write_text(json.dumps(value))
@@ -912,8 +961,8 @@ class RoleWakeTest(unittest.TestCase):
             self.no_mutation('busy')
         self.assertEqual(self.calls(), [['dkt', 'seats', '--json']])
 
-    def down_fixture(self, role='reviewer', wrapped=True, down='server'):
-        self.fixture(role, wrapped)
+    def down_fixture(self, seat='opus-main', wrapped=True, down='server'):
+        self.fixture(seat, wrapped)
         if wrapped:
             # A wrapped seat already has the HAPI cwd and no stored session.
             harness = json.loads(self.harness.read_text())
@@ -981,7 +1030,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_down_plain_seat_is_cut_over_then_started(self):
         for down in ('server', 'pane'):
             with self.subTest(down=down):
-                self.down_fixture('fixer', wrapped=False, down=down)
+                self.down_fixture('grok-main', wrapped=False, down=down)
                 original = self.harness.read_bytes()
                 self.assert_started_down(self.invoke())
                 changed = json.loads(self.harness.read_text())
@@ -1010,10 +1059,10 @@ class RoleWakeTest(unittest.TestCase):
     def test_seat_still_running_in_swarm_is_never_started(self):
         # The recorded target is missing or names an old socket, but the swarm's
         # default socket still has a pane stamped with this seat.
-        for role, wrapped in (('reviewer', True), ('fixer', False)):
+        for seat, wrapped in (('opus-main', True), ('grok-main', False)):
             for missing in (True, False):
-                with self.subTest(role=role, missing=missing):
-                    self.down_fixture(role, wrapped)
+                with self.subTest(seat=seat, missing=missing):
+                    self.down_fixture(seat, wrapped)
                     if missing:
                         (self.runtime / 'wake-target.json').unlink()
                     self.state['swarm'] = ['other-seat', self.seat]
@@ -1041,19 +1090,19 @@ class RoleWakeTest(unittest.TestCase):
         self.assertIn(self.seat, self.saved_map()['seats'])
 
     def test_down_with_quota_block_is_refused_before_start(self):
-        self.down_fixture('fixer', wrapped=False)
+        self.down_fixture('grok-main', wrapped=False)
         self.state['quota'][0]['verdict'] = 'BLOCK'
         self.save()
         self.no_mutation('refused')
 
     def test_glm_down_starts_plain_and_says_why(self):
-        self.down_fixture('builder', wrapped=False)
+        self.down_fixture('glm-main', wrapped=False)
         self.state['plain_up'] = True
         self.save()
         original = self.harness.read_bytes()
         value = self.invoke()
         self.assertEqual(value, {'status': 'up',
-                                 'reason': 'builder is running in its terminal, but glm has no phone session yet'})
+                                 'reason': 'glm-main is running in its terminal, but glm has no phone session yet'})
         self.assertEqual(self.harness.read_bytes(), original)
         self.assertFalse(list(self.runtime.glob('harness.json.pre-hapi.*')))
         self.assertEqual([c for c in self.calls() if c[0] == 'seat'], [['seat', 'up', 'glm-main']])
@@ -1063,7 +1112,7 @@ class RoleWakeTest(unittest.TestCase):
     def test_unwrappable_down_seat_starts_plain(self):
         for argv in (['/usr/bin/env', 'grok'], ['/stub/grok', '--resume', 'old']):
             with self.subTest(argv=argv):
-                self.down_fixture('fixer', wrapped=False)
+                self.down_fixture('grok-main', wrapped=False)
                 self.state['plain_up'] = True
                 self.save()
                 value = json.loads(self.harness.read_text())
@@ -1072,18 +1121,18 @@ class RoleWakeTest(unittest.TestCase):
                 original = self.harness.read_bytes()
                 result = self.invoke()
                 self.assertEqual(result['status'], 'up')
-                self.assertTrue(result['reason'].startswith('fixer is running in its terminal, but '))
+                self.assertTrue(result['reason'].startswith('grok-main is running in its terminal, but '))
                 self.assertEqual(self.harness.read_bytes(), original)
                 (self.root / 'calls.jsonl').unlink()
 
     def test_down_start_failure_restores_harness(self):
-        self.down_fixture('fixer', wrapped=False)
+        self.down_fixture('grok-main', wrapped=False)
         self.state['start_error'] = True
         self.save()
         original = self.harness.read_bytes()
         value = self.invoke()
         self.assertEqual(value['status'], 'failed')
-        self.assertIn('could not start fixer', value['reason'])
+        self.assertIn('could not start grok-main', value['reason'])
         self.assertEqual(self.harness.read_bytes(), original)
 
     def test_down_no_session_within_60_seconds(self):
@@ -1094,9 +1143,9 @@ class RoleWakeTest(unittest.TestCase):
                          'the swarm was not running; started it, but no session appeared within 60 seconds')
 
     def test_pane_pid_changed_is_identity_failure_not_down(self):
-        for role, wrapped in (('reviewer', True), ('fixer', False)):
-            with self.subTest(role=role):
-                self.fixture(role, wrapped)
+        for seat, wrapped in (('opus-main', True), ('grok-main', False)):
+            with self.subTest(seat=seat):
+                self.fixture(seat, wrapped)
                 self.state['pid'] = 900
                 self.save()
                 with patch.dict(os.environ, {'SEAT_ROLE_TEST_SESSION_WAIT': '3'}):
@@ -1108,13 +1157,13 @@ class RoleWakeTest(unittest.TestCase):
         self.assertEqual(value['reason'], "the swarm's tmux returned an error, so nothing was started")
 
     def test_reasons_never_name_bare_tool_failures(self):
-        self.fixture('fixer', wrapped=False)
+        self.fixture('grok-main', wrapped=False)
         self.state['start_error'] = True
         self.save()
         self.assertNotIn('tmux failed', self.invoke()['reason'])
 
     def test_shell_entrypoint(self):
-        result = subprocess.run(['/bin/bash', str(ROOT / 'scripts/seat-role'), 'wake', 'reviewer'],
+        result = subprocess.run(['/bin/bash', str(ROOT / 'scripts/seat-role'), 'wake', 'opus-main'],
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, '')

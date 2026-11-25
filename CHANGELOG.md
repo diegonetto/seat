@@ -26,6 +26,23 @@ Notable changes to this crate. Versions follow semantic versioning.
 
 ### Changed
 
+- Seats are woken and slept by seat name, not role (slice 1 of 3 of
+  "seats have no roles"). `seat-role wake <seat>`
+  looks the seat up in the docket seat map by its name; its unknown-name
+  failure reads `seat X is not in the seat map; use <seat names>`, the
+  session label falls back to the seat name, and the `up` and
+  start-failure reasons name the seat. Transitional: a word that is no
+  seat name but is exactly one record's `role` still names that seat,
+  because hq's poller sends role words until slice 2; slice 3 deletes
+  that fallback with `role` itself. The dispatcher (`src/sleep.rs`) runs
+  `seat-role wake <seat>` directly — the `seat_role()` lookup and its
+  "no role for seat" failure are gone — and its sleep precondition is
+  now that the seat is a record in `dkt seats --json` (a map that cannot
+  be read is still never permission to sleep); wake failure reasons
+  name the seat. `seat-gallery-up` starts and wakes exactly the seats
+  `dkt seats --names` prints, one per line, never re-filtering that
+  startup list. `role-wake.lock`, `seat-role` and
+  `role-wake-poll.service` keep their names.
 - Hard switch: `seat drain` is `seat read`, and `--hold` is `--lease`
   (`seat read --lease`). No alias: `seat drain` and `--hold` fail with
   clap's ordinary error. A plain read still prints and archives;
