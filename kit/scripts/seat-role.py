@@ -160,25 +160,19 @@ def seat_map():
     return seats
 
 
-def map_roles(seats=None):
+def seat_names(seats=None):
     """The map's seat names in its file order; the map says which seats exist (one read when `seats` is given)."""
     return list(seat_map() if seats is None else seats)
 
 
 def seat_row(name):
-    """(seat, record) for the map record named `name`: the seat name is the key."""
+    """The map record for seat `name`: the seat name is the key."""
     seats = seat_map()
-    if name in seats:
-        if not isinstance(seats[name], dict):
-            fail("the seat map record for seat " + name + " is invalid")
-        return name, seats[name]
-    # Transitional fallback, removed in slice 3 of "seats have no roles" with `role` itself: hq's poller still sends a
-    # role word until slice 2 moves it to seat names. A word that is no seat name but is exactly one record's role
-    # names that seat.
-    matches = [(seat, row) for seat, row in seats.items() if isinstance(row, dict) and row.get("role") == name]
-    if len(matches) == 1:
-        return matches[0]
-    fail("seat " + name + " is not in the seat map; use " + ", ".join(map_roles(seats)))
+    if name not in seats:
+        fail("seat " + name + " is not in the seat map; use " + ", ".join(seat_names(seats)))
+    if not isinstance(seats[name], dict):
+        fail("the seat map record for seat " + name + " is invalid")
+    return seats[name]
 
 
 class Wake:
@@ -187,7 +181,7 @@ class Wake:
         self.home = Path(os.environ.get("SEAT_ROLE_HOME", str(Path.home())))
         self.projects = self.home / "Projects"
         # One seat list: the docket map names the seat, kind, label and account (the tables and roles.json are gone).
-        self.seat, record = seat_row(name)
+        self.seat, record = name, seat_row(name)
         kind, account, label = record.get("harness"), record.get("account"), record.get("name")
         if (not isinstance(kind, str) or not kind
                 or not isinstance(account, str)
