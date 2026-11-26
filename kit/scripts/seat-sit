@@ -31,7 +31,7 @@ fi
 printf '%s\n' "$$" >"$RUNTIME/pane.pid"
 
 mapfile -d '' -t LAUNCH < <(python3 - "$SEAT" "$RUNTIME" "$HARNESS" "$$" "${TMUX_PANE}" "${TMUX%%,*}" <<'PY'
-import datetime, json, pathlib, sys
+import datetime, json, pathlib, re, sys
 seat, runtime, harness_path, pane_pid, pane, socket = sys.argv[1:]
 harness = json.loads(pathlib.Path(harness_path).read_text())
 argv = harness.get("argv") or []
@@ -72,18 +72,31 @@ path = pathlib.Path(runtime) / "wake-target.json"
 tmp = path.with_suffix(".json.tmp")
 tmp.write_text(json.dumps(target) + "\n")
 tmp.replace(path)
+# Optional env (NAME -> text) is exported before the launch, so a hapi-first argv keeps its phone session.
+env = harness.get("env") or {}
+if not isinstance(env, dict) or any(
+        not isinstance(k, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", k)
+        or not isinstance(v, str) or "\0" in v for k, v in env.items()):
+    sys.stderr.write("seat-sit: harness.json env must map NAME to text\n")
+    sys.exit(1)
 out = sys.stdout.buffer
+out.write(str(len(env)).encode() + b"\0")
+for key, value in sorted(env.items()):
+    out.write(f"{key}={value}".encode() + b"\0")
 out.write(cwd.encode() + b"\0")
 for arg in argv:
     out.write(str(arg).encode() + b"\0")
 PY
 )
-if [ "${#LAUNCH[@]}" -lt 2 ]; then
+NENV="${LAUNCH[0]:-}"
+case "$NENV" in ""|*[!0-9]*) printf 'seat-sit: harness launch is incomplete\n' >&2; exit 1 ;; esac
+if [ "${#LAUNCH[@]}" -lt $((NENV + 3)) ]; then
   printf 'seat-sit: harness launch is incomplete\n' >&2
   exit 1
 fi
-CWD="${LAUNCH[0]}"
-ARGV=("${LAUNCH[@]:1}")
+for ((i = 1; i <= NENV; i++)); do export "${LAUNCH[i]}"; done
+CWD="${LAUNCH[NENV + 1]}"
+ARGV=("${LAUNCH[@]:NENV + 2}")
 
 if ! cd -- "$CWD"; then
   exit 1
