@@ -1263,5 +1263,40 @@ class PinsTest(unittest.TestCase):
         self.assertEqual(report["fable-main"], "unpinned")
 
 
+class WindowsMemoryTest(unittest.TestCase):
+    """Legion has no Slix watchdog log: without SEAT_ROLE_MEMORY_LOG the guard asks Windows itself."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def fake_powershell(self, body):
+        script = self.root / 'powershell.exe'
+        script.write_text('#!/bin/sh\n' + body + '\n')
+        script.chmod(0o755)
+        return script
+
+    def test_log_wins_when_named(self):
+        log = self.root / 'log.csv'
+        log.write_text('at,free_mb\nt,4321\n')
+        with patch.dict(os.environ, {'SEAT_ROLE_MEMORY_LOG': str(log)}):
+            self.assertEqual(ROLE.windows_free_mb(), 4321)
+
+    def test_reads_windows_live_without_a_log(self):
+        ps = self.fake_powershell('echo 4096000')  # KB
+        env = {k: v for k, v in os.environ.items() if k != 'SEAT_ROLE_MEMORY_LOG'}
+        env['SEAT_ROLE_POWERSHELL'] = str(ps)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(ROLE.windows_free_mb(), 4000)
+
+    def test_a_failing_powershell_is_unreadable(self):
+        ps = self.fake_powershell('exit 1')
+        env = {k: v for k, v in os.environ.items() if k != 'SEAT_ROLE_MEMORY_LOG'}
+        env['SEAT_ROLE_POWERSHELL'] = str(ps)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError):
+                ROLE.windows_free_mb()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
