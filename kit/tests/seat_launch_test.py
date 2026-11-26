@@ -114,6 +114,31 @@ class SeatSitTest(unittest.TestCase):
             time.sleep(0.1)
         return False
 
+    def test_harness_env_is_exported_to_the_launch(self):
+        stub = self.bin / "print-env"
+        out = self.root / "env.out"
+        write_exec(stub, f"""\
+            #!/bin/sh
+            echo "GROK_HOME=$GROK_HOME" > {out}
+            exit 1
+            """)
+        (self.runtime / "harness.json").write_text(json.dumps({
+            "harness": "grok", "argv": [str(stub)], "cwd": str(self.root),
+            "expect_cmds": ["hapi"], "env": {"GROK_HOME": "/tmp/seat-test-grok-home"},
+        }))
+        self.sit()
+        self.assertTrue(self.wait_for(out.exists), "the harness never ran")
+        self.assertEqual(out.read_text().strip(), "GROK_HOME=/tmp/seat-test-grok-home")
+
+    def test_bad_harness_env_refuses_the_launch(self):
+        (self.runtime / "harness.json").write_text(json.dumps({
+            "harness": "grok", "argv": ["/bin/true"], "cwd": str(self.root),
+            "expect_cmds": ["hapi"], "env": {"bad name": "x"},
+        }))
+        pane, _ = self.sit()
+        self.assertTrue(self.wait_for(lambda: not self.pane_alive(pane)), "a bad env still launched")
+        self.assertFalse((self.runtime / "harness-exit.log").exists())
+
     def test_harness_dying_at_launch_leaves_the_trace(self):
         stub = self.bin / "die-at-launch"
         write_exec(stub, """\
