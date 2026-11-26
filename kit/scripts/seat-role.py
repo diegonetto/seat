@@ -90,6 +90,29 @@ class Result(Exception):
             self.value["url"] = url
 
 
+WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def windows_free_mb():
+    """Free Windows memory in MB: the last row of SEAT_ROLE_MEMORY_LOG when it names a watchdog log (Slix),
+    else Windows itself through PowerShell (Legion has no such log)."""
+    log = os.environ.get("SEAT_ROLE_MEMORY_LOG")
+    if log:
+        last = None
+        with Path(log).open() as handle:
+            for row in csv.reader(handle):
+                if row:
+                    last = row
+        return int(last[1])
+    done = subprocess.run(
+        [os.environ.get("SEAT_ROLE_POWERSHELL", WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command",
+         "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+        capture_output=True, text=True, timeout=20)
+    if done.returncode:
+        raise ValueError("PowerShell could not read Windows memory")
+    return int(done.stdout.strip()) // 1024
+
+
 def fail(reason):
     raise Result("failed", reason)
 
@@ -199,17 +222,11 @@ class Wake:
         self.session_name = None
 
     def memory_guard(self):
-        path = Path(os.environ.get("SEAT_ROLE_MEMORY_LOG", "/mnt/c/Users/diego/slix-watchdog/log.csv"))
         try:
-            with path.open() as handle:
-                last = None
-                for row in csv.reader(handle):
-                    if row:
-                        last = row
-            free = int(last[1])
+            free = windows_free_mb()
             if free < 0:
                 raise ValueError
-        except (OSError, ValueError, TypeError, IndexError):
+        except (OSError, ValueError, TypeError, IndexError, subprocess.TimeoutExpired):
             fail("Windows free memory could not be read, so nothing was started")
         if free < 3000:
             raise Result("refused", f"Windows has {free} MB free; a wake needs 3000 MB")
