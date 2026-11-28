@@ -94,7 +94,11 @@ finished.
 file's mtime to the lease deadline (`now + 30 minutes`), prints the
 mail exactly as `read` prints it, and archives nothing. Order per
 file: staged, deadline set, printed; a file whose deadline cannot be
-set is not printed and the command fails naming it. A lease stamps
+set is not printed and the command fails naming it. Each leased file
+appends one line to `dispatch.log` — `leased seat=<seat> id=<id>
+until=<deadline> pid=<pid> ppid=<ppid> parent=<parent's name>`, so a
+lease left unsettled names the process that took it; a line that
+cannot be written never fails the read. A lease stamps
 `last_drained` on every call — including one that printed nothing: a
 reader that only leases still reads.
 
