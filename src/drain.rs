@@ -29,6 +29,25 @@ pub(crate) fn leased(path: &Path) -> bool {
         .is_some()
 }
 
+/// The rest of a `leased` line in `dispatch.log` (after `seat=`):
+/// the id, the lease deadline, and who took it — this process's pid,
+/// its parent's pid, and the parent's name from `/proc/<ppid>/comm`
+/// (`unknown` when it cannot be read). No command line, no
+/// environment, no message text.
+pub(crate) fn lease_trace(id: &str, deadline: SystemTime) -> String {
+    let ppid = std::os::unix::process::parent_id();
+    let parent = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .ok()
+        .map(|s| s.trim().replace(char::is_whitespace, "_"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "id={id} until={} pid={} ppid={ppid} parent={parent}",
+        chrono::DateTime::<chrono::Utc>::from(deadline).to_rfc3339(),
+        std::process::id()
+    )
+}
+
 /// Set a file's mtime, leaving its atime alone.
 pub(crate) fn set_mtime(path: &Path, at: SystemTime) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
@@ -132,7 +151,10 @@ fn report_failures(received: &Received) -> Result<()> {
 /// mail stays in `draining/` until the bot that leased it names its ids
 /// done (`done`) or the deadline passes. Order per file: staged,
 /// deadline set, printed; a file whose deadline cannot be set is not
-/// printed and the command fails naming it. Mail leased by an earlier
+/// printed and the command fails naming it. Each file leased appends
+/// one `leased` line to `dispatch.log` after its deadline is set
+/// (`lease_trace`: who took it); a line that cannot be written never
+/// fails the lease. Mail leased by an earlier
 /// lease is left alone by `receive` and printed by nobody. A lease
 /// stamps `last_drained` on every call — after printing, including a
 /// call that printed nothing: a reader that only leases still reads.
@@ -155,6 +177,12 @@ pub fn hold(root: &Path, seat_name: &str, out: &mut dyn Write) -> Result<()> {
                 staged.display()
             ))
         })?;
+        dstate::log_line(
+            root,
+            "leased",
+            seat_name,
+            &lease_trace(&d.header.id, deadline),
+        );
         write_direct(d, out)?;
     }
 
@@ -992,6 +1020,84 @@ mod tests {
         assert!(leased(&staged[0]), "the deadline was set at the lease");
     }
 
+    /// The tails (minus the stamp) of every `leased` line in the log.
+    fn leased_lines(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join("dispatch.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|(_, t)| t.to_string()))
+            .filter(|t| t.starts_with("leased "))
+            .collect()
+    }
+
+    /// Each mail a `--lease` leases appends exactly one `leased` line
+    /// naming the seat, the id, a deadline 30 minutes out, and who
+    /// took it (this process's pid, its parent); a second `--lease`
+    /// over still-leased mail writes none.
+    #[test]
+    fn a_lease_is_logged_with_who_took_it() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "one", None).unwrap();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "two", None).unwrap();
+        let dir = seat::seat_dir(&root, "beta");
+        let mut ids: Vec<String> = msg::list_msg_dir(&dir.join("inbox"))
+            .unwrap()
+            .iter()
+            .map(|p| id_of(p))
+            .collect();
+        ids.sort();
+
+        let before = chrono::Utc::now();
+        let (r, _) = hold_str(&root, "beta");
+        r.unwrap();
+        let after = chrono::Utc::now();
+
+        let lines = leased_lines(&root);
+        assert_eq!(lines.len(), 2, "one line per id: {lines:?}");
+        let mut seen = Vec::new();
+        let ppid = std::os::unix::process::parent_id();
+        for line in &lines {
+            let f: Vec<&str> = line.split(' ').collect();
+            assert_eq!(f.len(), 7, "the complete line: {line}");
+            assert_eq!(f[0], "leased");
+            assert_eq!(f[1], "seat=beta");
+            seen.push(f[2].strip_prefix("id=").unwrap().to_string());
+            let until =
+                chrono::DateTime::parse_from_rfc3339(f[3].strip_prefix("until=").unwrap()).unwrap();
+            let lease = chrono::Duration::from_std(LEASE).unwrap();
+            assert!(until >= before + lease && until <= after + lease, "{line}");
+            assert_eq!(f[4], format!("pid={}", std::process::id()));
+            assert_eq!(f[5], format!("ppid={ppid}"));
+            let parent = f[6].strip_prefix("parent=").unwrap();
+            assert!(!parent.is_empty(), "{line}");
+        }
+        seen.sort();
+        assert_eq!(seen, ids);
+
+        // Still leased: a second --lease takes nothing and logs nothing.
+        let (r2, text2) = hold_str(&root, "beta");
+        r2.unwrap();
+        assert_eq!(text2, "");
+        assert_eq!(leased_lines(&root).len(), 2);
+    }
+
+    /// A `leased` line that cannot be written never fails the lease:
+    /// with `dispatch.log` a directory the mail is still leased and
+    /// printed.
+    #[test]
+    fn an_unwritable_log_does_not_fail_the_lease() {
+        let root = setup();
+        verbs::cmd_send(&root, Some("alpha"), "beta", "still leased", None).unwrap();
+        std::fs::create_dir(root.join("dispatch.log")).unwrap();
+        let (r, text) = hold_str(&root, "beta");
+        r.unwrap();
+        assert!(text.contains("still leased"));
+        let dir = seat::seat_dir(&root, "beta");
+        let staged = msg::list_msg_dir(&dir.join("draining")).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert!(leased(&staged[0]));
+    }
+
     /// A leftover from a receive without commit (no lease) is not
     /// leased — nothing ever set its mtime — so the next plain
     /// `read` prints and archives it exactly as before the lease
@@ -1617,7 +1723,10 @@ mod tests {
             log.contains(&format!("done seat=alpha id={alpha_id} by=unknown")),
             "{log}"
         );
-        assert!(!log.contains(&format!("id={beta_id}")), "{log}");
+        assert!(
+            !log.contains(&format!("done seat=beta id={beta_id}")),
+            "{log}"
+        );
     }
 
     /// A redelivery is exactly the redelivery line plus the direct

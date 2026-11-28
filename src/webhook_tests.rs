@@ -1774,7 +1774,27 @@ fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
         RingOutcome::Idle
     );
     assert!(hook.hits().is_empty());
-    pin_log(&root, &[]);
+    // The lease's own trace is the only line: who took the mail.
+    let raw = std::fs::read_to_string(root.join("dispatch.log")).unwrap();
+    let leased_line = raw
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    let who = format!(
+        " pid={} ppid={} parent=",
+        std::process::id(),
+        std::os::unix::process::parent_id()
+    );
+    assert!(
+        leased_line.starts_with("leased seat=kotek-grokbot id=abcdef12 until=")
+            && leased_line.contains(&who),
+        "the lease's trace: {leased_line}"
+    );
+    pin_log(&root, &[&leased_line]);
     assert!(!root.join("dispatch-alarms.json").exists());
 
     // The deadline passes (the lease clock is the file's mtime): the
@@ -1797,6 +1817,7 @@ fn held_mail_is_owed_by_nobody_until_its_lease_passes() {
     pin_log(
         &root,
         &[
+            &leased_line,
             "alarm seat=kotek-grokbot cause=undelivered an item has waited over 15 minutes undelivered",
             "rung seat=kotek-grokbot id=abcdef12",
         ],
